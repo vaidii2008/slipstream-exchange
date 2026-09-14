@@ -1,0 +1,17 @@
+{
+  "name": "slipstream-exchange",
+  "version": "0.1.0",
+  "description": "A real-time centralized cryptocurrency exchange simulator",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "typescript": "^7.0.2"
+  }
+}
