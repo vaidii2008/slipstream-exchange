@@ -12,7 +12,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "start": "node --env-file-if-exists=.env server.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -24,6 +25,7 @@
     "typescript-eslint": "^8.70.0"
   },
   "dependencies": {
-    "fastify": "^5.12.4"
+    "fastify": "^5.12.4",
+    "zod": "^4.6.5"
   }
 }

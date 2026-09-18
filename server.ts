@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { parseConfig } from "./config.ts";
 
 export function buildServer() {
   const app = Fastify({
@@ -12,14 +13,12 @@ export function buildServer() {
   return app;
 }
 
-const port = Number(process.env.PORT ?? 3000);
-
-const app = buildServer();
-
 try {
-  await app.listen({ port, host: "0.0.0.0" });
-  console.log(`slipstream api listening on http://localhost:${port}`);
+  const config = parseConfig(process.env);
+  const app = buildServer();
+  await app.listen({ port: config.PORT, host: "0.0.0.0" });
+  console.log(`slipstream api listening on http://localhost:${config.PORT}`);
 } catch (error) {
-  console.error(error);
+  console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 }
