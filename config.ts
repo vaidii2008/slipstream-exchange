@@ -3,6 +3,11 @@ import { z } from "zod";
 const envSchema = z
   .object({
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+    DATABASE_URL: z.url({
+      protocol: /^postgres(ql)?$/,
+      hostname: /.+/,
+      error: "must be a postgres:// connection string",
+    }),
   })
   .readonly();
 
