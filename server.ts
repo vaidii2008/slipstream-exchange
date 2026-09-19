@@ -1,15 +1,46 @@
+import { setTimeout as delay } from "node:timers/promises";
 import Fastify from "fastify";
 import { Pool } from "pg";
 import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
 
-export function buildServer() {
+const HEALTH_CHECK_TIMEOUT_MS = 1000;
+
+type Dependencies = {
+  pool: Pool;
+  redis: ReturnType<typeof createRedisClient>;
+};
+
+async function probe(check: () => Promise<unknown>): Promise<"up" | "down"> {
+  try {
+    await Promise.race([
+      check(),
+      delay(HEALTH_CHECK_TIMEOUT_MS, undefined, { ref: false }).then(() => {
+        throw new Error("health check timed out");
+      }),
+    ]);
+    return "up";
+  } catch {
+    return "down";
+  }
+}
+
+export function buildServer({ pool, redis }: Dependencies) {
   const app = Fastify({
     logger: false,
   });
 
-  app.get("/health", () => {
-    return { status: "ok" };
+  app.get("/health", async (_request, reply) => {
+    const [postgres, redisStatus] = await Promise.all([
+      probe(() => pool.query("select 1")),
+      probe(() => redis.ping()),
+    ]);
+    const healthy = postgres === "up" && redisStatus === "up";
+
+    return reply.code(healthy ? 200 : 503).send({
+      status: healthy ? "ok" : "degraded",
+      checks: { postgres, redis: redisStatus },
+    });
   });
 
   return app;
@@ -70,7 +101,7 @@ try {
   await verifyRedis(redis);
   console.log("redis connection verified");
 
-  const app = buildServer();
+  const app = buildServer({ pool, redis });
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   console.log(`slipstream api listening on http://localhost:${config.PORT}`);
 } catch (error) {
