@@ -8,6 +8,11 @@ const envSchema = z
       hostname: /.+/,
       error: "must be a postgres:// connection string",
     }),
+    REDIS_URL: z.url({
+      protocol: /^rediss?$/,
+      hostname: /.+/,
+      error: "must be a redis:// connection string",
+    }),
   })
   .readonly();
 

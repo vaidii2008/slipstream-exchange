@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { Pool } from "pg";
+import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
 
 export function buildServer() {
@@ -23,6 +24,34 @@ async function verifyPostgres(pool: Pool): Promise<void> {
   }
 }
 
+function createRedisClient(url: string) {
+  let hasConnected = false;
+  const client = createClient({
+    url,
+    socket: {
+      connectTimeout: 5000,
+      reconnectStrategy: (retries, cause) => (hasConnected ? Math.min(retries * 200, 2000) : cause),
+    },
+  });
+  client.on("ready", () => {
+    hasConnected = true;
+  });
+  client.on("error", (error) => {
+    console.error(`redis client error: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  return client;
+}
+
+async function verifyRedis(redis: ReturnType<typeof createRedisClient>): Promise<void> {
+  try {
+    await redis.connect();
+    await redis.ping();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`redis is unreachable: ${reason}`, { cause: error });
+  }
+}
+
 try {
   const config = parseConfig(process.env);
 
@@ -36,6 +65,10 @@ try {
 
   await verifyPostgres(pool);
   console.log("postgres connection verified");
+
+  const redis = createRedisClient(config.REDIS_URL);
+  await verifyRedis(redis);
+  console.log("redis connection verified");
 
   const app = buildServer();
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
