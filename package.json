@@ -13,7 +13,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "start": "node --env-file-if-exists=.env server.ts",
+    "start": "node --env-file-if-exists=.env main.ts",
     "test": "vitest run"
   },
   "devDependencies": {
