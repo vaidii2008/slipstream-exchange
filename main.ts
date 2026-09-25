@@ -1,3 +1,4 @@
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
@@ -58,7 +59,8 @@ try {
   await verifyRedis(redis);
   console.log("redis connection verified");
 
-  const app = buildServer({ pool, redis });
+  const db = drizzle({ client: pool });
+  const app = buildServer({ pool, redis, db });
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   console.log(`slipstream api listening on http://localhost:${config.PORT}`);
 } catch (error) {
