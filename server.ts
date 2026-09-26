@@ -7,6 +7,7 @@ import { users } from "./schema.ts";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 const UNIQUE_VIOLATION = "23505";
+const MAX_CAUSE_DEPTH = 5;
 
 type PostgresProbe = {
   query: (sql: string) => Promise<unknown>;
@@ -42,12 +43,22 @@ async function probe(check: () => Promise<unknown>): Promise<"up" | "down"> {
 }
 
 function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    error.code === UNIQUE_VIOLATION
-  );
+  let current: unknown = error;
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (typeof current !== "object" || current === null) {
+      return false;
+    }
+    if ("code" in current && current.code === UNIQUE_VIOLATION) {
+      return true;
+    }
+    if (!("cause" in current)) {
+      return false;
+    }
+    current = current.cause;
+  }
+
+  return false;
 }
 
 export function buildServer({ pool, redis, db }: ServerDependencies) {
