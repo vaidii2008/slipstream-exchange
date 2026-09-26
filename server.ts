@@ -43,7 +43,10 @@ async function probe(check: () => Promise<unknown>): Promise<"up" | "down"> {
 
 function isUniqueViolation(error: unknown): boolean {
   return (
-    typeof error === "object" && error !== null && "code" in error && error.code === UNIQUE_VIOLATION
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === UNIQUE_VIOLATION
   );
 }
 
