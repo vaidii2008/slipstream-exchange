@@ -153,3 +153,158 @@ Opens with the split that Day 2 made unavoidable, then the planned commits:
 - `feat: add register endpoint with zod request validation`
 - `feat: hash passwords with argon2id`
 - `test: cover duplicate email rejection`
+
+## Day 3 — Users exist
+
+**Commits landed (11)**
+
+- `refactor(api): move process boot out of server.ts`
+- `style(api): apply prettier to the boot refactor`
+- `chore(db): add the drizzle toolchain`
+- `feat(db): define the users table schema`
+- `chore(db): generate the first migration`
+- `feat(auth): hash passwords with argon2id`
+- `feat(api): add register endpoint with zod request validation`
+- `style(api): apply prettier to the register endpoint`
+- `fix(api): detect unique violations through the drizzle error cause`
+- `test(api): cover duplicate email rejection`
+- `docs: record day 3 in PROGRESS.md`
+
+**What now works**
+
+- `server.ts` exports `buildServer({ pool, redis, db })` and nothing else runs on
+  import. `main.ts` is the composition root: parse config, open the pool, verify
+  Postgres, open Redis, verify, wrap the pool in Drizzle, build the app, listen.
+  `npm start` runs `main.ts`.
+- `buildServer` declares the narrowest types it uses: something with `query`,
+  something with `ping`. A test satisfies Redis with a two-line object while the
+  real client still passes. `db` is the concrete `NodePgDatabase`, because a
+  structural type for the query builder would be unusable.
+- drizzle-orm 0.45.3 and drizzle-kit 0.31.11. `schema.ts` is the source of truth
+  for the `users` table: uuid primary key defaulting to `gen_random_uuid()`,
+  `email` text not null unique, `password_hash` text not null, `created_at`
+  timestamptz not null defaulting to `now()`.
+- `drizzle.config.ts` reads `.env` through `process.loadEnvFile`, since
+  drizzle-kit is a separate process and never sees `--env-file-if-exists`. Real
+  environment variables still win. It deliberately does not import `parseConfig`,
+  which would fail a migration over a missing `REDIS_URL`.
+- `drizzle/0000_create_users.sql` is generated, committed and applied. The
+  `drizzle.__drizzle_migrations` table records it by hash, so a second `migrate`
+  applies nothing. Verified by running it twice.
+- `password.ts` wraps @node-rs/argon2 with argon2id at m=19456, t=2, p=1,
+  outputLen=32. Output is a PHC string carrying the variant, version, parameters
+  and salt, which is why `password_hash` is `text` and why the cost can be raised
+  later with old hashes still verifying. Measured 6.9 ms per hash on this machine.
+- `POST /register` validates with zod inside the handler. Email is trimmed and
+  lowercased before the address is checked, so `"  Vaidhyam@Example.COM  "` and
+  `"vaidhyam@example.com"` are one account. Password is 8–256 characters. A bad
+  request returns 400 listing every issue at once, not just the first.
+- Success returns 201 with `id`, `email` and `createdAt` from `.returning()`, so
+  no follow-up SELECT, and no password material in the response.
+- A duplicate returns 409 `email_already_registered`. There is no check-then-
+  insert anywhere: the insert runs and the unique index arbitrates. A pre-check
+  would leave a window between the check and the insert that no application code
+  can close.
+- `isUniqueViolation` walks the error `cause` chain up to five levels looking for
+  SQLSTATE 23505, because Drizzle wraps the driver's `DatabaseError` in a
+  `DrizzleQueryError` and the code lives on the inner one. Matching is on the
+  SQLSTATE, never on message text.
+- `server.test.ts` drives the app through `app.inject()` in memory, against real
+  Postgres and a fake Redis. Four tests, including six concurrent registrations of
+  one address producing exactly one 201, five 409s and one row.
+- Tests isolate themselves with unique `register-test-<uuid>@slipstream.test`
+  addresses and delete exactly those rows in `afterAll`, so the suite never
+  destroys data being used by hand.
+- 26 tests over three files. Gate unchanged: `format:check`, `lint`, `typecheck`,
+  `test`.
+
+**What is stubbed**
+
+- Unhandled errors leak internals. During today's bug, Fastify's default handler
+  echoed the failing SQL and a stored argon2 digest into a 500 body. Day 5's
+  centralized error handler is now required, not cosmetic.
+- No login, no tokens, no sessions. `verifyPassword` is written and tested but
+  has no caller until Day 4.
+- Registration is unauthenticated and unlimited, and every call burns ~7 ms of
+  argon2 CPU. That is a denial-of-service lever until Day 15's rate limiting.
+- Returning 409 confirms to an anonymous caller that an address is registered.
+  Accepted knowingly: the alternative needs a mail system this simulator lacks.
+- `npm test` now needs `docker compose up -d --wait` first. Day 7's CI will need
+  a Postgres service container.
+- There is no test database. The suite scopes itself by email; a test needing to
+  assert over all users would break that and force a real one.
+- `isUniqueViolation` matches the SQLSTATE only, not the constraint name. A second
+  unique constraint on `users` would make a collision there report
+  "email already registered".
+- No graceful shutdown. Ctrl+C still leaves the pool and Redis connection unclosed.
+- Still `console.log` and `console.error`. Day 5 brings pino.
+- `npm audit` reports 4 moderate findings, all from drizzle-kit's dependency on
+  the deprecated `@esbuild-kit` loaders, which pin an old esbuild.
+  `npm audit --omit=dev` is 0, the advisories need esbuild's dev server running,
+  and drizzle-kit never starts it. Not force-fixed: the only change `--force` can
+  make is downgrading drizzle-kit to 0.18.1. Revisit when drizzle-kit ships a
+  stable release without `@esbuild-kit`.
+- Three esbuild install scripts and fsevents remain unapproved under allowScripts.
+  `generate` and `migrate` both work without them.
+- One manual row is left in the dev database: `vaidhyam@example.com` with
+  password `hunter2hunter2`. Useful for Day 4's login testing.
+
+**Decisions and deviations from the plan**
+
+- Day 3 opened with the split Day 2 made unavoidable. `main.ts` is the one file
+  allowed to reach out and create things; everything below it receives what it
+  needs as arguments. This is what makes `app.inject()` possible at all.
+- The plan's `chore: add drizzle-orm and drizzle-kit` became one commit. Kit reads
+  orm's table objects and must match its version, so a repo with one and not the
+  other is never a correct state.
+- The plan's commits 5 and 6 were swapped: hashing landed before the endpoint.
+  In the planned order the endpoint must either persist nothing or write a
+  non-hash into `password_hash`, and neither is an honest green commit.
+- `generate and apply the first migration` was renamed to `generate the first
+migration`. Applying changes a database, not the repo, so it cannot be part of
+  a commit.
+- uuid over serial for the users primary key, because user ids are public and
+  sequential integers expose volume and let anyone walk the range. Internal
+  tables coming on Days 6–7 will likely take bigint identity instead; this is a
+  per-table call, not a house rule.
+- `text` plus normalisation at the API boundary, over the `citext` extension.
+  One `.toLowerCase()` in zod solves what an extension would otherwise manage.
+- No `updatedAt` on users. Nothing updates a user yet, and adding the column later
+  is a small migration worth practising.
+- @node-rs/argon2 over node-argon2, which needs exactly the postinstall prebuild
+  step this machine's npm holds back, and over `node:crypto.argon2`, which is a
+  raw KDF and would mean hand-rolling salt handling, PHC encoding and constant-
+  time comparison.
+- The argon2 variant is not passed explicitly. The package default is argon2id
+  and it exports the variant as a const enum, which TypeScript refuses to read
+  under isolatedModules. The test asserts the `$argon2id$v=19$m=19456,t=2,p=1$`
+  prefix instead, which is a stronger guarantee than a setting.
+- zod parsing sits inside the handler rather than in Fastify's JSON Schema option,
+  so there is one description of each request shape. Day 4's login repeats the
+  same four lines; that repetition is what earns a shared helper, not before.
+- Two `style:` commits were needed because supplied code exceeded the print width
+  twice and the gate was run after `git add` instead of before. Working rule from
+  here: `npm run format` first, then the full gate, then stage and commit.
+- One `fix:` commit because the first attempt checked `error.code` on the thrown
+  object. A throwaway probe script showed the code one layer down in `cause`.
+  Diagnosing before editing is what made that a three-line fix.
+- Day 3 ran to 11 commits rather than 7.
+
+**Repo shape**
+
+Still flat. Root now also holds `drizzle.config.ts`, `schema.ts`, `password.ts`,
+`password.test.ts` and `server.test.ts`, alongside the generated `drizzle/`
+directory, which is the only directory in the repo and is excluded from Prettier
+via `.prettierignore`.
+
+`server.ts` is just over 100 lines and now holds two unrelated route groups plus
+their helpers. Day 4 adds login, an auth prehandler and a current-user route. That
+is the pressure that will force routes into their own module, probably mid-day.
+
+**Next: Day 4 — Login works**
+
+- `feat: add login endpoint with credential verification`
+- `feat: issue short-lived jwt access tokens`
+- `feat: add auth prehandler and current-user route`
+- `fix: return a uniform error shape for auth failures`
+- `test: cover login success and wrong-password paths`
