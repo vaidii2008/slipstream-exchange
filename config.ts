@@ -13,6 +13,7 @@ const envSchema = z
       hostname: /.+/,
       error: "must be a redis:// connection string",
     }),
+    JWT_ACCESS_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
   })
   .readonly();
 

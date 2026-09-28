@@ -3,6 +3,7 @@ import { Pool } from "pg";
 import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
 import { buildServer } from "./server.ts";
+import { createAccessTokens } from "./tokens.ts";
 
 async function verifyPostgres(pool: Pool): Promise<void> {
   try {
@@ -43,6 +44,7 @@ async function verifyRedis(redis: ReturnType<typeof createRedisClient>): Promise
 
 try {
   const config = parseConfig(process.env);
+  const tokens = createAccessTokens(config.JWT_ACCESS_SECRET);
 
   const pool = new Pool({
     connectionString: config.DATABASE_URL,
@@ -60,7 +62,7 @@ try {
   console.log("redis connection verified");
 
   const db = drizzle({ client: pool });
-  const app = buildServer({ pool, redis, db });
+  const app = buildServer({ pool, redis, db, tokens });
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   console.log(`slipstream api listening on http://localhost:${config.PORT}`);
 } catch (error) {

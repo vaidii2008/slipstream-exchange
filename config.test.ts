@@ -4,6 +4,7 @@ import { parseConfig } from "./config.ts";
 const base = {
   DATABASE_URL: "postgres://slipstream:slipstream@127.0.0.1:5433/slipstream",
   REDIS_URL: "redis://127.0.0.1:6380",
+  JWT_ACCESS_SECRET: "test-access-secret-0123456789abcdef",
 };
 
 describe("parseConfig", () => {
@@ -51,6 +52,24 @@ describe("parseConfig", () => {
       expect(() => parseConfig({ ...base, REDIS_URL: url })).toThrow(/REDIS_URL/);
     },
   );
+
+  it("rejects a missing JWT_ACCESS_SECRET", () => {
+    expect(() =>
+      parseConfig({ DATABASE_URL: base.DATABASE_URL, REDIS_URL: base.REDIS_URL }),
+    ).toThrow(/JWT_ACCESS_SECRET/);
+  });
+
+  it("rejects a short JWT_ACCESS_SECRET without echoing it", () => {
+    const secret = "short-secret-that-must-not-leak";
+    let message = "";
+    try {
+      parseConfig({ ...base, JWT_ACCESS_SECRET: secret });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/JWT_ACCESS_SECRET/);
+    expect(message).not.toContain(secret);
+  });
 
   it("freezes the parsed config", () => {
     expect(Object.isFrozen(parseConfig(base))).toBe(true);

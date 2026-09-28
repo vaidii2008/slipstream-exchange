@@ -6,6 +6,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
+import { createAccessTokens } from "./tokens.ts";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -22,6 +23,7 @@ const app = buildServer({
   pool,
   redis: { ping: () => Promise.resolve("PONG") },
   db,
+  tokens: createAccessTokens("t".repeat(32)),
 });
 
 const createdEmails: string[] = [];
