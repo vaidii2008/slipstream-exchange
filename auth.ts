@@ -15,15 +15,27 @@ export type AuthDependencies = {
   tokens: AccessTokens;
 };
 
+const emailField = z.string().trim().toLowerCase().pipe(z.email().max(254));
+
 const registerBody = z.object({
-  email: z.string().trim().toLowerCase().pipe(z.email().max(254)),
+  email: emailField,
   password: z.string().min(8).max(256),
 });
 
 const loginBody = z.object({
-  email: z.string().trim().toLowerCase().pipe(z.email().max(254)),
+  email: emailField,
   password: z.string().min(1).max(256),
 });
+
+function invalidRequest(error: z.ZodError) {
+  return {
+    error: "invalid_request",
+    issues: error.issues.map((issue) => ({
+      field: issue.path.join("."),
+      message: issue.message,
+    })),
+  };
+}
 
 function isUniqueViolation(error: unknown): boolean {
   let current: unknown = error;
@@ -55,13 +67,7 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
   app.post("/register", async (request, reply) => {
     const parsed = registerBody.safeParse(request.body);
     if (!parsed.success) {
-      return reply.code(400).send({
-        error: "invalid_request",
-        issues: parsed.error.issues.map((issue) => ({
-          field: issue.path.join("."),
-          message: issue.message,
-        })),
-      });
+      return reply.code(400).send(invalidRequest(parsed.error));
     }
 
     const passwordHash = await hashPassword(parsed.data.password);
@@ -88,13 +94,7 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
   app.post("/login", async (request, reply) => {
     const parsed = loginBody.safeParse(request.body);
     if (!parsed.success) {
-      return reply.code(400).send({
-        error: "invalid_request",
-        issues: parsed.error.issues.map((issue) => ({
-          field: issue.path.join("."),
-          message: issue.message,
-        })),
-      });
+      return reply.code(400).send(invalidRequest(parsed.error));
     }
 
     const [user] = await db
