@@ -1,11 +1,18 @@
 import { eq } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { hashPassword, verifyPassword } from "./password.ts";
 import { users } from "./schema.ts";
 import type { AccessTokens } from "./tokens.ts";
 
+declare module "fastify" {
+  interface FastifyRequest {
+    userId: string | null;
+  }
+}
+
+const BEARER_HEADER = /^Bearer +(\S+)$/i;
 const UNIQUE_VIOLATION = "23505";
 const MAX_CAUSE_DEPTH = 5;
 const TIMING_DUMMY_PASSWORD = "slipstream-login-timing-dummy";
@@ -37,6 +44,13 @@ function invalidRequest(error: z.ZodError) {
   };
 }
 
+function readBearerToken(header: string | undefined): string | undefined {
+  if (header === undefined) {
+    return undefined;
+  }
+  return BEARER_HEADER.exec(header)?.[1];
+}
+
 function isUniqueViolation(error: unknown): boolean {
   let current: unknown = error;
 
@@ -62,6 +76,30 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
   async function verifyAgainstDummy(password: string): Promise<void> {
     timingDummyHash ??= hashPassword(TIMING_DUMMY_PASSWORD);
     await verifyPassword(await timingDummyHash, password);
+  }
+
+  app.decorateRequest("userId", null);
+
+  async function authenticate(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<FastifyReply | undefined> {
+    const token = readBearerToken(request.headers.authorization);
+    if (token === undefined) {
+      return reply.code(401).header("www-authenticate", "Bearer").send({ error: "missing_token" });
+    }
+
+    const verification = await tokens.verify(token);
+    if (!verification.ok) {
+      const error = verification.reason === "expired" ? "token_expired" : "invalid_token";
+      return reply
+        .code(401)
+        .header("www-authenticate", 'Bearer error="invalid_token"')
+        .send({ error });
+    }
+
+    request.userId = verification.userId;
+    return undefined;
   }
 
   app.post("/register", async (request, reply) => {
@@ -115,5 +153,27 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
 
     const accessToken = await tokens.issue(user.id);
     return reply.code(200).send({ accessToken, tokenType: "Bearer" });
+  });
+
+  app.get("/me", { onRequest: authenticate }, async (request, reply) => {
+    const userId = request.userId;
+    if (userId === null) {
+      throw new Error("GET /me ran without the authenticate hook");
+    }
+
+    const [user] = await db
+      .select({ id: users.id, email: users.email, createdAt: users.createdAt })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    if (user === undefined) {
+      return reply
+        .code(401)
+        .header("www-authenticate", 'Bearer error="invalid_token"')
+        .send({ error: "invalid_token" });
+    }
+
+    return reply.code(200).send(user);
   });
 }
