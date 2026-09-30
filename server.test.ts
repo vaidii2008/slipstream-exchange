@@ -19,11 +19,12 @@ if (databaseUrl === undefined) {
 
 const pool = new Pool({ connectionString: databaseUrl });
 const db = drizzle({ client: pool });
+const tokens = createAccessTokens("t".repeat(32));
 const app = buildServer({
   pool,
   redis: { ping: () => Promise.resolve("PONG") },
   db,
-  tokens: createAccessTokens("t".repeat(32)),
+  tokens,
 });
 
 const createdEmails: string[] = [];
@@ -38,6 +39,14 @@ function register(email: string, password: string) {
   return app.inject({
     method: "POST",
     url: "/register",
+    payload: { email, password },
+  });
+}
+
+function login(email: string, password: string) {
+  return app.inject({
+    method: "POST",
+    url: "/login",
     payload: { email, password },
   });
 }
@@ -105,5 +114,60 @@ describe("POST /register", () => {
 
     const rows = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
     expect(rows).toHaveLength(1);
+  });
+});
+
+describe("POST /login", () => {
+  it("returns a bearer token that verifies to the registered user", async () => {
+    const email = uniqueEmail();
+    const registered = await register(email, "hunter2hunter2");
+    const { id } = registered.json<{ id: string }>();
+
+    const response = await login(email, "hunter2hunter2");
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ accessToken: string; tokenType: string }>();
+    expect(body.tokenType).toBe("Bearer");
+    await expect(tokens.verify(body.accessToken)).resolves.toMatchObject({ ok: true, userId: id });
+  });
+
+  it("accepts the email in a different case with surrounding space", async () => {
+    const email = uniqueEmail();
+    await register(email, "hunter2hunter2");
+
+    const response = await login(`  ${email.toUpperCase()}  `, "hunter2hunter2");
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("rejects a wrong password with invalid_credentials", async () => {
+    const email = uniqueEmail();
+    await register(email, "hunter2hunter2");
+
+    const response = await login(email, "hunter2hunter3");
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json<unknown>()).toEqual({ error: "invalid_credentials" });
+  });
+
+  it("answers an unknown email exactly as it answers a wrong password", async () => {
+    const email = uniqueEmail();
+    await register(email, "hunter2hunter2");
+
+    const wrongPassword = await login(email, "hunter2hunter3");
+    const unknownEmail = await login(
+      `login-unknown-${randomUUID()}@slipstream.test`,
+      "hunter2hunter3",
+    );
+
+    expect(unknownEmail.statusCode).toBe(wrongPassword.statusCode);
+    expect(unknownEmail.body).toBe(wrongPassword.body);
+  });
+
+  it("rejects an empty password with invalid_request", async () => {
+    const response = await login(uniqueEmail(), "");
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json<unknown>()).toMatchObject({ error: "invalid_request" });
   });
 });
