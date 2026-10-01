@@ -6,7 +6,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
-import { createAccessTokens } from "./tokens.ts";
+import { createAccessTokens, DEFAULT_ACCESS_TOKEN_TTL_SECONDS } from "./tokens.ts";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -19,7 +19,8 @@ if (databaseUrl === undefined) {
 
 const pool = new Pool({ connectionString: databaseUrl });
 const db = drizzle({ client: pool });
-const tokens = createAccessTokens("t".repeat(32));
+const TEST_SECRET = "t".repeat(32);
+const tokens = createAccessTokens(TEST_SECRET);
 const app = buildServer({
   pool,
   redis: { ping: () => Promise.resolve("PONG") },
@@ -48,6 +49,14 @@ function login(email: string, password: string) {
     method: "POST",
     url: "/login",
     payload: { email, password },
+  });
+}
+
+function me(authorization?: string) {
+  return app.inject({
+    method: "GET",
+    url: "/me",
+    headers: authorization === undefined ? {} : { authorization },
   });
 }
 
@@ -169,5 +178,74 @@ describe("POST /login", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json<unknown>()).toMatchObject({ error: "invalid_request" });
+  });
+});
+
+describe("GET /me", () => {
+  async function signedInUser() {
+    const email = uniqueEmail();
+    const registered = await register(email, "hunter2hunter2");
+    const { id } = registered.json<{ id: string }>();
+    const loggedIn = await login(email, "hunter2hunter2");
+    const { accessToken } = loggedIn.json<{ accessToken: string }>();
+    return { id, email, accessToken };
+  }
+
+  it("returns the caller's own row and nothing else", async () => {
+    const { id, email, accessToken } = await signedInUser();
+
+    const response = await me(`Bearer ${accessToken}`);
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json<Record<string, unknown>>();
+    expect(Object.keys(body).sort()).toEqual(["createdAt", "email", "id"]);
+    expect(body).toMatchObject({ id, email });
+  });
+
+  it("accepts the bearer scheme in lowercase", async () => {
+    const { accessToken } = await signedInUser();
+
+    const response = await me(`bearer ${accessToken}`);
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it("rejects a request with no authorization header", async () => {
+    const response = await me();
+
+    expect(response.statusCode).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe("Bearer");
+    expect(response.json<unknown>()).toEqual({ error: "missing_token" });
+  });
+
+  it("rejects a token that is not a jwt", async () => {
+    const response = await me("Bearer not-a-token");
+
+    expect(response.statusCode).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe('Bearer error="invalid_token"');
+    expect(response.json<unknown>()).toEqual({ error: "invalid_token" });
+  });
+
+  it("tells the client a correctly signed but old token has expired", async () => {
+    const { id } = await signedInUser();
+    const issuedTooLongAgo = createAccessTokens(TEST_SECRET, {
+      now: () => new Date(Date.now() - (DEFAULT_ACCESS_TOKEN_TTL_SECONDS + 60) * 1000),
+    });
+    const expired = await issuedTooLongAgo.issue(id);
+
+    const response = await me(`Bearer ${expired}`);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json<unknown>()).toEqual({ error: "token_expired" });
+  });
+
+  it("rejects a still-valid token whose user no longer exists", async () => {
+    const { id, accessToken } = await signedInUser();
+    await db.delete(users).where(eq(users.id, id));
+
+    const response = await me(`Bearer ${accessToken}`);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json<unknown>()).toEqual({ error: "invalid_token" });
   });
 });
