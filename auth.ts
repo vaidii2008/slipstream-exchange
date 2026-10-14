@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { hashPassword, verifyPassword } from "./password.ts";
-import { users } from "./schema.ts";
-import type { AccessTokens } from "./tokens.ts";
+import { refreshTokens, users } from "./schema.ts";
+import { generateRefreshToken, REFRESH_TOKEN_TTL_SECONDS, type AccessTokens } from "./tokens.ts";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -15,6 +16,8 @@ declare module "fastify" {
 const BEARER_HEADER = /^Bearer +(\S+)$/i;
 const UNIQUE_VIOLATION = "23505";
 const MAX_CAUSE_DEPTH = 5;
+const REFRESH_COOKIE = "slipstream_refresh";
+const REFRESH_COOKIE_PATH = "/session";
 const TIMING_DUMMY_PASSWORD = "slipstream-login-timing-dummy";
 
 export type AuthDependencies = {
@@ -152,7 +155,24 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
     }
 
     const accessToken = await tokens.issue(user.id);
-    return reply.code(200).send({ accessToken, tokenType: "Bearer" });
+    const refresh = generateRefreshToken();
+    await db.insert(refreshTokens).values({
+      userId: user.id,
+      familyId: randomUUID(),
+      tokenHash: refresh.tokenHash,
+      expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000),
+    });
+
+    return reply
+      .code(200)
+      .setCookie(REFRESH_COOKIE, refresh.token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "strict",
+        path: REFRESH_COOKIE_PATH,
+        maxAge: REFRESH_TOKEN_TTL_SECONDS,
+      })
+      .send({ accessToken, tokenType: "Bearer" });
   });
 
   app.get("/me", { onRequest: authenticate }, async (request, reply) => {

@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Fastify from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
+import cookie from "@fastify/cookie";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 
@@ -35,6 +36,8 @@ export function buildServer({ pool, redis, db, tokens }: ServerDependencies) {
   const app = Fastify({
     logger: false,
   });
+
+  void app.register(cookie);
 
   app.get("/health", async (_request, reply) => {
     const [postgres, redisStatus] = await Promise.all([

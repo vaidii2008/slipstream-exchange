@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { errors, jwtVerify, SignJWT } from "jose";
 
 const ALGORITHM = "HS256";
@@ -76,4 +77,20 @@ export function createAccessTokens(secret: string, options: AccessTokenOptions =
       }
     },
   };
+}
+
+export const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+export type GeneratedRefreshToken = {
+  token: string;
+  tokenHash: string;
+};
+
+export function hashRefreshToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export function generateRefreshToken(): GeneratedRefreshToken {
+  const token = randomBytes(32).toString("base64url");
+  return { token, tokenHash: hashRefreshToken(token) };
 }

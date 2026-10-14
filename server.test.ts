@@ -4,9 +4,13 @@ import { eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { users } from "./schema.ts";
+import { refreshTokens, users } from "./schema.ts";
 import { buildServer } from "./server.ts";
-import { createAccessTokens, DEFAULT_ACCESS_TOKEN_TTL_SECONDS } from "./tokens.ts";
+import {
+  createAccessTokens,
+  DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+  hashRefreshToken,
+} from "./tokens.ts";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -138,6 +142,32 @@ describe("POST /login", () => {
     const body = response.json<{ accessToken: string; tokenType: string }>();
     expect(body.tokenType).toBe("Bearer");
     await expect(tokens.verify(body.accessToken)).resolves.toMatchObject({ ok: true, userId: id });
+  });
+
+  it("sets a strict httpOnly refresh cookie and stores only its hash", async () => {
+    const email = uniqueEmail();
+    const registered = await register(email, "hunter2hunter2");
+    const { id } = registered.json<{ id: string }>();
+
+    const response = await login(email, "hunter2hunter2");
+
+    const cookie = response.cookies.find((candidate) => candidate.name === "slipstream_refresh");
+    if (cookie === undefined) {
+      throw new Error("login set no slipstream_refresh cookie");
+    }
+    expect(cookie).toMatchObject({
+      httpOnly: true,
+      secure: true,
+      sameSite: "Strict",
+      path: "/session",
+      maxAge: 604800,
+    });
+
+    const rows = await db
+      .select({ tokenHash: refreshTokens.tokenHash })
+      .from(refreshTokens)
+      .where(eq(refreshTokens.userId, id));
+    expect(rows).toEqual([{ tokenHash: hashRefreshToken(cookie.value) }]);
   });
 
   it("accepts the email in a different case with surrounding space", async () => {

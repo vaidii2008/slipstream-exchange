@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createAccessTokens } from "./tokens.ts";
+import { createAccessTokens, generateRefreshToken, hashRefreshToken } from "./tokens.ts";
 
 const SECRET = "a".repeat(32);
 
@@ -116,5 +116,27 @@ describe("createAccessTokens", () => {
       ok: false,
       reason: "invalid",
     });
+  });
+});
+
+describe("generateRefreshToken", () => {
+  it("returns 32 random bytes as base64url with their sha-256 hex digest", () => {
+    const { token, tokenHash } = generateRefreshToken();
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(tokenHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(tokenHash).toBe(hashRefreshToken(token));
+  });
+
+  it("never returns the same token twice", () => {
+    const seen = new Set(Array.from({ length: 100 }, () => generateRefreshToken().token));
+    expect(seen.size).toBe(100);
+  });
+});
+
+describe("hashRefreshToken", () => {
+  it("matches the published sha-256 test vector", () => {
+    expect(hashRefreshToken("abc")).toBe(
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
   });
 });
