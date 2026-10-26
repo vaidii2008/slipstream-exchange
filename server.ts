@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Fastify from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
+import { registerSessionRoutes } from "./sessions.ts";
 import cookie from "@fastify/cookie";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
@@ -53,6 +54,7 @@ export function buildServer({ pool, redis, db, tokens }: ServerDependencies) {
   });
 
   registerAuthRoutes(app, { db, tokens });
+  registerSessionRoutes(app, { db, tokens });
 
   return app;
 }
