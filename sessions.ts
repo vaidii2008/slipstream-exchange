@@ -61,6 +61,21 @@ export function rotateSession(
       .returning({ userId: refreshTokens.userId, familyId: refreshTokens.familyId });
 
     if (consumed === undefined) {
+      const [presented] = await tx
+        .select({ familyId: refreshTokens.familyId, usedAt: refreshTokens.usedAt })
+        .from(refreshTokens)
+        .where(eq(refreshTokens.tokenHash, presentedHash))
+        .limit(1);
+
+      if (presented !== undefined && presented.usedAt !== null) {
+        await tx
+          .update(refreshTokens)
+          .set({ revokedAt: now })
+          .where(
+            and(eq(refreshTokens.familyId, presented.familyId), isNull(refreshTokens.revokedAt)),
+          );
+      }
+
       return undefined;
     }
 
