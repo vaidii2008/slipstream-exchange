@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { refreshTokens } from "./schema.ts";
@@ -11,7 +11,13 @@ import {
 } from "./tokens.ts";
 
 const REFRESH_COOKIE = "slipstream_refresh";
-const REFRESH_COOKIE_PATH = "/session";
+
+const REFRESH_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  path: "/session",
+} as const;
 
 export type SessionDependencies = {
   db: NodePgDatabase;
@@ -90,14 +96,27 @@ export function rotateSession(
   });
 }
 
+export async function endSession(db: NodePgDatabase, presentedToken: string): Promise<void> {
+  const presentedFamily = db
+    .select({ familyId: refreshTokens.familyId })
+    .from(refreshTokens)
+    .where(eq(refreshTokens.tokenHash, hashRefreshToken(presentedToken)));
+
+  await db
+    .update(refreshTokens)
+    .set({ revokedAt: new Date() })
+    .where(and(isNull(refreshTokens.revokedAt), inArray(refreshTokens.familyId, presentedFamily)));
+}
+
 export function setRefreshCookie(reply: FastifyReply, token: string): FastifyReply {
   return reply.setCookie(REFRESH_COOKIE, token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "strict",
-    path: REFRESH_COOKIE_PATH,
+    ...REFRESH_COOKIE_OPTIONS,
     maxAge: REFRESH_TOKEN_TTL_SECONDS,
   });
+}
+
+export function clearRefreshCookie(reply: FastifyReply): FastifyReply {
+  return reply.clearCookie(REFRESH_COOKIE, REFRESH_COOKIE_OPTIONS);
 }
 
 export function registerSessionRoutes(
@@ -120,5 +139,13 @@ export function registerSessionRoutes(
       accessToken,
       tokenType: "Bearer",
     });
+  });
+
+  app.post("/session/logout", async (request, reply) => {
+    const presented = request.cookies[REFRESH_COOKIE];
+    if (presented !== undefined) {
+      await endSession(db, presented);
+    }
+    return clearRefreshCookie(reply.code(204)).send();
   });
 }
