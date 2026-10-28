@@ -35,7 +35,7 @@ const loginBody = z.object({
   password: z.string().min(1).max(256),
 });
 
-function invalidRequest(error: z.ZodError) {
+export function invalidRequest(error: z.ZodError) {
   return {
     error: "invalid_request",
     issues: error.issues.map((issue) => ({
@@ -71,17 +71,10 @@ function isUniqueViolation(error: unknown): boolean {
   return false;
 }
 
-export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDependencies): void {
-  let timingDummyHash: Promise<string> | undefined;
-
-  async function verifyAgainstDummy(password: string): Promise<void> {
-    timingDummyHash ??= hashPassword(TIMING_DUMMY_PASSWORD);
-    await verifyPassword(await timingDummyHash, password);
-  }
-
-  app.decorateRequest("userId", null);
-
-  async function authenticate(
+// An onRequest hook that rejects a request without a valid access token and records the
+// caller's id on the request for the handler.
+export function bearerAuth(tokens: AccessTokens) {
+  return async function authenticate(
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<FastifyReply | undefined> {
@@ -101,7 +94,27 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
 
     request.userId = verification.userId;
     return undefined;
+  };
+}
+
+// For handlers behind bearerAuth. A null here means the route forgot the hook.
+export function authenticatedUserId(request: FastifyRequest): string {
+  if (request.userId === null) {
+    throw new Error(`${request.method} ${request.url} ran without the bearerAuth hook`);
   }
+  return request.userId;
+}
+
+export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDependencies): void {
+  let timingDummyHash: Promise<string> | undefined;
+
+  async function verifyAgainstDummy(password: string): Promise<void> {
+    timingDummyHash ??= hashPassword(TIMING_DUMMY_PASSWORD);
+    await verifyPassword(await timingDummyHash, password);
+  }
+
+  app.decorateRequest("userId", null);
+  const authenticate = bearerAuth(tokens);
 
   app.post("/register", async (request, reply) => {
     const parsed = registerBody.safeParse(request.body);
@@ -162,10 +175,7 @@ export function registerAuthRoutes(app: FastifyInstance, { db, tokens }: AuthDep
   });
 
   app.get("/me", { onRequest: authenticate }, async (request, reply) => {
-    const userId = request.userId;
-    if (userId === null) {
-      throw new Error("GET /me ran without the authenticate hook");
-    }
+    const userId = authenticatedUserId(request);
 
     const [user] = await db
       .select({ id: users.id, email: users.email, createdAt: users.createdAt })
