@@ -1,43 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { eq, inArray } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { describe, expect, it } from "vitest";
 import { refreshTokens, users } from "./schema.ts";
-import { buildServer } from "./server.ts";
+import { TEST_SECRET, useTestServer } from "./testing.ts";
 import {
   createAccessTokens,
   DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
   hashRefreshToken,
 } from "./tokens.ts";
 
-if (existsSync(".env")) {
-  process.loadEnvFile(".env");
-}
-
-const databaseUrl = process.env.DATABASE_URL;
-if (databaseUrl === undefined) {
-  throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
-}
-
-const pool = new Pool({ connectionString: databaseUrl });
-const db = drizzle({ client: pool });
-const TEST_SECRET = "t".repeat(32);
-const tokens = createAccessTokens(TEST_SECRET);
-const app = buildServer({
-  pool,
-  redis: { ping: () => Promise.resolve("PONG") },
-  db,
-  tokens,
-});
-
-const createdEmails: string[] = [];
+const { db, tokens, app, uniqueEmail: emailWithPrefix } = useTestServer();
 
 function uniqueEmail(): string {
-  const email = `register-test-${randomUUID()}@slipstream.test`;
-  createdEmails.push(email);
-  return email;
+  return emailWithPrefix("register-test");
 }
 
 function register(email: string, password: string) {
@@ -63,24 +38,6 @@ function me(authorization?: string) {
     headers: authorization === undefined ? {} : { authorization },
   });
 }
-
-beforeAll(async () => {
-  try {
-    await pool.query("select 1");
-  } catch (error) {
-    throw new Error("cannot reach postgres: run `docker compose up -d --wait` first", {
-      cause: error,
-    });
-  }
-});
-
-afterAll(async () => {
-  if (createdEmails.length > 0) {
-    await db.delete(users).where(inArray(users.email, createdEmails));
-  }
-  await app.close();
-  await pool.end();
-});
 
 describe("POST /register", () => {
   it("creates a user and returns the row without any credential material", async () => {

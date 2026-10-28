@@ -1,43 +1,8 @@
-import { existsSync } from "node:fs";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { buildServer } from "./server.ts";
-import { createAccessTokens } from "./tokens.ts";
+import { useTestServer } from "./testing.ts";
 
-if (existsSync(".env")) {
-  process.loadEnvFile(".env");
-}
-
-const databaseUrl = process.env.DATABASE_URL;
-if (databaseUrl === undefined) {
-  throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
-}
-
-const pool = new Pool({ connectionString: databaseUrl });
-const db = drizzle({ client: pool });
-const tokens = createAccessTokens("t".repeat(32));
-const app = buildServer({
-  pool,
-  redis: { ping: () => Promise.resolve("PONG") },
-  db,
-  tokens,
-});
-
-beforeAll(async () => {
-  try {
-    await pool.query("select 1");
-  } catch (error) {
-    throw new Error("cannot reach postgres: run `docker compose up -d --wait` first", {
-      cause: error,
-    });
-  }
-});
-
-afterAll(async () => {
-  await app.close();
-  await pool.end();
-});
+const { pool, db, tokens, app } = useTestServer();
 
 describe("central error handling", () => {
   const leakyMessage = 'duplicate key value violates "users_email_unique": argon2id$secret';

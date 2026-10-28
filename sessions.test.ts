@@ -1,35 +1,12 @@
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { eq, inArray } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { describe, expect, it } from "vitest";
 import { refreshTokens, users } from "./schema.ts";
-import { buildServer } from "./server.ts";
-import { createAccessTokens, hashRefreshToken } from "./tokens.ts";
-
-if (existsSync(".env")) {
-  process.loadEnvFile(".env");
-}
-
-const databaseUrl = process.env.DATABASE_URL;
-if (databaseUrl === undefined) {
-  throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
-}
+import { useTestServer } from "./testing.ts";
+import { hashRefreshToken } from "./tokens.ts";
 
 const REFRESH_COOKIE = "slipstream_refresh";
 
-const pool = new Pool({ connectionString: databaseUrl });
-const db = drizzle({ client: pool });
-const tokens = createAccessTokens("s".repeat(32));
-const app = buildServer({
-  pool,
-  redis: { ping: () => Promise.resolve("PONG") },
-  db,
-  tokens,
-});
-
-const createdEmails: string[] = [];
+const { db, tokens, app, uniqueEmail } = useTestServer();
 
 type Response = Awaited<ReturnType<typeof app.inject>>;
 
@@ -42,8 +19,7 @@ function refreshCookieOf(response: Response): string {
 }
 
 async function signedInUser(): Promise<{ userId: string; refreshToken: string }> {
-  const email = `session-test-${randomUUID()}@slipstream.test`;
-  createdEmails.push(email);
+  const email = uniqueEmail("session-test");
 
   const registered = await app.inject({
     method: "POST",
@@ -87,24 +63,6 @@ function sessionRows(userId: string) {
     .from(refreshTokens)
     .where(eq(refreshTokens.userId, userId));
 }
-
-beforeAll(async () => {
-  try {
-    await pool.query("select 1");
-  } catch (error) {
-    throw new Error("cannot reach postgres: run `docker compose up -d --wait` first", {
-      cause: error,
-    });
-  }
-});
-
-afterAll(async () => {
-  if (createdEmails.length > 0) {
-    await db.delete(users).where(inArray(users.email, createdEmails));
-  }
-  await app.close();
-  await pool.end();
-});
 
 describe("POST /session/refresh", () => {
   it("swaps a valid refresh token for a new access token and a new refresh token", async () => {
