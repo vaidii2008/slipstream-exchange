@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Same images as compose.yaml, so CI tests against the versions developers run.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: slipstream
+          POSTGRES_PASSWORD: slipstream
+          POSTGRES_DB: slipstream
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U slipstream -d slipstream"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+
+    env:
+      DATABASE_URL: postgres://slipstream:slipstream@127.0.0.1:5432/slipstream
+      REDIS_URL: redis://127.0.0.1:6379
+      # A throwaway value: CI issues no token anyone can use.
+      JWT_ACCESS_SECRET: ci-only-access-secret-not-used-anywhere-else
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx drizzle-kit migrate
+      - run: npm run check
