@@ -1,6 +1,14 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { balancesOf, deposit, LedgerError, openAccount, postTransaction } from "./ledger.ts";
+import {
+  balancesOf,
+  deposit,
+  LedgerError,
+  openAccount,
+  postTransaction,
+  release,
+  reserve,
+} from "./ledger.ts";
 import { fromNumeric } from "./money.ts";
 import { ledgerEntries, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
@@ -199,5 +207,89 @@ describe("balancesOf", () => {
       available: 380n,
       reserved: 120n,
     });
+  });
+});
+
+describe("reserve and release", () => {
+  async function btcOf(userId: string) {
+    const balances = await balancesOf(db, userId);
+    const btc = balances.find((balance) => balance.asset === "BTC");
+    return { available: btc?.available, reserved: btc?.reserved };
+  }
+
+  it("moves funds from available to reserved and back", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+
+    await reserve(db, userId, "BTC", 70n);
+    await expect(btcOf(userId)).resolves.toEqual({ available: 30n, reserved: 70n });
+
+    await release(db, userId, "BTC", 25n);
+    await expect(btcOf(userId)).resolves.toEqual({ available: 55n, reserved: 45n });
+  });
+
+  it("refuses to reserve more than is available and changes nothing", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+
+    await expectLedgerError(reserve(db, userId, "BTC", 101n), "insufficient_funds");
+
+    await expect(btcOf(userId)).resolves.toEqual({ available: 100n, reserved: 0n });
+  });
+
+  it("does not let reserved funds be reserved twice", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+    await reserve(db, userId, "BTC", 60n);
+
+    await expectLedgerError(reserve(db, userId, "BTC", 50n), "insufficient_funds");
+
+    await expect(btcOf(userId)).resolves.toEqual({ available: 40n, reserved: 60n });
+  });
+
+  it("refuses to release more than is reserved", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+    await reserve(db, userId, "BTC", 10n);
+
+    await expectLedgerError(release(db, userId, "BTC", 11n), "insufficient_funds");
+
+    await expect(btcOf(userId)).resolves.toEqual({ available: 90n, reserved: 10n });
+  });
+
+  it("refuses a user with no funds at all", async () => {
+    const userId = await createUser();
+
+    await expectLedgerError(reserve(db, userId, "BTC", 1n), "insufficient_funds");
+  });
+
+  it("stops any posting from overdrawing a user, not just reservations", async () => {
+    const payer = await createUser();
+    const payee = await createUser();
+    await deposit(db, payer, "BTC", 5n);
+
+    await expectLedgerError(
+      postTransaction(db, "trade", [
+        { accountId: await openAccount(db, payer, "BTC", "available"), amount: -6n },
+        { accountId: await openAccount(db, payee, "BTC", "available"), amount: 6n },
+      ]),
+      "insufficient_funds",
+    );
+  });
+
+  it("lets the system account go negative, since deposits are drawn from it", async () => {
+    const userId = await createUser();
+
+    await deposit(db, userId, "ETH", 1n);
+
+    const [system] = await db
+      .execute<{ total: string }>(
+        sql`
+      select coalesce(sum(e.amount), 0) as total
+      from ledger_entries e join ledger_accounts a on a.id = e.account_id
+      where a.user_id is null and a.asset = 'ETH'`,
+      )
+      .then((result) => result.rows);
+    expect(fromNumeric(system?.total ?? "0", 8)).toBeLessThan(0n);
   });
 });

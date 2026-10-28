@@ -12,7 +12,8 @@ export type Posting = {
   amount: bigint;
 };
 
-export type LedgerErrorCode = "too_few_postings" | "zero_amount" | "unknown_account" | "unbalanced";
+export type LedgerErrorCode =
+  "too_few_postings" | "zero_amount" | "unknown_account" | "unbalanced" | "insufficient_funds";
 
 export class LedgerError extends Error {
   readonly code: LedgerErrorCode;
@@ -87,25 +88,74 @@ export async function postTransaction(
   return db.transaction(async (tx) => {
     const accountIds = [...new Set(postings.map((posting) => posting.accountId))];
     const accounts = await tx
-      .select({ id: ledgerAccounts.id, asset: ledgerAccounts.asset, scale: assets.scale })
+      .select({
+        id: ledgerAccounts.id,
+        userId: ledgerAccounts.userId,
+        asset: ledgerAccounts.asset,
+        scale: assets.scale,
+      })
       .from(ledgerAccounts)
       .innerJoin(assets, eq(assets.code, ledgerAccounts.asset))
       .where(inArray(ledgerAccounts.id, accountIds));
     const accountsById = new Map(accounts.map((account) => [account.id, account]));
 
     const totals = new Map<string, bigint>();
+    const netChange = new Map<number, bigint>();
     const rows = postings.map((posting) => {
       const account = accountsById.get(posting.accountId);
       if (account === undefined) {
         throw new LedgerError("unknown_account", `no ledger account ${posting.accountId}`);
       }
       totals.set(account.asset, (totals.get(account.asset) ?? 0n) + posting.amount);
+      netChange.set(account.id, (netChange.get(account.id) ?? 0n) + posting.amount);
       return { accountId: posting.accountId, amount: formatAmount(posting.amount, account.scale) };
     });
 
     for (const [asset, total] of totals) {
       if (total !== 0n) {
         throw new LedgerError("unbalanced", `${asset} entries sum to ${total}, not zero`);
+      }
+    }
+
+    // Only a user account that loses money can be overdrawn, so only those are locked and
+    // checked. The system account may go negative, and skipping it keeps every deposit of an
+    // asset from queueing on one row.
+    const debited = [...netChange]
+      .filter(([id, change]) => change < 0n && accountsById.get(id)?.userId !== null)
+      .map(([id]) => id);
+
+    if (debited.length > 0) {
+      // Locks are always taken in ascending id order, whatever order the postings came in, so
+      // two transactions debiting the same accounts queue instead of deadlocking.
+      await tx
+        .select({ id: ledgerAccounts.id })
+        .from(ledgerAccounts)
+        .where(inArray(ledgerAccounts.id, debited))
+        .orderBy(ledgerAccounts.id)
+        .for("update");
+
+      // A new statement after the lock, so under READ COMMITTED it sees every entry committed
+      // by whoever held the lock before us.
+      const sums = await tx
+        .select({ accountId: ledgerEntries.accountId, total: sum(ledgerEntries.amount) })
+        .from(ledgerEntries)
+        .where(inArray(ledgerEntries.accountId, debited))
+        .groupBy(ledgerEntries.accountId);
+      const balanceOf = new Map(sums.map((row) => [row.accountId, row.total ?? "0"]));
+
+      for (const id of debited) {
+        const account = accountsById.get(id);
+        const change = netChange.get(id);
+        if (account === undefined || change === undefined) {
+          throw new Error(`debited account ${id} missing from its own lookup`);
+        }
+        const balance = fromNumeric(balanceOf.get(id) ?? "0", account.scale);
+        if (balance + change < 0n) {
+          throw new LedgerError(
+            "insufficient_funds",
+            `account ${id} holds ${balance} ${account.asset}, cannot take ${-change}`,
+          );
+        }
       }
     }
 
@@ -142,6 +192,48 @@ export async function deposit(
   return postTransaction(db, "deposit", [
     { accountId: system, amount: -amount },
     { accountId: available, amount },
+  ]);
+}
+
+// Moves funds from available to reserved, for an open order. Fails with insufficient_funds
+// rather than overdraw.
+export function reserve(
+  db: NodePgDatabase,
+  userId: string,
+  asset: string,
+  amount: bigint,
+): Promise<number> {
+  return moveBetweenBuckets(db, "reserve", userId, asset, "available", "reserved", amount);
+}
+
+// Moves funds from reserved back to available, for a cancelled or finished order.
+export function release(
+  db: NodePgDatabase,
+  userId: string,
+  asset: string,
+  amount: bigint,
+): Promise<number> {
+  return moveBetweenBuckets(db, "release", userId, asset, "reserved", "available", amount);
+}
+
+async function moveBetweenBuckets(
+  db: NodePgDatabase,
+  kind: TransactionKind,
+  userId: string,
+  asset: string,
+  from: Bucket,
+  to: Bucket,
+  amount: bigint,
+): Promise<number> {
+  if (amount <= 0n) {
+    throw new RangeError(`${kind} amount must be positive, got ${amount}`);
+  }
+  const source = await openAccount(db, userId, asset, from);
+  const destination = await openAccount(db, userId, asset, to);
+
+  return postTransaction(db, kind, [
+    { accountId: source, amount: -amount },
+    { accountId: destination, amount },
   ]);
 }
 
