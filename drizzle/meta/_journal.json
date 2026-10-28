@@ -29,6 +29,13 @@
       "when": 1793219551308,
       "tag": "0003_seed_assets_and_markets",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793219578679,
+      "tag": "0004_create_ledger",
+      "breakpoints": true
     }
   ]
 }
