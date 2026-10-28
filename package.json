@@ -14,7 +14,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "start": "node --env-file-if-exists=.env main.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check": "npm run format:check && npm run typecheck && npm run lint && npm test"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
