@@ -39,7 +39,33 @@ async function verifyRedis(redis: ReturnType<typeof createRedisClient>): Promise
   }
 }
 
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
 let app: ReturnType<typeof buildServer> | undefined;
+
+function shutDownOn(signal: NodeJS.Signals, server: ReturnType<typeof buildServer>): void {
+  process.once(signal, () => {
+    server.log.info({ signal }, "shutting down");
+
+    // A request that never finishes must not keep the process alive past the
+    // orchestrator's own kill timeout, so give up and exit non-zero instead.
+    setTimeout(() => {
+      server.log.error({ timeoutMs: SHUTDOWN_TIMEOUT_MS }, "shutdown timed out");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS).unref();
+
+    server.close().then(
+      () => {
+        server.log.info("shutdown complete");
+        process.exit(0);
+      },
+      (error: unknown) => {
+        server.log.error({ err: error }, "shutdown failed");
+        process.exit(1);
+      },
+    );
+  });
+}
 
 try {
   const config = parseConfig(process.env);
@@ -62,6 +88,14 @@ try {
   redis.on("error", (error: unknown) => {
     log.error({ err: error }, "redis client error");
   });
+
+  // app.close() stops accepting connections and waits for in-flight requests before
+  // running onClose, so no request loses its database halfway through.
+  app.addHook("onClose", async () => {
+    await Promise.all([redis.isOpen ? redis.close() : undefined, pool.end()]);
+  });
+  shutDownOn("SIGTERM", app);
+  shutDownOn("SIGINT", app);
 
   await verifyPostgres(pool);
   log.info("postgres connection verified");
