@@ -1,0 +1,126 @@
+import { and, eq, inArray, isNull } from "drizzle-orm";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { formatAmount } from "./money.ts";
+import { assets, ledgerAccounts, ledgerEntries, ledgerTransactions } from "./schema.ts";
+
+export type Bucket = (typeof ledgerAccounts.bucket.enumValues)[number];
+export type TransactionKind = (typeof ledgerTransactions.kind.enumValues)[number];
+
+// One side of a transaction: a signed amount in the account's asset's minor units.
+export type Posting = {
+  accountId: number;
+  amount: bigint;
+};
+
+export type LedgerErrorCode = "too_few_postings" | "zero_amount" | "unknown_account" | "unbalanced";
+
+export class LedgerError extends Error {
+  readonly code: LedgerErrorCode;
+
+  constructor(code: LedgerErrorCode, message: string) {
+    super(message);
+    this.name = "LedgerError";
+    this.code = code;
+  }
+}
+
+// Accounts are created the first time they are needed, so a new user has no rows until money
+// moves. `owner` null is the asset's system account.
+export async function openAccount(
+  db: NodePgDatabase,
+  owner: string | null,
+  asset: string,
+  bucket: Bucket,
+): Promise<number> {
+  const matches = and(
+    owner === null ? isNull(ledgerAccounts.userId) : eq(ledgerAccounts.userId, owner),
+    eq(ledgerAccounts.asset, asset),
+    eq(ledgerAccounts.bucket, bucket),
+  );
+
+  const [existing] = await db
+    .select({ id: ledgerAccounts.id })
+    .from(ledgerAccounts)
+    .where(matches)
+    .limit(1);
+  if (existing !== undefined) {
+    return existing.id;
+  }
+
+  const [created] = await db
+    .insert(ledgerAccounts)
+    .values({ userId: owner, asset, bucket })
+    .onConflictDoNothing({
+      target: [ledgerAccounts.userId, ledgerAccounts.asset, ledgerAccounts.bucket],
+    })
+    .returning({ id: ledgerAccounts.id });
+  if (created !== undefined) {
+    return created.id;
+  }
+
+  // A concurrent call inserted the same account between our select and insert.
+  const [raced] = await db
+    .select({ id: ledgerAccounts.id })
+    .from(ledgerAccounts)
+    .where(matches)
+    .limit(1);
+  if (raced === undefined) {
+    throw new Error(`ledger account for ${owner ?? "system"} ${asset} ${bucket} vanished`);
+  }
+  return raced.id;
+}
+
+// Writes one transaction and all its entries, or nothing. The asset of each posting comes
+// from the database, not the caller, so a caller cannot balance BTC against USD by mislabelling.
+export async function postTransaction(
+  db: NodePgDatabase,
+  kind: TransactionKind,
+  postings: Posting[],
+): Promise<number> {
+  if (postings.length < 2) {
+    throw new LedgerError("too_few_postings", "a transaction needs at least two postings");
+  }
+  if (postings.some((posting) => posting.amount === 0n)) {
+    throw new LedgerError("zero_amount", "a posting cannot move zero");
+  }
+
+  return db.transaction(async (tx) => {
+    const accountIds = [...new Set(postings.map((posting) => posting.accountId))];
+    const accounts = await tx
+      .select({ id: ledgerAccounts.id, asset: ledgerAccounts.asset, scale: assets.scale })
+      .from(ledgerAccounts)
+      .innerJoin(assets, eq(assets.code, ledgerAccounts.asset))
+      .where(inArray(ledgerAccounts.id, accountIds));
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+
+    const totals = new Map<string, bigint>();
+    const rows = postings.map((posting) => {
+      const account = accountsById.get(posting.accountId);
+      if (account === undefined) {
+        throw new LedgerError("unknown_account", `no ledger account ${posting.accountId}`);
+      }
+      totals.set(account.asset, (totals.get(account.asset) ?? 0n) + posting.amount);
+      return { accountId: posting.accountId, amount: formatAmount(posting.amount, account.scale) };
+    });
+
+    for (const [asset, total] of totals) {
+      if (total !== 0n) {
+        throw new LedgerError("unbalanced", `${asset} entries sum to ${total}, not zero`);
+      }
+    }
+
+    const [transaction] = await tx
+      .insert(ledgerTransactions)
+      .values({ kind })
+      .returning({ id: ledgerTransactions.id });
+    if (transaction === undefined) {
+      throw new Error("ledger transaction insert returned no row");
+    }
+
+    await tx
+      .insert(ledgerEntries)
+      .values(rows.map((row) => ({ ...row, transactionId: transaction.id })));
+
+    return transaction.id;
+  });
+}

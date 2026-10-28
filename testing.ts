@@ -10,6 +10,41 @@ import { createAccessTokens } from "./tokens.ts";
 
 export const TEST_SECRET = "t".repeat(32);
 
+// The ledger never cascades, so test users' ledger rows go first. Whole transactions are
+// removed, system-account side included, which leaves every remaining transaction balanced.
+async function deleteLedgerHistory(pool: Pool, emails: string[]): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query(
+      `create temporary table doomed_transactions on commit drop as
+         select distinct e.transaction_id as id
+         from ledger_entries e
+         join ledger_accounts a on a.id = e.account_id
+         join users u on u.id = a.user_id
+         where u.email = any($1)`,
+      [emails],
+    );
+    await client.query(
+      "delete from ledger_entries where transaction_id in (select id from doomed_transactions)",
+    );
+    await client.query(
+      "delete from ledger_transactions where id in (select id from doomed_transactions)",
+    );
+    await client.query(
+      `delete from ledger_accounts
+       where user_id in (select id from users where email = any($1))`,
+      [emails],
+    );
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // Each test file calls this once at the top level. Vitest gives every file its own module
 // graph, so each file gets its own pool and app, and the hooks attach to that file.
 export function useTestServer() {
@@ -52,6 +87,7 @@ export function useTestServer() {
 
   afterAll(async () => {
     if (createdEmails.length > 0) {
+      await deleteLedgerHistory(pool, createdEmails);
       await db.delete(users).where(inArray(users.email, createdEmails));
     }
     await app.close();
