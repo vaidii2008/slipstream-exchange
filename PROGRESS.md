@@ -544,3 +544,96 @@ sharing it.
 - `feat(api): report balances derived from the ledger`
 - `feat(ledger): reserve and release funds under row locks`
 - `test(ledger): prove parallel reservations cannot overdraw`
+
+## Day 6 — Money and the ledger
+
+**Commits landed (13)**
+
+- `refactor(test): move the auth route tests from server.test.ts to auth.test.ts`
+- `refactor(test): share the Postgres test setup`
+- `feat(money): convert decimal strings to bigint minor units at a fixed scale`
+- `feat(db): define assets and markets with a seed for BTC, ETH and USD`
+- `feat(db): define ledger accounts, transactions and entries`
+- `feat(ledger): post a balanced transaction atomically`
+- `refactor(auth): export the bearer hook for a second consumer`
+- `feat(api): add a simulated deposit endpoint`
+- `feat(api): report balances derived from the ledger`
+- `feat(ledger): reserve and release funds under row locks`
+- `test(ledger): prove parallel reservations cannot overdraw`
+- `docs: record the money and ledger decisions in DECISIONS.md`
+- `docs: record day 6 in PROGRESS.md`
+
+**What now works**
+
+- `money.ts` is the one conversion module. `parseAmount("1.5", 8)` is `150000000n`.
+  It rejects negatives, exponents, leading zeros, more decimals than the scale and
+  anything past NUMERIC(36,18), and never rounds. `fromNumeric` reads Postgres's
+  18-decimal text back, and `formatAmount` prints exactly the asset's scale.
+- `assets` (BTC 8, ETH 8, USD 2) and `markets` (BTC-USD and ETH-USD, tick 0.01,
+  minimum quantity 0.0001 and 0.001) are seeded by a custom migration, so CI and
+  any fresh database get them from `drizzle-kit migrate`.
+- `ledger_accounts`, `ledger_transactions` and `ledger_entries` exist. Accounts
+  open on first use; the null-owner system account is one per asset through
+  `UNIQUE NULLS NOT DISTINCT`. Nothing cascades.
+- `postTransaction` writes a transaction and its entries atomically, and rejects
+  postings that don't sum to zero per asset, zero amounts, unknown accounts, and
+  any overdraft of a user account. It locks the debited user accounts in id
+  order with `SELECT ... FOR UPDATE` before re-summing them.
+- `reserve` and `release` move funds between available and reserved.
+- `POST /deposits { asset, amount }` credits the caller from the system account.
+  `GET /balances` lists every asset's available and reserved balance, summed
+  from the entries.
+- 50 parallel reservations of 10 against 100: exactly 10 succeed, 0 available
+  and 100 reserved after. With the lock removed by hand, 12 succeeded. Passed in
+  five consecutive runs of `ledger.test.ts` and three of the full suite.
+- 128 tests in 9 files, up from 68.
+
+**What is stubbed**
+
+- Nothing calls `reserve` or `release` over HTTP yet; order placement does in
+  Session 4.
+- Balanced-per-asset is enforced in `postTransaction`, not by the database. Rows
+  written by hand in psql are not checked.
+- Carried over: no test database separate from the dev one, `npm audit` dev-only
+  findings from drizzle-kit, the manual `vaidhyam@example.com` row, and the CI
+  workflow has still not run on GitHub.
+
+**Decisions and deviations from the plan**
+
+- Two refactors came first: the auth tests moved to `auth.test.ts`, then the
+  three copies of the Postgres test setup became `useTestServer()` in
+  `testing.ts`. Teardown now deletes test users' whole ledger transactions
+  before the users.
+- `bearerAuth` left `registerAuthRoutes` in its own refactor commit, because the
+  wallet routes were its second consumer.
+- The deposit and balance routes live in `wallet.ts`, not `ledger.ts`: HTTP
+  shape and bookkeeping rules change for different reasons.
+- Only debited user accounts are locked; the system account is not, so deposits
+  don't queue on one row. Four entries in `DECISIONS.md`.
+
+**Repo shape**
+
+Still flat. New: `money.ts`, `ledger.ts`, `wallet.ts`, `testing.ts` and their
+tests. `ledger.ts` is 284 lines with three jobs: accounts, posting, and
+balances/reservations. Trade settlement in Session 4 adds a fourth, so that is
+the point to split it.
+
+**Open question for Session 4**
+
+USD has scale 2, but a BTC quantity at scale 8 times a price at a 0.01 tick is
+not always a whole number of cents (0.00000001 BTC at 65000.00 is 0.00065 USD).
+Settlement needs either a quote rounding rule or a quantity step per market.
+A quantity step is a new column, so it comes as a proposal first. Raising the
+USD scale needs no data migration, because NUMERIC stores decimals, not minor
+units.
+
+**Next: Day 7 — Matching engine**
+
+- `feat(engine): rest limit orders in sorted price levels with FIFO queues`
+- `feat(engine): match an incoming limit order by price-time priority`
+- `feat(engine): fill partially and rest the remainder`
+- `feat(engine): execute market orders without resting the remainder`
+- `feat(engine): cancel a resting order by id`
+- `feat(engine): prevent self-trades by cancelling the incoming order`
+- `feat(engine): emit typed events with a per-market sequence number`
+- `test(engine): check invariants over random order sequences`
