@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import cookie from "@fastify/cookie";
 import Fastify from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
+import type { LogLevel } from "./config.ts";
 import { registerSessionRoutes } from "./sessions.ts";
-import cookie from "@fastify/cookie";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 
@@ -33,9 +35,19 @@ async function probe(check: () => Promise<unknown>): Promise<"up" | "down"> {
   }
 }
 
-export function buildServer({ pool, redis, db, tokens }: ServerDependencies) {
+export type ServerOptions = {
+  // Left unset in tests so the suite output stays readable.
+  logLevel?: LogLevel;
+};
+
+export function buildServer(
+  { pool, redis, db, tokens }: ServerDependencies,
+  { logLevel }: ServerOptions = {},
+) {
   const app = Fastify({
-    logger: false,
+    logger: logLevel === undefined ? false : { level: logLevel },
+    // A UUID instead of Fastify's per-process counter, so ids stay unique across restarts.
+    genReqId: () => randomUUID(),
   });
 
   void app.register(cookie);

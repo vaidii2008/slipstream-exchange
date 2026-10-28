@@ -9,17 +9,22 @@ const base = {
 
 describe("parseConfig", () => {
   it("defaults PORT to 3000 when it is not set", () => {
-    expect(parseConfig(base)).toEqual({ ...base, PORT: 3000 });
+    expect(parseConfig(base)).toEqual({ ...base, PORT: 3000, LOG_LEVEL: "info" });
   });
 
   it("converts a numeric PORT string into a number", () => {
-    expect(parseConfig({ ...base, PORT: "8080" })).toEqual({ ...base, PORT: 8080 });
+    expect(parseConfig({ ...base, PORT: "8080" })).toEqual({
+      ...base,
+      PORT: 8080,
+      LOG_LEVEL: "info",
+    });
   });
 
   it("keeps only the variables it declares", () => {
     expect(parseConfig({ ...base, AWS_SECRET_ACCESS_KEY: "leak" })).toEqual({
       ...base,
       PORT: 3000,
+      LOG_LEVEL: "info",
     });
   });
 
@@ -52,6 +57,14 @@ describe("parseConfig", () => {
       expect(() => parseConfig({ ...base, REDIS_URL: url })).toThrow(/REDIS_URL/);
     },
   );
+
+  it("accepts a pino LOG_LEVEL", () => {
+    expect(parseConfig({ ...base, LOG_LEVEL: "debug" })).toMatchObject({ LOG_LEVEL: "debug" });
+  });
+
+  it("rejects a LOG_LEVEL pino does not know", () => {
+    expect(() => parseConfig({ ...base, LOG_LEVEL: "verbose" })).toThrow(/LOG_LEVEL/);
+  });
 
   it("rejects a missing JWT_ACCESS_SECRET", () => {
     expect(() =>

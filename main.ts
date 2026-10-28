@@ -26,9 +26,6 @@ function createRedisClient(url: string) {
   client.on("ready", () => {
     hasConnected = true;
   });
-  client.on("error", (error) => {
-    console.error(`redis client error: ${error instanceof Error ? error.message : String(error)}`);
-  });
   return client;
 }
 
@@ -42,6 +39,8 @@ async function verifyRedis(redis: ReturnType<typeof createRedisClient>): Promise
   }
 }
 
+let app: ReturnType<typeof buildServer> | undefined;
+
 try {
   const config = parseConfig(process.env);
   const tokens = createAccessTokens(config.JWT_ACCESS_SECRET);
@@ -50,22 +49,33 @@ try {
     connectionString: config.DATABASE_URL,
     connectionTimeoutMillis: 5000,
   });
+  const redis = createRedisClient(config.REDIS_URL);
+  const db = drizzle({ client: pool });
+
+  // Built before the connections are verified so every startup line goes through pino.
+  app = buildServer({ pool, redis, db, tokens }, { logLevel: config.LOG_LEVEL });
+  const log = app.log;
+
   pool.on("error", (error) => {
-    console.error(`postgres pool error: ${error.message}`);
+    log.error({ err: error }, "postgres pool error");
+  });
+  redis.on("error", (error: unknown) => {
+    log.error({ err: error }, "redis client error");
   });
 
   await verifyPostgres(pool);
-  console.log("postgres connection verified");
+  log.info("postgres connection verified");
 
-  const redis = createRedisClient(config.REDIS_URL);
   await verifyRedis(redis);
-  console.log("redis connection verified");
+  log.info("redis connection verified");
 
-  const db = drizzle({ client: pool });
-  const app = buildServer({ pool, redis, db, tokens });
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
-  console.log(`slipstream api listening on http://localhost:${config.PORT}`);
 } catch (error) {
-  console.error(error instanceof Error ? error.message : error);
+  if (app === undefined) {
+    // Config failed to parse, so there is no logger yet.
+    console.error(error instanceof Error ? error.message : error);
+  } else {
+    app.log.fatal({ err: error }, "startup failed");
+  }
   process.exit(1);
 }

@@ -14,10 +14,14 @@ const envSchema = z
       error: "must be a redis:// connection string",
     }),
     JWT_ACCESS_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
+    LOG_LEVEL: z
+      .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
+      .default("info"),
   })
   .readonly();
 
 export type Config = z.infer<typeof envSchema>;
+export type LogLevel = Config["LOG_LEVEL"];
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
   const result = envSchema.safeParse(env);
