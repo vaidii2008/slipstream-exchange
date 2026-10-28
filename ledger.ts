@@ -1,6 +1,6 @@
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sum } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-import { formatAmount } from "./money.ts";
+import { formatAmount, fromNumeric } from "./money.ts";
 import { assets, ledgerAccounts, ledgerEntries, ledgerTransactions } from "./schema.ts";
 
 export type Bucket = (typeof ledgerAccounts.bucket.enumValues)[number];
@@ -143,4 +143,46 @@ export async function deposit(
     { accountId: system, amount: -amount },
     { accountId: available, amount },
   ]);
+}
+
+export type Balance = {
+  asset: string;
+  scale: number;
+  available: bigint;
+  reserved: bigint;
+};
+
+// Every listed asset, zero where the user has no entries. Summed from the entries on every
+// read; there is no stored balance that could drift from them.
+export async function balancesOf(db: NodePgDatabase, userId: string): Promise<Balance[]> {
+  const rows = await db
+    .select({
+      asset: assets.code,
+      scale: assets.scale,
+      bucket: ledgerAccounts.bucket,
+      total: sum(ledgerEntries.amount),
+    })
+    .from(assets)
+    .leftJoin(
+      ledgerAccounts,
+      and(eq(ledgerAccounts.asset, assets.code), eq(ledgerAccounts.userId, userId)),
+    )
+    .leftJoin(ledgerEntries, eq(ledgerEntries.accountId, ledgerAccounts.id))
+    .groupBy(assets.code, assets.scale, ledgerAccounts.bucket)
+    .orderBy(assets.code);
+
+  const balances = new Map<string, Balance>();
+  for (const row of rows) {
+    const balance = balances.get(row.asset) ?? {
+      asset: row.asset,
+      scale: row.scale,
+      available: 0n,
+      reserved: 0n,
+    };
+    if (row.bucket !== null && row.total !== null) {
+      balance[row.bucket] = fromNumeric(row.total, row.scale);
+    }
+    balances.set(row.asset, balance);
+  }
+  return [...balances.values()];
 }

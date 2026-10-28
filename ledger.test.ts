@@ -1,6 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { LedgerError, openAccount, postTransaction } from "./ledger.ts";
+import { balancesOf, deposit, LedgerError, openAccount, postTransaction } from "./ledger.ts";
 import { fromNumeric } from "./money.ts";
 import { ledgerEntries, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
@@ -166,5 +166,38 @@ describe("postTransaction", () => {
       select count(*) as count from ledger_transactions t
       where not exists (select 1 from ledger_entries e where e.transaction_id = t.id)`);
     expect(orphans.rows[0]?.count).toBe("0");
+  });
+});
+
+describe("balancesOf", () => {
+  it("lists every asset at zero for a user with no entries", async () => {
+    const userId = await createUser();
+
+    await expect(balancesOf(db, userId)).resolves.toEqual([
+      { asset: "BTC", scale: 8, available: 0n, reserved: 0n },
+      { asset: "ETH", scale: 8, available: 0n, reserved: 0n },
+      { asset: "USD", scale: 2, available: 0n, reserved: 0n },
+    ]);
+  });
+
+  it("sums each bucket's entries separately and ignores other users", async () => {
+    const userId = await createUser();
+    const someoneElse = await createUser();
+    await deposit(db, userId, "BTC", 300n);
+    await deposit(db, userId, "BTC", 200n);
+    await deposit(db, someoneElse, "BTC", 999n);
+    await postTransaction(db, "reserve", [
+      { accountId: await openAccount(db, userId, "BTC", "available"), amount: -120n },
+      { accountId: await openAccount(db, userId, "BTC", "reserved"), amount: 120n },
+    ]);
+
+    const balances = await balancesOf(db, userId);
+
+    expect(balances.find((balance) => balance.asset === "BTC")).toEqual({
+      asset: "BTC",
+      scale: 8,
+      available: 380n,
+      reserved: 120n,
+    });
   });
 });

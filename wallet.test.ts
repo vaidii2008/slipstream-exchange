@@ -117,3 +117,32 @@ describe("POST /deposits", () => {
     await expect(ledgerBalance(userId, "USD", 2)).resolves.toBe(0n);
   });
 });
+
+describe("GET /balances", () => {
+  it("reports deposits as available, every asset at its own scale", async () => {
+    const { authorization } = await signedInUser();
+    await postDeposit(authorization, { asset: "BTC", amount: "0.25" });
+    await postDeposit(authorization, { asset: "USD", amount: "1000" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/balances",
+      headers: { authorization },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<unknown>()).toEqual({
+      balances: [
+        { asset: "BTC", available: "0.25000000", reserved: "0.00000000" },
+        { asset: "ETH", available: "0.00000000", reserved: "0.00000000" },
+        { asset: "USD", available: "1000.00", reserved: "0.00" },
+      ],
+    });
+  });
+
+  it("requires an access token", async () => {
+    const response = await app.inject({ method: "GET", url: "/balances" });
+
+    expect(response.statusCode).toBe(401);
+  });
+});

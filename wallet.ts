@@ -3,7 +3,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
-import { deposit } from "./ledger.ts";
+import { balancesOf, deposit } from "./ledger.ts";
 import { formatAmount, parseAmount, type ParseFailure } from "./money.ts";
 import { assets } from "./schema.ts";
 import type { AccessTokens } from "./tokens.ts";
@@ -65,6 +65,19 @@ export function registerWalletRoutes(app: FastifyInstance, { db, tokens }: Walle
       transactionId,
       asset: asset.code,
       amount: formatAmount(amount.units, asset.scale),
+    });
+  });
+
+  app.get("/balances", { onRequest: authenticate }, async (request, reply) => {
+    const userId = authenticatedUserId(request);
+    const balances = await balancesOf(db, userId);
+
+    return reply.code(200).send({
+      balances: balances.map((balance) => ({
+        asset: balance.asset,
+        available: formatAmount(balance.available, balance.scale),
+        reserved: formatAmount(balance.reserved, balance.scale),
+      })),
     });
   });
 }
