@@ -6,6 +6,7 @@ import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
 import type { LogLevel } from "./config.ts";
 import { registerSessionRoutes } from "./sessions.ts";
+import { registerWalletRoutes } from "./wallet.ts";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 
@@ -99,6 +100,7 @@ export function buildServer(
 
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
+  registerWalletRoutes(app, { db, tokens });
 
   return app;
 }

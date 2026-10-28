@@ -124,3 +124,23 @@ export async function postTransaction(
     return transaction.id;
   });
 }
+
+// Simulated: money arrives from the asset's system account, which goes negative by exactly
+// what has been deposited in total.
+export async function deposit(
+  db: NodePgDatabase,
+  userId: string,
+  asset: string,
+  amount: bigint,
+): Promise<number> {
+  if (amount <= 0n) {
+    throw new RangeError(`deposit amount must be positive, got ${amount}`);
+  }
+  const system = await openAccount(db, null, asset, "available");
+  const available = await openAccount(db, userId, asset, "available");
+
+  return postTransaction(db, "deposit", [
+    { accountId: system, amount: -amount },
+    { accountId: available, amount },
+  ]);
+}
