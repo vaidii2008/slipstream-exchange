@@ -438,3 +438,109 @@ early on Day 5.
   in two, since an error handler and request logging are separate reasons to
   change
 - `test: cover refresh rotation and token reuse detection`
+
+## Day 5 — Sessions survive a refresh
+
+**Commits landed (16)**
+
+Pushed before today's session, recorded here for the first time:
+
+- `feat(db): define the refresh tokens table schema`
+- `docs: restore days 1 to 3 in PROGRESS.md`
+- `chore(db): generate the refresh tokens migration`
+- `feat(auth): issue a refresh token at login`
+- `chore(deps): bump fastify for GHSA-4mh8-r7rc-xpvc`
+- `refactor(auth): move session handling out of auth.ts`
+- `feat(auth): rotate refresh tokens on the refresh endpoint`
+- `feat(auth): revoke the token family when a refresh token is reused`
+- `feat(auth): add logout with token revocation`
+
+Today:
+
+- `test(auth): cover refresh rotation and reuse detection`
+- `feat(api): log requests with pino instead of console.log`
+- `feat(api): return one error shape from a central error handler`
+- `feat(api): shut down gracefully on SIGTERM and SIGINT`
+- `chore: add a check script that runs the whole gate`
+- `ci: run the gate on every push with Postgres and Redis services`
+- `docs: start DECISIONS.md with the auth and API decisions`
+
+**What now works**
+
+- Login sets a `slipstream_refresh` cookie: httpOnly, secure, `SameSite=Strict`,
+  scoped to `/session`, seven days. Only its SHA-256 hash is stored, in
+  `refresh_tokens`, together with a `family_id` that every rotation inherits.
+- `POST /session/refresh` consumes the token with one
+  `UPDATE ... WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > now`
+  and inserts its successor in the same transaction. A used token presented
+  again revokes the whole family. An expired or unknown token is a plain 401.
+- Two concurrent refreshes with the same token: the row lock makes the second
+  `UPDATE` wait, re-check, find `used_at` set and treat itself as a replay. One
+  gets 200, the family ends revoked. Ran the test eight times in a row with no
+  flake.
+- `POST /session/logout` revokes the presented token's family, even when that
+  token is an older rotated one, clears the cookie, and answers 204 with or
+  without a cookie.
+- `sessions.test.ts` holds 11 tests for all of the above, against real Postgres.
+- Fastify logs through its built-in pino at `LOG_LEVEL` (default `info`): one
+  JSON line per request in and out, tied by a UUID request id. Pool and Redis
+  errors and startup go through the same logger. Tests leave logging off.
+- One error shape: every error body has an `error` code. Fastify's 4xx errors
+  also return their message (malformed JSON is 400 `invalid_request`, a wrong
+  content type is 415 `unsupported_media_type`). Anything else is a bare 500
+  `internal_error`, with the detail logged under the request id. Unknown routes
+  are 404 `not_found`. This closes the Day 3 leak of SQL and an argon2 digest in
+  a 500 body.
+- SIGTERM or SIGINT closes Fastify, waits for in-flight requests, then closes
+  Redis and the pool in an `onClose` hook, and exits 0. A 10 second timer forces
+  exit 1. Checked by hand: a login in flight at SIGTERM still returned 401
+  (31 ms) between "shutting down" and "shutdown complete".
+- `npm run check` runs format:check, typecheck, lint and test, stopping at the
+  first failure.
+- GitHub Actions runs on every push and pull request: Postgres 16 and Redis 7
+  service containers, `npm ci`, `drizzle-kit migrate` on the empty database,
+  then `npm run check`. Rehearsed locally against a fresh `ci_rehearsal`
+  database: both migrations applied, 68/68 passed, database dropped after.
+- 68 tests in 5 files, up from 51.
+
+**What is stubbed**
+
+- The CI workflow has not run on GitHub yet; it first runs on the next push.
+- Graceful shutdown has no automated test: it lives in `main.ts`, which runs
+  on import. The manual check above is the evidence.
+- No `pino-pretty`: local logs are raw JSON.
+- Carried over: no test database separate from the dev one, `npm audit`
+  dev-only findings from drizzle-kit, and the manual `vaidhyam@example.com`
+  row.
+
+**Decisions and deviations from the plan**
+
+- Logout had already landed and already revokes the family, so the plan's
+  first commit was done before the session started.
+- Logging landed before the error handler, swapping the planned order: with
+  Fastify's logger off, the handler's 500 logs would have gone nowhere.
+- Logout tests went into the refresh test commit; there were none before.
+- `LOG_LEVEL` is new config, validated as one of pino's levels, in
+  `.env.example` and optional in `.env`.
+- `DECISIONS.md` is new, with five entries. The concurrent-refresh behaviour
+  is the one to defend: strict reuse detection over a grace window.
+
+**Repo shape**
+
+Still flat. New: `sessions.test.ts`, `DECISIONS.md` and
+`.github/workflows/ci.yml`, a path GitHub requires. `server.test.ts` is 339
+lines and is mostly auth-route tests, which is pressure to move them to
+`auth.test.ts` in a `refactor:` commit. The two test files also repeat the
+same Postgres and app setup; a third database test file would justify
+sharing it.
+
+**Next: Day 6 — Money and the ledger**
+
+- `feat(money): convert decimal strings to bigint minor units at a fixed scale`
+- `feat(db): define assets and markets with a seed for BTC, ETH and USD`
+- `feat(db): define ledger accounts, transactions and entries`
+- `feat(ledger): post a balanced transaction atomically`
+- `feat(api): add a simulated deposit endpoint`
+- `feat(api): report balances derived from the ledger`
+- `feat(ledger): reserve and release funds under row locks`
+- `test(ledger): prove parallel reservations cannot overdraw`
