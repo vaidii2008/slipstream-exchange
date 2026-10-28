@@ -54,3 +54,50 @@ Each entry: the decision, the alternative, why, and where it lives.
 - **Why:** `onClose` runs only after in-flight requests finish, so no request loses its database
   mid-query. Checked by hand: a login in flight at SIGTERM still returned its 401 before exit 0.
 - **Where:** `shutDownOn` and the `onClose` hook in `main.ts`.
+
+## Money and the ledger
+
+### Amounts are rejected, never rounded, at the boundary
+
+- **Decision:** a client sends amounts as decimal strings. `parseAmount` turns them into bigint
+  minor units at the asset's scale and rejects anything with more decimals than the scale allows,
+  as well as negatives, exponents and values past NUMERIC(36,18).
+- **Alternative:** accept JSON numbers, or round extra decimals to the scale.
+- **Why:** a JSON number has been through a float before our code sees it (`0.1` is not 0.1), and
+  rounding silently changes what the client asked for. A 400 tells them.
+- **Where:** `parseAmount` in `money.ts`; the only other conversions, `fromNumeric` and
+  `formatAmount`, live in the same file.
+
+### A balance is always summed from the entries
+
+- **Decision:** there is no balance column. `balancesOf` and the overdraft check both `SUM` an
+  account's ledger entries when they need the number.
+- **Alternative:** a cached balance column updated in the same transaction as each entry.
+- **Why:** with no second copy of the number, it cannot drift from the entries. The cost is a
+  sum over every entry on each read. That is fine at this size; if the benchmark later shows it
+  matters, a cached column comes as a proposal with numbers.
+- **Where:** `balancesOf` and `postTransaction` in `ledger.ts`.
+
+### Lock only the user accounts a transaction debits, in id order
+
+- **Decision:** `postTransaction` takes `SELECT ... FOR UPDATE` on each user account whose net
+  change is negative, sorted by id, then re-sums those accounts and refuses to overdraw them.
+- **Alternative:** lock every account in the transaction, or lock in posting order.
+- **Why:** an account that only gains money cannot be overdrawn, and the system account may go
+  negative, so locking either would just queue writers: every deposit of an asset would wait on
+  one system row. Sorting by id means two transactions that debit the same accounts always
+  request the locks in the same order, so they queue instead of deadlocking. Proof: 50 parallel
+  reservations of 10 against 100 give exactly 10 successes. With the lock removed, 12 got through.
+- **Where:** the `debited` block in `postTransaction`, `ledger.ts`; test under
+  `concurrent reservations` in `ledger.test.ts`.
+
+### The ledger never cascades
+
+- **Decision:** no foreign key into or inside the ledger has `ON DELETE CASCADE`, so a user with
+  ledger history cannot be deleted.
+- **Alternative:** cascade from `users`, like `refresh_tokens` does.
+- **Why:** deleting a user would silently delete half of every transaction they took part in,
+  and the system account and counterparties would stop balancing. Tests delete whole
+  transactions explicitly before deleting their users.
+- **Where:** `ledgerAccounts` and `ledgerEntries` in `schema.ts`; `deleteLedgerHistory` in
+  `testing.ts`.
