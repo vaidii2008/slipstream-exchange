@@ -293,3 +293,27 @@ describe("reserve and release", () => {
     expect(fromNumeric(system?.total ?? "0", 8)).toBeLessThan(0n);
   });
 });
+
+describe("concurrent reservations", () => {
+  it("lets exactly 10 of 50 parallel reservations of 10 through against a balance of 100", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "USD", 100n);
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 50 }, () => reserve(db, userId, "USD", 10n)),
+    );
+
+    const succeeded = outcomes.filter((outcome) => outcome.status === "fulfilled");
+    const refusals = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason as unknown] : [],
+    );
+    expect(succeeded).toHaveLength(10);
+    expect(refusals).toHaveLength(40);
+    for (const reason of refusals) {
+      expect(reason).toMatchObject({ code: "insufficient_funds" });
+    }
+
+    const usd = (await balancesOf(db, userId)).find((balance) => balance.asset === "USD");
+    expect(usd).toMatchObject({ available: 0n, reserved: 100n });
+  });
+});
