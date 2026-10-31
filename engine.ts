@@ -4,12 +4,24 @@
 import { type BookSnapshot, OrderBook, type Side } from "./book.ts";
 
 export type LimitOrder = {
+  type: "limit";
   id: string;
   userId: string;
   side: Side;
   price: bigint;
   quantity: bigint;
 };
+
+// Takes whatever the book offers at any price, up to `quantity`, and never rests.
+export type MarketOrder = {
+  type: "market";
+  id: string;
+  userId: string;
+  side: Side;
+  quantity: bigint;
+};
+
+export type NewOrder = LimitOrder | MarketOrder;
 
 export type EngineEvent =
   | {
@@ -31,6 +43,18 @@ export type EngineEvent =
       side: Side;
       price: bigint;
       quantity: bigint;
+    }
+  | {
+      // The order's unfilled quantity left the engine without trading. A market order whose
+      // book ran out ends this way.
+      type: "cancelled";
+      orderId: string;
+      userId: string;
+      side: Side;
+      // Null for a market order, which has no price.
+      price: bigint | null;
+      quantity: bigint;
+      reason: "no_liquidity";
     };
 
 const opposite = (side: Side): Side => (side === "buy" ? "sell" : "buy");
@@ -41,9 +65,10 @@ export class Engine {
   readonly #book = new OrderBook();
 
   // Matches the order against the opposite side, best price first and oldest first within a
-  // price, then rests whatever is left. The incoming order is the taker; resting ones are makers.
-  submit(order: LimitOrder): EngineEvent[] {
-    if (order.price <= 0n || order.quantity <= 0n) {
+  // price. The incoming order is the taker; resting ones are makers. What a limit order has
+  // left rests at its price; what a market order has left is cancelled.
+  submit(order: NewOrder): EngineEvent[] {
+    if (order.quantity <= 0n || (order.type === "limit" && order.price <= 0n)) {
       throw new RangeError(`order ${order.id} needs a positive price and quantity`);
     }
     // Checked before matching: failing at rest time would leave the trades half applied.
@@ -53,9 +78,11 @@ export class Engine {
 
     const events: EngineEvent[] = [];
     const makerSide = opposite(order.side);
-    // A buy crosses any ask at or below its limit; a sell crosses any bid at or above it.
+    // A buy crosses any ask at or below its limit; a sell crosses any bid at or above it. A
+    // market order crosses everything.
     const crosses = (price: bigint) =>
-      order.side === "buy" ? price <= order.price : price >= order.price;
+      order.type === "market" ||
+      (order.side === "buy" ? price <= order.price : price >= order.price);
 
     let remaining = order.quantity;
     for (let maker = this.#book.best(makerSide); maker !== undefined && remaining > 0n;) {
@@ -78,23 +105,37 @@ export class Engine {
       maker = this.#book.best(makerSide);
     }
 
-    if (remaining > 0n) {
-      this.#book.rest({
-        id: order.id,
-        userId: order.userId,
-        side: order.side,
-        price: order.price,
-        remaining,
-      });
+    if (remaining === 0n) {
+      return events;
+    }
+    if (order.type === "market") {
       events.push({
-        type: "rested",
+        type: "cancelled",
         orderId: order.id,
         userId: order.userId,
         side: order.side,
-        price: order.price,
+        price: null,
         quantity: remaining,
+        reason: "no_liquidity",
       });
+      return events;
     }
+
+    this.#book.rest({
+      id: order.id,
+      userId: order.userId,
+      side: order.side,
+      price: order.price,
+      remaining,
+    });
+    events.push({
+      type: "rested",
+      orderId: order.id,
+      userId: order.userId,
+      side: order.side,
+      price: order.price,
+      quantity: remaining,
+    });
     return events;
   }
 

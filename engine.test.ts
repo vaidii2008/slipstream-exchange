@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { RestingOrder, Side } from "./book.ts";
-import { Engine, type LimitOrder } from "./engine.ts";
+import { Engine, type LimitOrder, type MarketOrder } from "./engine.ts";
 
 function limit(id: string, side: Side, price: bigint, quantity: bigint, userId = `user-${id}`) {
-  return { id, userId, side, price, quantity } satisfies LimitOrder;
+  return { type: "limit", id, userId, side, price, quantity } satisfies LimitOrder;
+}
+
+function market(id: string, side: Side, quantity: bigint, userId = `user-${id}`) {
+  return { type: "market", id, userId, side, quantity } satisfies MarketOrder;
 }
 
 // The trades in an event list as [maker, taker, price, quantity].
@@ -166,5 +170,69 @@ describe("Engine.submit with a limit order", () => {
 
     expect(() => engine.submit(limit("a", "buy", 0n, 1n))).toThrow(RangeError);
     expect(() => engine.submit(limit("b", "buy", 100n, 0n))).toThrow(RangeError);
+  });
+});
+
+describe("Engine.submit with a market order", () => {
+  it("sweeps price levels in priority order regardless of price", () => {
+    const engine = new Engine();
+    engine.submit(limit("a", "sell", 100n, 2n));
+    engine.submit(limit("b", "sell", 150n, 2n));
+    engine.submit(limit("c", "sell", 900n, 2n));
+
+    const events = engine.submit(market("buy", "buy", 5n));
+
+    expect(trades(events)).toEqual([
+      ["a", "buy", 100n, 2n],
+      ["b", "buy", 150n, 2n],
+      ["c", "buy", 900n, 1n],
+    ]);
+    expect(events).toHaveLength(3);
+    expect(remaining(engine.snapshot().asks)).toEqual([[900n, [["c", 1n]]]]);
+  });
+
+  it("cancels what the book could not fill instead of resting it", () => {
+    const engine = new Engine();
+    engine.submit(limit("bid", "buy", 100n, 3n));
+
+    const events = engine.submit(market("sell", "sell", 10n));
+
+    expect(trades(events)).toEqual([["bid", "sell", 100n, 3n]]);
+    expect(events.at(-1)).toEqual({
+      type: "cancelled",
+      orderId: "sell",
+      userId: "user-sell",
+      side: "sell",
+      price: null,
+      quantity: 7n,
+      reason: "no_liquidity",
+    });
+    expect(engine.snapshot()).toEqual({ bids: [], asks: [] });
+  });
+
+  it("cancels the whole order against an empty side", () => {
+    const engine = new Engine();
+    engine.submit(limit("bid", "buy", 100n, 3n));
+
+    const events = engine.submit(market("buy", "buy", 4n));
+
+    expect(events).toEqual([
+      {
+        type: "cancelled",
+        orderId: "buy",
+        userId: "user-buy",
+        side: "buy",
+        price: null,
+        quantity: 4n,
+        reason: "no_liquidity",
+      },
+    ]);
+    expect(remaining(engine.snapshot().bids)).toEqual([[100n, [["bid", 3n]]]]);
+  });
+
+  it("rejects a zero quantity", () => {
+    const engine = new Engine();
+
+    expect(() => engine.submit(market("m", "buy", 0n))).toThrow(RangeError);
   });
 });
