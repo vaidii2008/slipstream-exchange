@@ -637,3 +637,97 @@ units.
 - `feat(engine): prevent self-trades by cancelling the incoming order`
 - `feat(engine): emit typed events with a per-market sequence number`
 - `test(engine): check invariants over random order sequences`
+
+## Day 7 — Matching engine
+
+**Commits landed (11)**
+
+- `fix(ledger): lock debited accounts FOR NO KEY UPDATE so reserve and release cannot deadlock`
+- `feat(engine): rest limit orders in sorted price levels with FIFO queues`
+- `feat(engine): match an incoming limit order by price-time priority`
+- `refactor(engine): move the order book into book.ts`
+- `feat(engine): execute market orders without resting the remainder`
+- `feat(engine): cancel a resting order by id`
+- `feat(engine): prevent self-trades by cancelling the incoming order`
+- `feat(engine): emit typed events with a per-market sequence number`
+- `test(engine): check invariants over random order sequences`
+- `docs: record the matching engine decisions in DECISIONS.md`
+- `docs: record day 7 in PROGRESS.md`
+
+**What now works**
+
+- Ledger fix: a reserve and a release on the same user and asset could deadlock.
+  Each held `FOR UPDATE` on the account it debited, while its entry insert needed
+  `FOR KEY SHARE` on the other account for the foreign-key check. With 40
+  interleaved reserves and releases, 36 died with 40P01. With
+  `FOR NO KEY UPDATE`, 0 did, and the 50-parallel overdraw test still gives
+  exactly 10 successes. Passed five consecutive runs of `ledger.test.ts`.
+- `OrderBook` (`book.ts`): bids and asks as price levels sorted worst-first, with
+  the best level last, FIFO queues within a level, an id index, `best`,
+  `fillBest`, `remove` and a copying `snapshot`.
+- `Engine` (`engine.ts`), one per market: limit orders match by price-time
+  priority at the maker's price and rest the remainder. Market orders sweep and
+  cancel the remainder (`no_liquidity`). `cancel(id)` returns a `cancelled`
+  event, or `cancel_rejected` if the order isn't resting. Self-trades stop the
+  incoming order (`self_trade`) and earlier fills stand.
+- Events are a typed union (`trade`, `rested`, `cancelled`, `cancel_rejected`),
+  stamped with the market and a sequence number from 1 with no gaps. A command
+  that throws spends no numbers.
+- Property tests run 5 × 300 generated sequences (median about 90 commands,
+  maximum 200): no crossed, unsorted or empty level after any step; quantity
+  conserved per order; no trade beyond a limit and no self-trades; sequences
+  1..n; identical events and book on replay. Four bugs injected by hand each
+  failed the property meant to catch them.
+- 171 tests in 12 files, up from 128.
+
+**What is stubbed**
+
+- The engine is not wired to anything: no queue, no orders table, no settlement.
+  That is Session 4.
+- `cancel` doesn't check ownership. The orders layer will check it against the
+  orders table before enqueueing.
+- Market buys are sized in base quantity only. Session 5's capped reservation
+  will need the engine to stop at a quote budget, which means passing the base
+  scale in so it can compute price × quantity.
+- Carried over: no test database separate from the dev one, `npm audit` dev-only
+  findings from drizzle-kit, the manual `vaidhyam@example.com` row, and the CI
+  workflow has still not run on GitHub.
+
+**Decisions and deviations from the plan**
+
+- The ledger fix came first, as its own commit, with a failing regression test
+  shown before the change.
+- "Match an incoming limit order" and "fill partially and rest the remainder"
+  became one commit. Every fill is the smaller of two quantities, so splitting
+  them would have meant writing a stub that drops the leftover.
+- Events existed from the first matching commit; the sequence-number commit
+  added the stamp rather than replacing a different return type.
+- fast-check's default array size caps generated sequences at 10 commands
+  whatever `maxLength` says. The property tests use `size: "large"`.
+- Approved for the start of Session 4, before the orders table: USD scale
+  becomes 8 and `markets` gains `quantity_step` (BTC-USD 0.0001, ETH-USD 0.001).
+  Prices must be multiples of the tick and quantities multiples of the step, at
+  least the minimum. A test checks that tick × step is exact at the quote
+  asset's scale for every market. This lands as a new migration. It answers
+  Day 6's open question.
+- Three entries plus the Session 3 interview note in `DECISIONS.md`, and the
+  locking entry is updated for `FOR NO KEY UPDATE`.
+
+**Repo shape**
+
+Still flat. New: `book.ts` (the book) and `engine.ts` (matching rules), split
+once `engine.ts` reached 221 lines with two reasons to change. Also
+`engine.property.test.ts`, kept separate from `engine.test.ts` (about 420 lines)
+because it has its own generators and runner. `ledger.ts` still needs its split
+when trade settlement arrives.
+
+**Next: Day 8 — Engine numbers, placing orders**
+
+- `perf(engine): add a benchmark reporting orders/sec and p50/p99 match latency`
+- `perf(engine): <one optimisation>`, only if the baseline shows a hotspot
+- `feat(db): raise USD scale to 8 and add a quantity step per market`
+- `feat(db): define orders and trades tables`
+- `feat(orders): serialize each market's commands through one queue`
+- `feat(orders): place a limit order with funds reserved first`
+- `feat(orders): persist trades and settle both sides in the ledger`
+- `test(orders): cover place, partial fill and full fill between two real users`
