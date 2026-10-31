@@ -46,7 +46,8 @@ export type EngineEvent =
     }
   | {
       // The order's unfilled quantity left the engine without trading: a market order whose
-      // book ran out, or a resting order its owner cancelled.
+      // book ran out, a resting order its owner cancelled, or an incoming order that reached
+      // its owner's own resting order.
       type: "cancelled";
       orderId: string;
       userId: string;
@@ -54,7 +55,7 @@ export type EngineEvent =
       // Null for a market order, which has no price.
       price: bigint | null;
       quantity: bigint;
-      reason: "no_liquidity" | "requested";
+      reason: "no_liquidity" | "requested" | "self_trade";
     }
   | {
       // Nothing to cancel: the order already filled, was already cancelled, or never rested.
@@ -92,8 +93,16 @@ export class Engine {
       (order.side === "buy" ? price <= order.price : price >= order.price);
 
     let remaining = order.quantity;
+    let selfTrade = false;
     for (let maker = this.#book.best(makerSide); maker !== undefined && remaining > 0n;) {
       if (!crosses(maker.price)) {
+        break;
+      }
+      // Self-trade prevention, cancel-newest: a user trading with themselves would print a
+      // fake trade, so the incoming order stops here. Fills before this point stand, and the
+      // resting order keeps its place.
+      if (maker.userId === order.userId) {
+        selfTrade = true;
         break;
       }
       const quantity = remaining < maker.remaining ? remaining : maker.remaining;
@@ -115,15 +124,17 @@ export class Engine {
     if (remaining === 0n) {
       return events;
     }
-    if (order.type === "market") {
+    // A limit order's remainder cannot rest after a self-trade stop: it would cross its
+    // owner's order and leave the book crossed.
+    if (selfTrade || order.type === "market") {
       events.push({
         type: "cancelled",
         orderId: order.id,
         userId: order.userId,
         side: order.side,
-        price: null,
+        price: order.type === "limit" ? order.price : null,
         quantity: remaining,
-        reason: "no_liquidity",
+        reason: selfTrade ? "self_trade" : "no_liquidity",
       });
       return events;
     }

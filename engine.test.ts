@@ -291,3 +291,78 @@ describe("Engine.cancel", () => {
     expect(engine.snapshot()).toEqual(before);
   });
 });
+
+describe("self-trade prevention", () => {
+  it("cancels an incoming limit order that would trade with its owner's resting order", () => {
+    const engine = new Engine();
+    engine.submit(limit("mine", "sell", 100n, 5n, "alice"));
+
+    const events = engine.submit(limit("also-mine", "buy", 100n, 3n, "alice"));
+
+    expect(events).toEqual([
+      {
+        type: "cancelled",
+        orderId: "also-mine",
+        userId: "alice",
+        side: "buy",
+        price: 100n,
+        quantity: 3n,
+        reason: "self_trade",
+      },
+    ]);
+    expect(remaining(engine.snapshot().asks)).toEqual([[100n, [["mine", 5n]]]]);
+    expect(engine.snapshot().bids).toEqual([]);
+  });
+
+  it("keeps fills made before reaching the owner's order and cancels only the rest", () => {
+    const engine = new Engine();
+    engine.submit(limit("bob-ask", "sell", 100n, 2n, "bob"));
+    engine.submit(limit("alice-ask", "sell", 101n, 5n, "alice"));
+    engine.submit(limit("carol-ask", "sell", 102n, 5n, "carol"));
+
+    const events = engine.submit(limit("alice-bid", "buy", 102n, 6n, "alice"));
+
+    expect(trades(events)).toEqual([["bob-ask", "alice-bid", 100n, 2n]]);
+    expect(events.at(-1)).toMatchObject({
+      type: "cancelled",
+      orderId: "alice-bid",
+      quantity: 4n,
+      reason: "self_trade",
+    });
+    // Carol's ask is untouched: matching stopped at Alice's own order, which is ahead of it.
+    expect(remaining(engine.snapshot().asks)).toEqual([
+      [101n, [["alice-ask", 5n]]],
+      [102n, [["carol-ask", 5n]]],
+    ]);
+  });
+
+  it("applies to market orders too", () => {
+    const engine = new Engine();
+    engine.submit(limit("mine", "buy", 100n, 5n, "alice"));
+
+    const events = engine.submit(market("sweep", "sell", 2n, "alice"));
+
+    expect(events).toEqual([
+      {
+        type: "cancelled",
+        orderId: "sweep",
+        userId: "alice",
+        side: "sell",
+        price: null,
+        quantity: 2n,
+        reason: "self_trade",
+      },
+    ]);
+  });
+
+  it("does not stop a limit order whose own resting order is past its limit", () => {
+    const engine = new Engine();
+    engine.submit(limit("bob-ask", "sell", 100n, 1n, "bob"));
+    engine.submit(limit("alice-ask", "sell", 105n, 1n, "alice"));
+
+    const events = engine.submit(limit("alice-bid", "buy", 101n, 3n, "alice"));
+
+    expect(trades(events)).toEqual([["bob-ask", "alice-bid", 100n, 1n]]);
+    expect(events.at(-1)).toMatchObject({ type: "rested", orderId: "alice-bid", quantity: 2n });
+  });
+});
