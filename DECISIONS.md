@@ -108,3 +108,53 @@ Each entry: the decision, the alternative, why, and where it lives.
   transactions explicitly before deleting their users.
 - **Where:** `ledgerAccounts` and `ledgerEntries` in `schema.ts`; `deleteLedgerHistory` in
   `testing.ts`.
+
+## Matching engine
+
+### Price levels in a sorted array, best price last
+
+- **Decision:** each side of the book is an array of price levels sorted worst-first, so the best
+  level is the last element. A binary search places new levels; each level is an array of orders
+  in arrival order, and an id index finds any order for cancel.
+- **Alternative:** a balanced tree or skip list keyed by price, and a linked list per level.
+- **Why:** reading and emptying the best level, which every match does, is `at(-1)` and `pop()`.
+  Inserting a new level costs a splice, but a book has tens of active levels, not millions. The
+  per-level `shift()` is O(n) in the queue length; Session 4's benchmark decides whether that
+  matters before anything fancier goes in.
+- **Where:** `OrderBook` in `book.ts`.
+
+### Self-trade prevention cancels the incoming order
+
+- **Decision:** when the next maker in priority belongs to the taker's own user, matching stops and
+  the taker's remainder is cancelled with reason `self_trade`. Earlier fills stand.
+- **Alternative:** cancel the resting order (cancel-oldest), cancel both, or skip past it to the
+  next maker.
+- **Why:** the resting order earned its queue position and the user may be relying on it, while
+  the incoming order is the one that just made the mistake. Skipping past it would let a taker
+  trade at a worse price than one already on the book, which breaks price priority.
+- **Where:** the `selfTrade` check in `Engine.#match`, `engine.ts`.
+
+### Cancelling a missing order is an event, not an exception
+
+- **Decision:** `Engine.cancel` on an id that is not resting returns a `cancel_rejected` event.
+  Bad input (a zero quantity, a reused id) throws.
+- **Alternative:** throw for both, or ignore the missing cancel silently.
+- **Why:** a cancel that arrives just after the fill that emptied the order is normal under load,
+  and the client needs to hear about it. A zero quantity reaching the engine means validation
+  upstream failed, which is a bug.
+- **Where:** `Engine.cancel` in `engine.ts`.
+
+### Interview note: Session 3, the matching engine
+
+The problem was matching orders fairly, by best price first and then arrival time, while
+staying deterministic so that a book can later be rebuilt by replaying the same commands. The
+engine is a pure TypeScript class per market, with no clock, no I/O and no randomness, and it
+emits typed events numbered 1, 2, 3, ... per market, stamped only once a command completes. The
+trade-off is that it has to run behind one serial queue per market, so one market's throughput
+is limited to one core, which buys a book with exactly one writer and no locks. fast-check runs
+1,500 generated sequences of up to 200 limit, market and cancel commands, with a median near 90,
+and checks after every step that the book is uncrossed, that every order's quantity is
+accounted for, that no user trades with themselves, and that replaying the same commands gives
+identical events. Four bugs injected by hand (trading past the limit, no self-trade check, a
+market remainder dropped, sells resting without matching) each failed exactly the property
+meant to catch it.
