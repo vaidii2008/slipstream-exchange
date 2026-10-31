@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { RestingOrder, Side } from "./book.ts";
-import { Engine, type LimitOrder, type MarketOrder } from "./engine.ts";
+import {
+  Engine,
+  type EngineEvent,
+  type EventBody,
+  type LimitOrder,
+  type MarketOrder,
+} from "./engine.ts";
 
 function limit(id: string, side: Side, price: bigint, quantity: bigint, userId = `user-${id}`) {
   return { type: "limit", id, userId, side, price, quantity } satisfies LimitOrder;
@@ -11,7 +17,12 @@ function market(id: string, side: Side, quantity: bigint, userId = `user-${id}`)
 }
 
 // The trades in an event list as [maker, taker, price, quantity].
-function trades(events: ReturnType<Engine["submit"]>) {
+// Drops the market and sequence stamp, for tests about what happened rather than its number.
+function unstamped(events: EngineEvent[]): EventBody[] {
+  return events.map(({ market: _market, sequence: _sequence, ...body }) => body);
+}
+
+function trades(events: EngineEvent[]) {
   return events.flatMap((event) =>
     event.type === "trade"
       ? [[event.makerOrderId, event.takerOrderId, event.price, event.quantity]]
@@ -26,12 +37,12 @@ function remaining(levels: { price: bigint; orders: RestingOrder[] }[]) {
 
 describe("Engine.submit with a limit order", () => {
   it("rests an order that crosses nothing", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("ask", "sell", 101n, 5n));
 
     const events = engine.submit(limit("bid", "buy", 100n, 3n));
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "rested",
         orderId: "bid",
@@ -45,12 +56,12 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("fills an exact match completely and leaves both sides empty", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("ask", "sell", 100n, 5n));
 
     const events = engine.submit(limit("bid", "buy", 100n, 5n));
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "trade",
         makerOrderId: "ask",
@@ -66,7 +77,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("trades at the maker's price when the taker would pay more", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("ask", "sell", 100n, 1n));
 
     const events = engine.submit(limit("bid", "buy", 105n, 1n));
@@ -75,7 +86,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("takes the best price first, whatever order the makers arrived in", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("dear", "sell", 102n, 1n));
     engine.submit(limit("cheap", "sell", 100n, 1n));
     engine.submit(limit("middle", "sell", 101n, 1n));
@@ -90,7 +101,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("takes the oldest order first within a price", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("first", "sell", 100n, 2n));
     engine.submit(limit("second", "sell", 100n, 2n));
 
@@ -103,7 +114,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("leaves a partly filled maker at the front of its queue", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("first", "sell", 100n, 5n));
     engine.submit(limit("second", "sell", 100n, 5n));
 
@@ -123,7 +134,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("stops at its limit and rests the remainder at its own price", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("a", "sell", 100n, 2n));
     engine.submit(limit("b", "sell", 101n, 2n));
     engine.submit(limit("c", "sell", 103n, 2n));
@@ -140,7 +151,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("matches a sell against the highest bids first", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("low", "buy", 98n, 1n));
     engine.submit(limit("high", "buy", 100n, 1n));
     engine.submit(limit("middle", "buy", 99n, 1n));
@@ -156,7 +167,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("rejects a reused order id before touching the book", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bid", "buy", 99n, 1n));
     engine.submit(limit("ask", "sell", 100n, 1n));
     const before = engine.snapshot();
@@ -166,7 +177,7 @@ describe("Engine.submit with a limit order", () => {
   });
 
   it("rejects a zero price or quantity", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
 
     expect(() => engine.submit(limit("a", "buy", 0n, 1n))).toThrow(RangeError);
     expect(() => engine.submit(limit("b", "buy", 100n, 0n))).toThrow(RangeError);
@@ -175,7 +186,7 @@ describe("Engine.submit with a limit order", () => {
 
 describe("Engine.submit with a market order", () => {
   it("sweeps price levels in priority order regardless of price", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("a", "sell", 100n, 2n));
     engine.submit(limit("b", "sell", 150n, 2n));
     engine.submit(limit("c", "sell", 900n, 2n));
@@ -192,13 +203,13 @@ describe("Engine.submit with a market order", () => {
   });
 
   it("cancels what the book could not fill instead of resting it", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bid", "buy", 100n, 3n));
 
     const events = engine.submit(market("sell", "sell", 10n));
 
     expect(trades(events)).toEqual([["bid", "sell", 100n, 3n]]);
-    expect(events.at(-1)).toEqual({
+    expect(unstamped(events).at(-1)).toEqual({
       type: "cancelled",
       orderId: "sell",
       userId: "user-sell",
@@ -211,12 +222,12 @@ describe("Engine.submit with a market order", () => {
   });
 
   it("cancels the whole order against an empty side", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bid", "buy", 100n, 3n));
 
     const events = engine.submit(market("buy", "buy", 4n));
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "cancelled",
         orderId: "buy",
@@ -231,7 +242,7 @@ describe("Engine.submit with a market order", () => {
   });
 
   it("rejects a zero quantity", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
 
     expect(() => engine.submit(market("m", "buy", 0n))).toThrow(RangeError);
   });
@@ -239,13 +250,13 @@ describe("Engine.submit with a market order", () => {
 
 describe("Engine.cancel", () => {
   it("removes a resting order and reports what it had left", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("ask", "sell", 100n, 5n));
     engine.submit(limit("bid", "buy", 100n, 2n));
 
     const events = engine.cancel("ask");
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "cancelled",
         orderId: "ask",
@@ -260,7 +271,7 @@ describe("Engine.cancel", () => {
   });
 
   it("stops a cancelled order from trading", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("first", "sell", 100n, 1n));
     engine.submit(limit("second", "sell", 100n, 1n));
     engine.cancel("first");
@@ -271,21 +282,21 @@ describe("Engine.cancel", () => {
   });
 
   it("rejects a cancel for an order that already filled", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("ask", "sell", 100n, 1n));
     engine.submit(limit("bid", "buy", 100n, 1n));
 
-    expect(engine.cancel("ask")).toEqual([
+    expect(unstamped(engine.cancel("ask"))).toEqual([
       { type: "cancel_rejected", orderId: "ask", reason: "not_found" },
     ]);
   });
 
   it("rejects a cancel for an id it has never seen and leaves the book alone", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bid", "buy", 100n, 1n));
     const before = engine.snapshot();
 
-    expect(engine.cancel("ghost")).toEqual([
+    expect(unstamped(engine.cancel("ghost"))).toEqual([
       { type: "cancel_rejected", orderId: "ghost", reason: "not_found" },
     ]);
     expect(engine.snapshot()).toEqual(before);
@@ -294,12 +305,12 @@ describe("Engine.cancel", () => {
 
 describe("self-trade prevention", () => {
   it("cancels an incoming limit order that would trade with its owner's resting order", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("mine", "sell", 100n, 5n, "alice"));
 
     const events = engine.submit(limit("also-mine", "buy", 100n, 3n, "alice"));
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "cancelled",
         orderId: "also-mine",
@@ -315,7 +326,7 @@ describe("self-trade prevention", () => {
   });
 
   it("keeps fills made before reaching the owner's order and cancels only the rest", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bob-ask", "sell", 100n, 2n, "bob"));
     engine.submit(limit("alice-ask", "sell", 101n, 5n, "alice"));
     engine.submit(limit("carol-ask", "sell", 102n, 5n, "carol"));
@@ -337,12 +348,12 @@ describe("self-trade prevention", () => {
   });
 
   it("applies to market orders too", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("mine", "buy", 100n, 5n, "alice"));
 
     const events = engine.submit(market("sweep", "sell", 2n, "alice"));
 
-    expect(events).toEqual([
+    expect(unstamped(events)).toEqual([
       {
         type: "cancelled",
         orderId: "sweep",
@@ -356,7 +367,7 @@ describe("self-trade prevention", () => {
   });
 
   it("does not stop a limit order whose own resting order is past its limit", () => {
-    const engine = new Engine();
+    const engine = new Engine("TEST");
     engine.submit(limit("bob-ask", "sell", 100n, 1n, "bob"));
     engine.submit(limit("alice-ask", "sell", 105n, 1n, "alice"));
 
@@ -364,5 +375,50 @@ describe("self-trade prevention", () => {
 
     expect(trades(events)).toEqual([["bob-ask", "alice-bid", 100n, 1n]]);
     expect(events.at(-1)).toMatchObject({ type: "rested", orderId: "alice-bid", quantity: 2n });
+  });
+});
+
+describe("event sequence numbers", () => {
+  it("stamps every event with its market and a sequence that rises by one", () => {
+    const engine = new Engine("BTC-USD");
+
+    const first = engine.submit(limit("a", "sell", 100n, 1n));
+    const second = engine.submit(limit("b", "sell", 101n, 1n));
+    const sweep = engine.submit(market("m", "buy", 3n));
+    const cancel = engine.cancel("a");
+
+    const all = [...first, ...second, ...sweep, ...cancel];
+    expect(all.map((event) => [event.type, event.sequence])).toEqual([
+      ["rested", 1],
+      ["rested", 2],
+      ["trade", 3],
+      ["trade", 4],
+      ["cancelled", 5],
+      ["cancel_rejected", 6],
+    ]);
+    expect(all.every((event) => event.market === "BTC-USD")).toBe(true);
+    expect(engine.sequence).toBe(6);
+  });
+
+  it("starts at 0 and spends no numbers on a command that throws", () => {
+    const engine = new Engine("BTC-USD");
+    expect(engine.sequence).toBe(0);
+
+    expect(() => engine.submit(limit("bad", "buy", 100n, 0n))).toThrow(RangeError);
+    const events = engine.submit(limit("good", "buy", 100n, 1n));
+
+    expect(events.map((event) => event.sequence)).toEqual([1]);
+  });
+
+  it("counts each market on its own", () => {
+    const btc = new Engine("BTC-USD");
+    const eth = new Engine("ETH-USD");
+
+    btc.submit(limit("a", "buy", 100n, 1n));
+    btc.submit(limit("b", "buy", 100n, 1n));
+    const events = eth.submit(limit("c", "buy", 100n, 1n));
+
+    expect(events).toEqual([expect.objectContaining({ market: "ETH-USD", sequence: 1 })]);
+    expect(btc.sequence).toBe(2);
   });
 });

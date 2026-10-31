@@ -23,7 +23,8 @@ export type MarketOrder = {
 
 export type NewOrder = LimitOrder | MarketOrder;
 
-export type EngineEvent =
+// What happened, without the stamp every event gets on the way out.
+export type EventBody =
   | {
       type: "trade";
       makerOrderId: string;
@@ -65,17 +66,36 @@ export type EngineEvent =
       reason: "not_found";
     };
 
+// Sequence numbers start at 1 and rise by exactly 1 per event in a market, so a consumer
+// that sees 41 then 43 knows it missed one and must resync.
+export type EngineEvent = EventBody & { market: string; sequence: number };
+
 const opposite = (side: Side): Side => (side === "buy" ? "sell" : "buy");
 
 // One engine per market. Every call runs to completion before the next, so the book has
 // exactly one writer and needs no locks.
 export class Engine {
   readonly #book = new OrderBook();
+  readonly #market: string;
+  #sequence = 0;
+
+  constructor(market: string) {
+    this.#market = market;
+  }
+
+  // Number of the last event emitted, 0 before the first.
+  get sequence(): number {
+    return this.#sequence;
+  }
 
   // Matches the order against the opposite side, best price first and oldest first within a
   // price. The incoming order is the taker; resting ones are makers. What a limit order has
   // left rests at its price; what a market order has left is cancelled.
   submit(order: NewOrder): EngineEvent[] {
+    return this.#stamp(this.#match(order));
+  }
+
+  #match(order: NewOrder): EventBody[] {
     if (order.quantity <= 0n || (order.type === "limit" && order.price <= 0n)) {
       throw new RangeError(`order ${order.id} needs a positive price and quantity`);
     }
@@ -84,7 +104,7 @@ export class Engine {
       throw new Error(`order ${order.id} is already on the book`);
     }
 
-    const events: EngineEvent[] = [];
+    const events: EventBody[] = [];
     const makerSide = opposite(order.side);
     // A buy crosses any ask at or below its limit; a sell crosses any bid at or above it. A
     // market order crosses everything.
@@ -160,9 +180,9 @@ export class Engine {
   cancel(orderId: string): EngineEvent[] {
     const order = this.#book.remove(orderId);
     if (order === undefined) {
-      return [{ type: "cancel_rejected", orderId, reason: "not_found" }];
+      return this.#stamp([{ type: "cancel_rejected", orderId, reason: "not_found" }]);
     }
-    return [
+    return this.#stamp([
       {
         type: "cancelled",
         orderId: order.id,
@@ -172,10 +192,16 @@ export class Engine {
         quantity: order.remaining,
         reason: "requested",
       },
-    ];
+    ]);
   }
 
   snapshot(): BookSnapshot {
     return this.#book.snapshot();
+  }
+
+  // Numbers events only once a command has run to completion, so a command that throws on
+  // bad input uses up no sequence numbers.
+  #stamp(bodies: EventBody[]): EngineEvent[] {
+    return bodies.map((body) => ({ ...body, market: this.#market, sequence: ++this.#sequence }));
   }
 }
