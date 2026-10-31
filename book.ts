@@ -85,6 +85,30 @@ export class OrderBook {
     }
   }
 
+  // Takes an order off the book wherever it sits, and returns what it had left. Undefined if
+  // it is not on the book: never was, already filled, or already removed.
+  remove(id: string): RestingOrder | undefined {
+    const order = this.#byId.get(id);
+    if (order === undefined) {
+      return undefined;
+    }
+
+    const levels = this.#levels(order.side);
+    const index = this.#search(order.side, order.price);
+    const level = levels[index];
+    const position = level?.orders.indexOf(order) ?? -1;
+    if (level === undefined || position === -1) {
+      throw new Error(`order ${id} is indexed but missing from its price level`);
+    }
+
+    level.orders.splice(position, 1);
+    if (level.orders.length === 0) {
+      levels.splice(index, 1);
+    }
+    this.#byId.delete(id);
+    return { ...order };
+  }
+
   // Copies, best price first on each side, oldest first within a level.
   snapshot(): BookSnapshot {
     const copy = (levels: PriceLevel[]) =>

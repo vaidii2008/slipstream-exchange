@@ -95,3 +95,59 @@ describe("OrderBook.rest", () => {
     expect(book.snapshot().bids[0]?.orders[0]?.remaining).toBe(5n);
   });
 });
+
+describe("OrderBook.remove", () => {
+  it("takes an order from the middle of its queue and keeps the rest in order", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "sell", 100n, 1n));
+    book.rest(order("b", "sell", 100n, 2n));
+    book.rest(order("c", "sell", 100n, 3n));
+
+    const removed = book.remove("b");
+
+    expect(removed).toEqual(order("b", "sell", 100n, 2n));
+    expect(shape(book.snapshot().asks)).toEqual([[100n, ["a", "c"]]]);
+    expect(book.has("b")).toBe(false);
+  });
+
+  it("drops a price level once its last order is removed", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "buy", 100n, 1n));
+    book.rest(order("b", "buy", 101n, 1n));
+    book.rest(order("c", "buy", 102n, 1n));
+
+    book.remove("b");
+
+    expect(shape(book.snapshot().bids)).toEqual([
+      [102n, ["c"]],
+      [100n, ["a"]],
+    ]);
+  });
+
+  it("returns what is left after partial fills", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "sell", 100n, 10n));
+    book.fillBest("sell", 4n);
+
+    expect(book.remove("a")?.remaining).toBe(6n);
+  });
+
+  it("returns undefined for an order that is not on the book", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "sell", 100n, 1n));
+    book.fillBest("sell", 1n);
+
+    expect(book.remove("a")).toBeUndefined();
+    expect(book.remove("never")).toBeUndefined();
+  });
+
+  it("lets a removed id rest again", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "buy", 100n, 1n));
+    book.remove("a");
+
+    book.rest(order("a", "buy", 99n, 1n));
+
+    expect(shape(book.snapshot().bids)).toEqual([[99n, ["a"]]]);
+  });
+});

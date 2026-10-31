@@ -45,8 +45,8 @@ export type EngineEvent =
       quantity: bigint;
     }
   | {
-      // The order's unfilled quantity left the engine without trading. A market order whose
-      // book ran out ends this way.
+      // The order's unfilled quantity left the engine without trading: a market order whose
+      // book ran out, or a resting order its owner cancelled.
       type: "cancelled";
       orderId: string;
       userId: string;
@@ -54,7 +54,14 @@ export type EngineEvent =
       // Null for a market order, which has no price.
       price: bigint | null;
       quantity: bigint;
-      reason: "no_liquidity";
+      reason: "no_liquidity" | "requested";
+    }
+  | {
+      // Nothing to cancel: the order already filled, was already cancelled, or never rested.
+      // Expected in normal running, since a cancel can race the fill that empties the order.
+      type: "cancel_rejected";
+      orderId: string;
+      reason: "not_found";
     };
 
 const opposite = (side: Side): Side => (side === "buy" ? "sell" : "buy");
@@ -137,6 +144,24 @@ export class Engine {
       quantity: remaining,
     });
     return events;
+  }
+
+  cancel(orderId: string): EngineEvent[] {
+    const order = this.#book.remove(orderId);
+    if (order === undefined) {
+      return [{ type: "cancel_rejected", orderId, reason: "not_found" }];
+    }
+    return [
+      {
+        type: "cancelled",
+        orderId: order.id,
+        userId: order.userId,
+        side: order.side,
+        price: order.price,
+        quantity: order.remaining,
+        reason: "requested",
+      },
+    ];
   }
 
   snapshot(): BookSnapshot {

@@ -236,3 +236,58 @@ describe("Engine.submit with a market order", () => {
     expect(() => engine.submit(market("m", "buy", 0n))).toThrow(RangeError);
   });
 });
+
+describe("Engine.cancel", () => {
+  it("removes a resting order and reports what it had left", () => {
+    const engine = new Engine();
+    engine.submit(limit("ask", "sell", 100n, 5n));
+    engine.submit(limit("bid", "buy", 100n, 2n));
+
+    const events = engine.cancel("ask");
+
+    expect(events).toEqual([
+      {
+        type: "cancelled",
+        orderId: "ask",
+        userId: "user-ask",
+        side: "sell",
+        price: 100n,
+        quantity: 3n,
+        reason: "requested",
+      },
+    ]);
+    expect(engine.snapshot()).toEqual({ bids: [], asks: [] });
+  });
+
+  it("stops a cancelled order from trading", () => {
+    const engine = new Engine();
+    engine.submit(limit("first", "sell", 100n, 1n));
+    engine.submit(limit("second", "sell", 100n, 1n));
+    engine.cancel("first");
+
+    const events = engine.submit(limit("bid", "buy", 100n, 1n));
+
+    expect(trades(events)).toEqual([["second", "bid", 100n, 1n]]);
+  });
+
+  it("rejects a cancel for an order that already filled", () => {
+    const engine = new Engine();
+    engine.submit(limit("ask", "sell", 100n, 1n));
+    engine.submit(limit("bid", "buy", 100n, 1n));
+
+    expect(engine.cancel("ask")).toEqual([
+      { type: "cancel_rejected", orderId: "ask", reason: "not_found" },
+    ]);
+  });
+
+  it("rejects a cancel for an id it has never seen and leaves the book alone", () => {
+    const engine = new Engine();
+    engine.submit(limit("bid", "buy", 100n, 1n));
+    const before = engine.snapshot();
+
+    expect(engine.cancel("ghost")).toEqual([
+      { type: "cancel_rejected", orderId: "ghost", reason: "not_found" },
+    ]);
+    expect(engine.snapshot()).toEqual(before);
+  });
+});
