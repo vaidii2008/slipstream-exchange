@@ -127,12 +127,18 @@ export async function postTransaction(
     if (debited.length > 0) {
       // Locks are always taken in ascending id order, whatever order the postings came in, so
       // two transactions debiting the same accounts queue instead of deadlocking.
+      //
+      // NO KEY UPDATE, not UPDATE: inserting an entry makes Postgres take FOR KEY SHARE on the
+      // account it references, for the foreign-key check, and FOR UPDATE blocks that. A reserve
+      // (locks available, inserts into reserved) and a release (the reverse) would each wait on
+      // the other's row. NO KEY UPDATE still conflicts with itself, so two debits of one
+      // account still queue.
       await tx
         .select({ id: ledgerAccounts.id })
         .from(ledgerAccounts)
         .where(inArray(ledgerAccounts.id, debited))
         .orderBy(ledgerAccounts.id)
-        .for("update");
+        .for("no key update");
 
       // A new statement after the lock, so under READ COMMITTED it sees every entry committed
       // by whoever held the lock before us.

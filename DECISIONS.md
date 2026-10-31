@@ -78,17 +78,24 @@ Each entry: the decision, the alternative, why, and where it lives.
   matters, a cached column comes as a proposal with numbers.
 - **Where:** `balancesOf` and `postTransaction` in `ledger.ts`.
 
-### Lock only the user accounts a transaction debits, in id order
+### Lock only the user accounts a transaction debits, in id order, with FOR NO KEY UPDATE
 
-- **Decision:** `postTransaction` takes `SELECT ... FOR UPDATE` on each user account whose net
-  change is negative, sorted by id, then re-sums those accounts and refuses to overdraw them.
-- **Alternative:** lock every account in the transaction, or lock in posting order.
+- **Decision:** `postTransaction` takes `SELECT ... FOR NO KEY UPDATE` on each user account whose
+  net change is negative, sorted by id, then re-sums those accounts and refuses to overdraw them.
+- **Alternative:** lock every account in the transaction, lock in posting order, or use
+  `FOR UPDATE`.
 - **Why:** an account that only gains money cannot be overdrawn, and the system account may go
   negative, so locking either would just queue writers: every deposit of an asset would wait on
   one system row. Sorting by id means two transactions that debit the same accounts always
-  request the locks in the same order, so they queue instead of deadlocking. Proof: 50 parallel
-  reservations of 10 against 100 give exactly 10 successes. With the lock removed, 12 got through.
-- **Where:** the `debited` block in `postTransaction`, `ledger.ts`; test under
+  request the locks in the same order, so they queue instead of deadlocking. The lock strength
+  matters too. Inserting an entry makes Postgres take `FOR KEY SHARE` on the referenced account
+  for the foreign-key check, and `FOR UPDATE` blocks that. A reserve (locks available, inserts
+  into reserved) and a release (locks reserved, inserts into available) on the same user and
+  asset then wait on each other: 36 of 40 interleaved reserves and releases died with 40P01.
+  `FOR NO KEY UPDATE` does not block `FOR KEY SHARE` but still blocks itself, so two debits of one
+  account still queue. After the switch, 0 of 40 failed, and 50 parallel reservations of 10
+  against 100 still give exactly 10 successes. With the lock removed, 12 got through.
+- **Where:** the `debited` block in `postTransaction`, `ledger.ts`; tests under
   `concurrent reservations` in `ledger.test.ts`.
 
 ### The ledger never cascades

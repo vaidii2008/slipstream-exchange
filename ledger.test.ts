@@ -316,4 +316,37 @@ describe("concurrent reservations", () => {
     const usd = (await balancesOf(db, userId)).find((balance) => balance.asset === "USD");
     expect(usd).toMatchObject({ available: 0n, reserved: 100n });
   });
+
+  // A reserve debits `available` and inserts an entry referencing `reserved`; a release does
+  // the mirror image. Each entry insert's foreign-key check needs a key-share lock on the
+  // other row, so the debit lock must not conflict with it.
+  it("runs reserves and releases on one account in parallel without deadlocking", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "USD", 1_000n);
+    await reserve(db, userId, "USD", 500n);
+
+    // 20 of each, 10 at a time: neither bucket can run out in any order, so every one must
+    // succeed.
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 40 }, (_, i) =>
+        i % 2 === 0 ? reserve(db, userId, "USD", 10n) : release(db, userId, "USD", 10n),
+      ),
+    );
+
+    // Drizzle wraps driver errors, so the Postgres SQLSTATE can sit on the cause.
+    const failures = outcomes.flatMap((outcome) => {
+      if (outcome.status === "fulfilled") {
+        return [];
+      }
+      const reason = outcome.reason as { code?: string; cause?: { code?: string } };
+      return [reason.code ?? reason.cause?.code ?? String(outcome.reason)];
+    });
+    expect(failures).toEqual([]);
+
+    const usd = (await balancesOf(db, userId)).find((balance) => balance.asset === "USD");
+    expect(usd).toMatchObject({ available: 500n, reserved: 500n });
+    expect((usd?.available ?? 0n) + (usd?.reserved ?? 0n)).toBe(1_000n);
+    // Each deadlock costs Postgres's 1s deadlock_timeout before it is detected, so a
+    // regression needs room to report 40P01 instead of timing out.
+  }, 30_000);
 });
