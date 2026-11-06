@@ -31,6 +31,7 @@ export type WebSocketDependencies = {
   // A connection used only for SUBSCRIBE: Redis allows nothing else on it.
   subscriber: RedisClient;
   channels: FeedChannels;
+  limits: WebSocketLimits;
 };
 
 // A client message larger than this closes the connection: commands are tiny.
@@ -81,20 +82,48 @@ const topicOf = (channel: string, market: string) => `${channel}:${market}`;
 
 // One client. Its messages are handled one at a time, in arrival order, so "subscribe then
 // unsubscribe" can never end subscribed because the first was slower.
+export type WebSocketLimits = {
+  // How often each connection is pinged. One that has not answered the previous ping by the
+  // next one is gone (a dead network path never sends a close) and is terminated.
+  heartbeatMs: number;
+  // Bytes a connection may have queued and unsent. A client that reads slower than the
+  // market moves would otherwise make the server buffer for it without limit.
+  maxBufferedBytes: number;
+};
+
+export const DEFAULT_WEBSOCKET_LIMITS: WebSocketLimits = {
+  heartbeatMs: 15_000,
+  maxBufferedBytes: 1024 * 1024,
+};
+
 class Connection {
   readonly socket: WebSocket;
   readonly topics = new Set<string>();
   readonly inbox = new SerialQueue();
+  readonly #maxBufferedBytes: number;
   userId: string | undefined;
   // Closes the connection when its access token expires.
   expiry: NodeJS.Timeout | undefined;
+  // Cleared on each ping, set again by the pong.
+  alive = true;
 
-  constructor(socket: WebSocket) {
+  constructor(socket: WebSocket, maxBufferedBytes: number) {
     this.socket = socket;
+    this.#maxBufferedBytes = maxBufferedBytes;
   }
 
   send(message: ServerMessage): void {
-    this.socket.send(JSON.stringify(message));
+    this.sendText(JSON.stringify(message));
+  }
+
+  // Terminated rather than closed: a close frame would queue behind the backlog it is
+  // meant to stop. The client sees an abnormal close, reconnects and resyncs.
+  sendText(text: string): void {
+    if (this.socket.bufferedAmount > this.#maxBufferedBytes) {
+      this.socket.terminate();
+      return;
+    }
+    this.socket.send(text);
   }
 }
 
@@ -133,7 +162,7 @@ export class MarketDataHub {
     // Serialised once, however many subscribers there are.
     const text = JSON.stringify(message);
     for (const connection of connections) {
-      connection.socket.send(text);
+      connection.sendText(text);
     }
   }
 
@@ -187,9 +216,29 @@ async function balancesMessage(db: Database, userId: string): Promise<ServerMess
 
 export function registerWebSocketRoutes(
   app: FastifyInstance,
-  { db, exchange, tokens, subscriber, channels }: WebSocketDependencies,
+  { db, exchange, tokens, subscriber, channels, limits }: WebSocketDependencies,
 ) {
   const hub = new MarketDataHub();
+  const connections = new Set<Connection>();
+
+  let heartbeat: NodeJS.Timeout | undefined;
+  app.addHook("onReady", (done) => {
+    heartbeat = setInterval(() => {
+      for (const connection of connections) {
+        if (!connection.alive) {
+          connection.socket.terminate();
+          continue;
+        }
+        connection.alive = false;
+        connection.socket.ping();
+      }
+    }, limits.heartbeatMs);
+    done();
+  });
+  app.addHook("onClose", (_instance, done) => {
+    clearInterval(heartbeat);
+    done();
+  });
 
   // Read after the settlement committed, so it includes it. Off the market's queue: the
   // listener must not wait, and only users with a connection pay for the read.
@@ -347,7 +396,11 @@ export function registerWebSocketRoutes(
   }
 
   function accept(socket: WebSocket, log: FastifyBaseLogger): void {
-    const connection = new Connection(socket);
+    const connection = new Connection(socket, limits.maxBufferedBytes);
+    connections.add(connection);
+    socket.on("pong", () => {
+      connection.alive = true;
+    });
     socket.on("message", (data) => {
       void connection.inbox
         .run(() => handle(connection, data))
@@ -357,6 +410,7 @@ export function registerWebSocketRoutes(
         });
     });
     socket.on("close", () => {
+      connections.delete(connection);
       clearTimeout(connection.expiry);
       hub.disconnect(connection);
       if (connection.userId !== undefined) {

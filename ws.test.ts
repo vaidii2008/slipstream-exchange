@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import type { WebSocket } from "ws";
 import { Exchange } from "./exchange.ts";
@@ -5,7 +6,7 @@ import { deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
-import { buildServer } from "./server.ts";
+import { buildServer, type ServerOptions } from "./server.ts";
 import { TEST_SECRET, uniqueMarketDataPrefix, useTestServer } from "./testing.ts";
 import { createAccessTokens } from "./tokens.ts";
 import { decode, TOKEN_EXPIRED_CLOSE_CODE } from "./ws.ts";
@@ -35,11 +36,11 @@ async function funded(holdings: Record<string, string>): Promise<string> {
 }
 
 // A server around a fresh exchange, so its sequences start at 1 and its book is empty.
-function freshServer(marketDataPrefix = uniqueMarketDataPrefix()) {
+function freshServer(options: ServerOptions = {}) {
   const exchange = new Exchange(db);
   const server = buildServer(
     { pool, redis, subscriber, db, tokens, exchange },
-    { marketDataPrefix },
+    { marketDataPrefix: uniqueMarketDataPrefix(), ...options },
   );
   afterAll(async () => {
     await server.close();
@@ -103,6 +104,13 @@ async function connect(server: Server = app) {
     },
     close() {
       socket.terminate();
+    },
+    closed(): Promise<number> {
+      return new Promise((resolve) => {
+        socket.on("close", (code) => {
+          resolve(code);
+        });
+      });
     },
   };
 }
@@ -417,8 +425,8 @@ describe("fan-out through Redis", () => {
   // Two servers on one prefix stand in for two API processes: the first runs the market, the
   // second only holds sockets.
   const prefix = uniqueMarketDataPrefix();
-  const { exchange } = freshServer(prefix);
-  const { server: gateway } = freshServer(prefix);
+  const { exchange } = freshServer({ marketDataPrefix: prefix });
+  const { server: gateway } = freshServer({ marketDataPrefix: prefix });
 
   it("delivers trades and private events to a client connected to another process", async () => {
     const market = await btcUsd();
@@ -450,5 +458,78 @@ describe("fan-out through Redis", () => {
       expect.objectContaining({ sequence: 2, price: "60000.00000000", quantity: "0.10000000" }),
     ]);
     client.close();
+  });
+});
+
+describe("heartbeats", () => {
+  const { server } = freshServer({
+    webSocketLimits: { heartbeatMs: 50, maxBufferedBytes: 1024 * 1024 },
+  });
+
+  it("keeps a client that answers pings", async () => {
+    // Node's own WebSocket over a real port answers pings, as browsers do.
+    await server.listen({ port: 0, host: "127.0.0.1" });
+    const address = server.server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("server has no port");
+    }
+    const client = new globalThis.WebSocket(`ws://127.0.0.1:${address.port}/ws`);
+    const replies: unknown[] = [];
+    client.addEventListener("message", (event) => {
+      if (typeof event.data === "string") {
+        replies.push(JSON.parse(event.data));
+      }
+    });
+    await new Promise((resolve) => client.addEventListener("open", resolve));
+
+    await delay(300);
+    client.send(JSON.stringify({ op: "subscribe", channel: "trades", market: "BTC-USD" }));
+
+    await expect
+      .poll(() => replies)
+      .toEqual([{ type: "subscribed", channel: "trades", market: "BTC-USD" }]);
+    expect(client.readyState).toBe(globalThis.WebSocket.OPEN);
+    client.close();
+  });
+
+  it("terminates a client that never answers", async () => {
+    // An injected client never answers pings: it stands in for a connection whose network
+    // path died without a close.
+    const client = await connect(server);
+    const closed = client.closed();
+
+    await expect(closed).resolves.toBe(1006);
+  });
+});
+
+describe("a subscriber that falls behind", () => {
+  const { exchange, server } = freshServer({
+    webSocketLimits: { heartbeatMs: 60_000, maxBufferedBytes: 2048 },
+  });
+
+  it("is terminated once its unsent backlog passes the cap, while one that keeps up is not", async () => {
+    const market = await btcUsd();
+    const seller = await funded({ BTC: "1" });
+    for (let level = 0; level < 20; level++) {
+      await exchange.placeOrder(market, limit(seller, "sell", `${70000 + level}`, "0.01"));
+    }
+    const fast = await connect(server);
+    fast.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    await fast.next();
+    await fast.next();
+    const slow = await connect(server);
+    const slowClosed = slow.closed();
+
+    // The slow client stops reading and keeps asking for the 20-level snapshot. The in-memory
+    // pipe absorbs the first ~130 KB before the server's buffer grows, so it asks many times.
+    slow.socket.pause();
+    for (let request = 0; request < 400; request++) {
+      slow.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    }
+
+    await expect(slowClosed).resolves.toBe(1006);
+    await exchange.placeOrder(market, limit(seller, "sell", "80000", "0.01"));
+    await expect(fast.next()).resolves.toMatchObject({ type: "book_update", sequence: 21 });
+    fast.close();
   });
 });

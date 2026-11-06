@@ -13,7 +13,7 @@ import type { RedisClient } from "./redis.ts";
 import { registerSessionRoutes } from "./sessions.ts";
 import { registerTradingRoutes } from "./trading.ts";
 import { registerWalletRoutes } from "./wallet.ts";
-import { registerWebSocketRoutes } from "./ws.ts";
+import { DEFAULT_WEBSOCKET_LIMITS, registerWebSocketRoutes, type WebSocketLimits } from "./ws.ts";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 
@@ -59,6 +59,7 @@ export type ServerOptions = {
   orderRateLimit?: RateLimit;
   // Prefix for the market data channels in Redis. Tests give each server its own.
   marketDataPrefix?: string;
+  webSocketLimits?: WebSocketLimits;
 };
 
 export const DEFAULT_MARKET_DATA_PREFIX = "slipstream:";
@@ -71,6 +72,7 @@ export function buildServer(
     logLevel,
     orderRateLimit = DEFAULT_ORDER_RATE_LIMIT,
     marketDataPrefix = DEFAULT_MARKET_DATA_PREFIX,
+    webSocketLimits = DEFAULT_WEBSOCKET_LIMITS,
   }: ServerOptions = {},
 ) {
   const app = Fastify({
@@ -133,7 +135,14 @@ export function buildServer(
     stopPublishing();
     done();
   });
-  registerWebSocketRoutes(app, { db, exchange, tokens, subscriber, channels });
+  registerWebSocketRoutes(app, {
+    db,
+    exchange,
+    tokens,
+    subscriber,
+    channels,
+    limits: webSocketLimits,
+  });
 
   return app;
 }
