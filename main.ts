@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
+import { Exchange } from "./exchange.ts";
 import { buildServer } from "./server.ts";
 import { createAccessTokens } from "./tokens.ts";
 
@@ -79,7 +80,10 @@ try {
   const db = drizzle({ client: pool });
 
   // Built before the connections are verified so every startup line goes through pino.
-  app = buildServer({ pool, redis, db, tokens }, { logLevel: config.LOG_LEVEL });
+  app = buildServer(
+    { pool, redis, db, tokens, exchange: new Exchange(db) },
+    { logLevel: config.LOG_LEVEL },
+  );
   const log = app.log;
 
   pool.on("error", (error) => {

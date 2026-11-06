@@ -19,7 +19,7 @@ const depositBody = z.object({
   amount: z.string().max(64),
 });
 
-const AMOUNT_MESSAGES: Record<ParseFailure | "not_positive", string> = {
+export const AMOUNT_MESSAGES: Record<ParseFailure | "not_positive", string> = {
   malformed: "must be a plain decimal string such as 1.5",
   negative: "must be positive",
   not_positive: "must be positive",
@@ -27,7 +27,7 @@ const AMOUNT_MESSAGES: Record<ParseFailure | "not_positive", string> = {
   too_large: "is too large",
 };
 
-function fieldError(field: string, message: string) {
+export function fieldError(field: string, message: string) {
   return { error: "invalid_request", issues: [{ field, message }] };
 }
 

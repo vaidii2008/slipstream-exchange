@@ -4,6 +4,7 @@ import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll } from "vitest";
+import { Exchange } from "./exchange.ts";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
 import { createAccessTokens } from "./tokens.ts";
@@ -71,11 +72,13 @@ export function useTestServer() {
   const pool = new Pool({ connectionString: databaseUrl });
   const db = drizzle({ client: pool });
   const tokens = createAccessTokens(TEST_SECRET);
+  const exchange = new Exchange(db);
   const app = buildServer({
     pool,
     redis: { ping: () => Promise.resolve("PONG") },
     db,
     tokens,
+    exchange,
   });
 
   const createdEmails: string[] = [];
@@ -105,5 +108,5 @@ export function useTestServer() {
     await pool.end();
   });
 
-  return { pool, db, tokens, app, uniqueEmail };
+  return { pool, db, tokens, exchange, app, uniqueEmail };
 }

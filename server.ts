@@ -5,7 +5,9 @@ import cookie from "@fastify/cookie";
 import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
 import type { LogLevel } from "./config.ts";
+import type { Exchange } from "./exchange.ts";
 import { registerSessionRoutes } from "./sessions.ts";
+import { registerTradingRoutes } from "./trading.ts";
 import { registerWalletRoutes } from "./wallet.ts";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
@@ -21,6 +23,7 @@ type RedisProbe = {
 export type ServerDependencies = AuthDependencies & {
   pool: PostgresProbe;
   redis: RedisProbe;
+  exchange: Exchange;
 };
 
 // 400 matches the code the auth routes already use for a body that fails validation.
@@ -52,7 +55,7 @@ export type ServerOptions = {
 };
 
 export function buildServer(
-  { pool, redis, db, tokens }: ServerDependencies,
+  { pool, redis, db, tokens, exchange }: ServerDependencies,
   { logLevel }: ServerOptions = {},
 ) {
   const app = Fastify({
@@ -101,6 +104,7 @@ export function buildServer(
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
   registerWalletRoutes(app, { db, tokens });
+  registerTradingRoutes(app, { db, tokens, exchange });
 
   return app;
 }
