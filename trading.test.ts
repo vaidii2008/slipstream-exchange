@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { Exchange } from "./exchange.ts";
+import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, uniqueEmail } = useTestServer();
+const { pool, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
 
-async function signedInUser(): Promise<string> {
+// Each helper takes the server to talk to. Most tests share the file's server; a scenario that
+// needs an empty book builds its own around a fresh Exchange.
+type Server = typeof sharedApp;
+
+async function signedInUser(app: Server = sharedApp): Promise<string> {
   const email = uniqueEmail("trading-test");
   await app.inject({
     method: "POST",
@@ -18,7 +24,12 @@ async function signedInUser(): Promise<string> {
   return `Bearer ${loggedIn.json<{ accessToken: string }>().accessToken}`;
 }
 
-async function fund(authorization: string, asset: string, amount: string): Promise<void> {
+async function fund(
+  authorization: string,
+  asset: string,
+  amount: string,
+  app: Server = sharedApp,
+): Promise<void> {
   const response = await app.inject({
     method: "POST",
     url: "/deposits",
@@ -28,7 +39,11 @@ async function fund(authorization: string, asset: string, amount: string): Promi
   expect(response.statusCode).toBe(201);
 }
 
-function postOrder(authorization: string | undefined, payload: Record<string, unknown>) {
+function postOrder(
+  authorization: string | undefined,
+  payload: Record<string, unknown>,
+  app: Server = sharedApp,
+) {
   return app.inject({
     method: "POST",
     url: "/orders",
@@ -65,7 +80,7 @@ describe("POST /orders", () => {
     await fund(authorization, "USD", "6000");
     await postOrder(authorization, { ...aBuy, quantity: "0.05" });
 
-    const response = await app.inject({
+    const response = await sharedApp.inject({
       method: "GET",
       url: "/balances",
       headers: { authorization },
@@ -127,5 +142,103 @@ describe("POST /orders", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json<unknown>()).toMatchObject({ error: "invalid_request" });
+  });
+});
+
+describe("two users trading through the API", () => {
+  const app = buildServer({
+    pool,
+    redis: { ping: () => Promise.resolve("PONG") },
+    db,
+    tokens,
+    exchange: new Exchange(db),
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  type Balance = { asset: string; available: string; reserved: string };
+
+  async function balances(authorization: string): Promise<Record<string, [string, string]>> {
+    const response = await app.inject({
+      method: "GET",
+      url: "/balances",
+      headers: { authorization },
+    });
+    const rows = response.json<{ balances: Balance[] }>().balances;
+    return Object.fromEntries(rows.map((row) => [row.asset, [row.available, row.reserved]]));
+  }
+
+  async function place(authorization: string, side: string, price: string, quantity: string) {
+    const response = await postOrder(
+      authorization,
+      { market: "BTC-USD", side, type: "limit", price, quantity },
+      app,
+    );
+    expect(response.statusCode).toBe(201);
+    return response.json<{ status: string; filledQuantity: string; fills: unknown[] }>();
+  }
+
+  // Each step's expected balances are worked out by hand in the comment above it.
+  it("places, partly fills and fully fills orders, keeping both users' money whole", async () => {
+    const alice = await signedInUser(app);
+    const bob = await signedInUser(app);
+    await fund(alice, "BTC", "1", app);
+    await fund(bob, "USD", "100000", app);
+
+    // Alice offers 0.5 BTC at 60,000. Nothing to match, so it rests with 0.5 BTC reserved.
+    await expect(place(alice, "sell", "60000", "0.5")).resolves.toMatchObject({
+      status: "open",
+      filledQuantity: "0.00000000",
+    });
+
+    // Bob bids 0.2 at 60,100 and fills at Alice's 60,000. He reserved 12,020 and paid 12,000,
+    // so 20 comes back. Alice's order is now partly filled, 0.3 still reserved.
+    await expect(place(bob, "buy", "60100", "0.2")).resolves.toMatchObject({
+      status: "filled",
+      filledQuantity: "0.20000000",
+      fills: [{ price: "60000.00000000", quantity: "0.20000000" }],
+    });
+    await expect(balances(alice)).resolves.toMatchObject({
+      BTC: ["0.50000000", "0.30000000"],
+      USD: ["12000.00000000", "0.00000000"],
+    });
+    await expect(balances(bob)).resolves.toMatchObject({
+      BTC: ["0.20000000", "0.00000000"],
+      USD: ["88000.00000000", "0.00000000"],
+    });
+
+    // Bob bids 0.5 at 60,000: takes Alice's last 0.3, and 0.2 rests at 60,000 with 12,000
+    // still reserved. Alice's order is filled.
+    await expect(place(bob, "buy", "60000", "0.5")).resolves.toMatchObject({
+      status: "open",
+      filledQuantity: "0.30000000",
+    });
+    await expect(balances(alice)).resolves.toMatchObject({
+      BTC: ["0.50000000", "0.00000000"],
+      USD: ["30000.00000000", "0.00000000"],
+    });
+    await expect(balances(bob)).resolves.toMatchObject({
+      BTC: ["0.50000000", "0.00000000"],
+      USD: ["58000.00000000", "12000.00000000"],
+    });
+
+    // Alice offers 0.2 at 59,000 and fills against Bob's resting bid at his 60,000: the maker
+    // sets the price, so the seller gets more than she asked.
+    await expect(place(alice, "sell", "59000", "0.2")).resolves.toMatchObject({
+      status: "filled",
+      filledQuantity: "0.20000000",
+      fills: [{ price: "60000.00000000", quantity: "0.20000000" }],
+    });
+    await expect(balances(alice)).resolves.toMatchObject({
+      BTC: ["0.30000000", "0.00000000"],
+      USD: ["42000.00000000", "0.00000000"],
+    });
+    await expect(balances(bob)).resolves.toMatchObject({
+      BTC: ["0.70000000", "0.00000000"],
+      USD: ["58000.00000000", "0.00000000"],
+    });
+    // Nothing created or lost: 1 BTC and 100,000 USD between them, as deposited.
   });
 });
