@@ -69,6 +69,7 @@ describe("POST /orders", () => {
       type: "limit",
       price: "60000.00000000",
       quantity: "0.10000000",
+      clientOrderId: null,
       status: "open",
       filledQuantity: "0.00000000",
       fills: [],
@@ -143,6 +144,101 @@ describe("POST /orders", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json<unknown>()).toMatchObject({ error: "invalid_request" });
+  });
+});
+
+describe("POST /orders with a client order id", () => {
+  // Far below any ask another test rests in the shared book, so these orders never fill.
+  const keyed = (clientOrderId: string) => ({
+    ...aBuy,
+    price: "100",
+    quantity: "1",
+    clientOrderId,
+  });
+
+  async function usdOf(authorization: string) {
+    const response = await sharedApp.inject({
+      method: "GET",
+      url: "/balances",
+      headers: { authorization },
+    });
+    return response
+      .json<{ balances: { asset: string; available: string; reserved: string }[] }>()
+      .balances.find((balance) => balance.asset === "USD");
+  }
+
+  it("answers a repeat with the original order and 200, and reserves once", async () => {
+    const authorization = await signedInUser();
+    await fund(authorization, "USD", "100");
+
+    const first = await postOrder(authorization, keyed("retry-1"));
+    // The whole balance is reserved now, so placing it again would fail for funds.
+    const repeat = await postOrder(authorization, keyed("retry-1"));
+
+    expect(first.statusCode).toBe(201);
+    expect(repeat.statusCode).toBe(200);
+    expect(repeat.json<unknown>()).toEqual({
+      id: first.json<{ id: string }>().id,
+      market: "BTC-USD",
+      side: "buy",
+      type: "limit",
+      price: "100.00000000",
+      quantity: "1.00000000",
+      clientOrderId: "retry-1",
+      status: "open",
+      filledQuantity: "0.00000000",
+      fills: [],
+    });
+    await expect(usdOf(authorization)).resolves.toEqual({
+      asset: "USD",
+      available: "0.00000000",
+      reserved: "100.00000000",
+    });
+  });
+
+  it("places one order when the same request arrives several times at once", async () => {
+    const authorization = await signedInUser();
+    await fund(authorization, "USD", "100");
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () => postOrder(authorization, keyed("burst-1"))),
+    );
+
+    const codes = responses.map((response) => response.statusCode).sort();
+    expect(codes).toEqual([200, 200, 200, 200, 201]);
+    const ids = new Set(responses.map((response) => response.json<{ id: string }>().id));
+    expect(ids.size).toBe(1);
+    await expect(usdOf(authorization)).resolves.toMatchObject({ reserved: "100.00000000" });
+  });
+
+  it("refuses the same key on a different order with 409", async () => {
+    const authorization = await signedInUser();
+    await fund(authorization, "USD", "1000");
+    await postOrder(authorization, keyed("reused-1"));
+
+    const response = await postOrder(authorization, { ...keyed("reused-1"), price: "101" });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json<unknown>()).toMatchObject({ error: "client_order_id_reused" });
+    await expect(usdOf(authorization)).resolves.toMatchObject({ reserved: "100.00000000" });
+  });
+
+  it("scopes keys to the user, so two users can use the same one", async () => {
+    const alice = await signedInUser();
+    const bob = await signedInUser();
+    await fund(alice, "USD", "100");
+    await fund(bob, "USD", "100");
+
+    await expect(postOrder(alice, keyed("shared-1"))).resolves.toMatchObject({ statusCode: 201 });
+    await expect(postOrder(bob, keyed("shared-1"))).resolves.toMatchObject({ statusCode: 201 });
+  });
+
+  it.each(["", "has space", "x".repeat(65)])("rejects the key %j with 400", async (key) => {
+    const authorization = await signedInUser();
+
+    const response = await postOrder(authorization, keyed(key));
+
+    expect(response.statusCode).toBe(400);
   });
 });
 
@@ -289,6 +385,7 @@ describe("GET /orders and GET /fills", () => {
       quantity: "0.01000000",
       filledQuantity: "0.00000000",
       status: "open",
+      clientOrderId: null,
       createdAt: expect.any(String) as unknown,
       updatedAt: expect.any(String) as unknown,
     });

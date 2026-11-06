@@ -14,7 +14,9 @@ import {
 } from "./ledger.ts";
 import { formatAmount, notional } from "./money.ts";
 import {
+  DuplicateOrderError,
   type Market,
+  orderIdForClientOrderId,
   type OrderRequest,
   protectionPrice,
   recordOrder,
@@ -252,8 +254,22 @@ export class Exchange {
     this.#db = db;
   }
 
+  // Throws DuplicateOrderError, without touching the book or the ledger, when the request
+  // repeats a client order id the user has already placed.
   async placeOrder(market: Market, request: OrderRequest): Promise<PlacedOrder> {
     const { engine, queue } = this.#market(market.symbol);
+    // Checked first so a retry gets its original order back even if the book or the balance
+    // has changed since. recordOrder catches the retry that races the original.
+    if (request.clientOrderId !== undefined) {
+      const existing = await orderIdForClientOrderId(
+        this.#db,
+        request.userId,
+        request.clientOrderId,
+      );
+      if (existing !== undefined) {
+        throw new DuplicateOrderError(existing);
+      }
+    }
     // Read from the book as it is now, outside the queue. Commands queued ahead may move the
     // book before this order runs; the protection price still bounds what it can spend.
     const accepted =
@@ -270,7 +286,8 @@ export class Exchange {
     const { id } = await recordOrder(this.#db, market, accepted);
 
     return queue.run(async () => {
-      const events = engine.submit({ ...accepted, id });
+      const { clientOrderId: _clientOrderId, ...order } = accepted;
+      const events = engine.submit({ ...order, id });
       await settle(this.#db, market, events, worstPrice(accepted));
       return summarize(id, events);
     });

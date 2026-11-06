@@ -17,6 +17,7 @@ export const orderColumns = {
   quantity: orders.quantity,
   filledQuantity: orders.filledQuantity,
   status: orders.status,
+  clientOrderId: orders.clientOrderId,
   createdAt: orders.createdAt,
   updatedAt: orders.updatedAt,
 };
@@ -30,6 +31,7 @@ export type OrderRow = {
   quantity: string;
   filledQuantity: string;
   status: "pending" | "open" | "filled" | "cancelled";
+  clientOrderId: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -47,6 +49,19 @@ export async function findOrder(
     .where(and(eq(orders.id, orderId), eq(orders.userId, userId)))
     .limit(1);
   return row;
+}
+
+// The fills an order took as the taker, oldest first: what POST /orders reported when it
+// was placed, for answering a repeat of it.
+export async function takerFills(
+  db: Database,
+  orderId: string,
+): Promise<{ price: string; quantity: string }[]> {
+  return db
+    .select({ price: trades.price, quantity: trades.quantity })
+    .from(trades)
+    .where(eq(trades.takerOrderId, orderId))
+    .orderBy(trades.id);
 }
 
 export type OrderListing = {

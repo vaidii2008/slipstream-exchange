@@ -2,7 +2,14 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market, OrderError, protectionPrice, recordOrder } from "./orders.ts";
+import {
+  DuplicateOrderError,
+  loadMarket,
+  type Market,
+  OrderError,
+  protectionPrice,
+  recordOrder,
+} from "./orders.ts";
 import { orders, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
@@ -242,6 +249,41 @@ describe("recordOrder", () => {
     await expect(balanceOf(userId, "BTC")).resolves.toEqual({
       available: 0n,
       reserved: units("1"),
+    });
+  });
+
+  it("reserves for only one of several parallel orders with the same client order id", async () => {
+    const userId = await createUser();
+    // Enough for one order, so a repeat that reserved before noticing would fail for funds.
+    await deposit(db, userId, "BTC", units("0.25"));
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        recordOrder(db, btcUsd, {
+          type: "limit",
+          userId,
+          side: "sell",
+          price: units("50000"),
+          quantity: units("0.25"),
+          clientOrderId: "same-key",
+        }),
+      ),
+    );
+
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason as unknown] : [],
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(5);
+    for (const reason of rejected) {
+      expect(reason).toBeInstanceOf(DuplicateOrderError);
+      expect(reason).toMatchObject({ orderId: fulfilled[0]?.value.id });
+    }
+    await expect(ordersOf(userId)).resolves.toHaveLength(1);
+    await expect(balanceOf(userId, "BTC")).resolves.toEqual({
+      available: 0n,
+      reserved: units("0.25"),
     });
   });
 });

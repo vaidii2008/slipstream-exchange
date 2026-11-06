@@ -1,14 +1,22 @@
 // The order API. It needs both orders.ts (markets, rejections) and exchange.ts (placing), and
 // exchange.ts already imports orders.ts, so the routes live here rather than in either.
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
+import type { Side } from "./book.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
-import { findOrder, listFills, listOrders, type OrderRow } from "./history.ts";
-import { loadMarket, loadMarkets, type Market, OrderError, type OrderErrorCode } from "./orders.ts";
+import { findOrder, listFills, listOrders, type OrderRow, takerFills } from "./history.ts";
+import {
+  DuplicateOrderError,
+  loadMarket,
+  loadMarkets,
+  type Market,
+  OrderError,
+  type OrderErrorCode,
+} from "./orders.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 
@@ -24,6 +32,11 @@ const orderFields = {
   market: z.string().min(1).max(32),
   side: z.enum(["buy", "sell"]),
   quantity: z.string().max(64),
+  // The idempotency key. Printable and short, since it is stored and echoed back.
+  clientOrderId: z
+    .string()
+    .regex(/^[A-Za-z0-9._:-]{1,64}$/, "must be 1 to 64 letters, digits or . _ : -")
+    .optional(),
 };
 const orderBody = z.discriminatedUnion("type", [
   z.strictObject({ ...orderFields, type: z.literal("limit"), price: z.string().max(64) }),
@@ -67,6 +80,7 @@ function orderJson(row: OrderRow, market: Market) {
     quantity: rescale(row.quantity, market.baseScale),
     filledQuantity: rescale(row.filledQuantity, market.baseScale),
     status: row.status,
+    clientOrderId: row.clientOrderId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -85,6 +99,45 @@ export function registerTradingRoutes(
   { db, tokens, exchange }: TradingDependencies,
 ) {
   const authenticate = bearerAuth(tokens);
+
+  // A repeated client order id. The same order again gets the original back, in its current
+  // state, with 200 rather than 201 since nothing new was placed. The same key on a different
+  // order is the client's bug, and guessing which one they meant could trade the wrong thing.
+  async function replyToRepeat(
+    reply: FastifyReply,
+    userId: string,
+    orderId: string,
+    asked: { market: Market; side: Side; type: string; price: bigint | null; quantity: bigint },
+  ) {
+    const existing = await findOrder(db, userId, orderId);
+    if (existing === undefined) {
+      throw new Error(`order ${orderId} matched a client order id but has no row`);
+    }
+    const { market } = asked;
+    const same =
+      existing.market === market.symbol &&
+      existing.side === asked.side &&
+      existing.type === asked.type &&
+      (existing.price === null ? null : fromNumeric(existing.price, market.quoteScale)) ===
+        asked.price &&
+      fromNumeric(existing.quantity, market.baseScale) === asked.quantity;
+    if (!same) {
+      return reply.code(409).send({
+        error: "client_order_id_reused",
+        message: `client order id belongs to order ${existing.id}, which differs from this one`,
+      });
+    }
+
+    const { createdAt: _createdAt, updatedAt: _updatedAt, ...order } = orderJson(existing, market);
+    const fills = await takerFills(db, existing.id);
+    return reply.code(200).send({
+      ...order,
+      fills: fills.map((fill) => ({
+        price: rescale(fill.price, market.quoteScale),
+        quantity: rescale(fill.quantity, market.baseScale),
+      })),
+    });
+  }
 
   app.post("/orders", { onRequest: authenticate }, async (request, reply) => {
     const userId = authenticatedUserId(request);
@@ -113,7 +166,12 @@ export function registerTradingRoutes(
       return reply.code(400).send(fieldError("quantity", AMOUNT_MESSAGES[quantity.reason]));
     }
 
-    const fields = { userId, side: body.side, quantity: quantity.units };
+    const fields = {
+      userId,
+      side: body.side,
+      quantity: quantity.units,
+      clientOrderId: body.clientOrderId,
+    };
     let placed;
     try {
       placed = await exchange.placeOrder(
@@ -121,6 +179,15 @@ export function registerTradingRoutes(
         price === null ? { ...fields, type: "market" } : { ...fields, type: "limit", price },
       );
     } catch (error) {
+      if (error instanceof DuplicateOrderError) {
+        return replyToRepeat(reply, userId, error.orderId, {
+          market,
+          side: body.side,
+          type: body.type,
+          price,
+          quantity: quantity.units,
+        });
+      }
       if (!(error instanceof OrderError)) {
         throw error;
       }
@@ -140,6 +207,7 @@ export function registerTradingRoutes(
       type: body.type,
       price: price === null ? null : quote(price),
       quantity: base(quantity.units),
+      clientOrderId: body.clientOrderId ?? null,
       status: placed.status,
       filledQuantity: base(placed.filledQuantity),
       fills: placed.fills.map((fill) => ({
@@ -148,6 +216,7 @@ export function registerTradingRoutes(
       })),
     });
   });
+
   app.delete("/orders/:id", { onRequest: authenticate }, async (request, reply) => {
     const userId = authenticatedUserId(request);
 

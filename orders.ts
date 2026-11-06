@@ -1,7 +1,7 @@
 // Accepting an order: checks it against its market's grid, reserves what it could spend and
 // records it, before the engine sees it. Matching and settlement live in exchange.ts.
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Side } from "./book.ts";
 import { type Database, LedgerError, reserve } from "./ledger.ts";
@@ -77,11 +77,26 @@ export class OrderError extends Error {
   }
 }
 
+// An order this user already placed with the same client order id. Not a rejection of the
+// order but of the repeat: the caller answers with the existing order.
+export class DuplicateOrderError extends Error {
+  readonly orderId: string;
+
+  constructor(orderId: string) {
+    super(`client order id already used by order ${orderId}`);
+    this.name = "DuplicateOrderError";
+    this.orderId = orderId;
+  }
+}
+
 type OrderFields = {
   userId: string;
   side: Side;
   // Minor units at the base scale.
   quantity: bigint;
+  // The client's own id for the order, unique per user: sending the same one again returns
+  // the order already placed instead of placing a second.
+  clientOrderId?: string | undefined;
 };
 
 // Price in minor units at the quote scale.
@@ -145,9 +160,27 @@ export function reservationFor(
     : { asset: market.baseAsset, amount: quantity };
 }
 
+export async function orderIdForClientOrderId(
+  db: Database,
+  userId: string,
+  clientOrderId: string,
+): Promise<string | undefined> {
+  const [row] = await db
+    .select({ id: orders.id })
+    .from(orders)
+    .where(and(eq(orders.userId, userId), eq(orders.clientOrderId, clientOrderId)))
+    .limit(1);
+  return row?.id;
+}
+
 // Phase one of placing an order: reserve and record in one transaction, so there is never
 // a reservation without its order or an order without its reservation. The order is left
 // pending for the engine.
+//
+// The row goes in before the reservation so the unique (user, client order id) index decides
+// races between repeats of one order. A second insert with the same key waits there until the
+// first commits, then conflicts and reserves nothing. Reserving first, it could fail for
+// insufficient funds because the first had just taken them.
 export async function recordOrder(
   db: Database,
   market: Market,
@@ -158,18 +191,6 @@ export async function recordOrder(
   const reservation = reservationFor(market, side, worstPrice(order), quantity);
 
   return db.transaction(async (tx) => {
-    try {
-      await reserve(tx, userId, reservation.asset, reservation.amount);
-    } catch (error) {
-      if (error instanceof LedgerError && error.code === "insufficient_funds") {
-        throw new OrderError(
-          "insufficient_funds",
-          `not enough ${reservation.asset} available for this order`,
-        );
-      }
-      throw error;
-    }
-
     const [row] = await tx
       .insert(orders)
       .values({
@@ -180,10 +201,31 @@ export async function recordOrder(
         // The protection price is not the order's price: a market order has none.
         price: order.type === "limit" ? formatAmount(order.price, market.quoteScale) : null,
         quantity: formatAmount(quantity, market.baseScale),
+        clientOrderId: order.clientOrderId ?? null,
       })
+      .onConflictDoNothing({ target: [orders.userId, orders.clientOrderId] })
       .returning({ id: orders.id });
     if (row === undefined) {
-      throw new Error("order insert returned no row");
+      const existing =
+        order.clientOrderId === undefined
+          ? undefined
+          : await orderIdForClientOrderId(tx, userId, order.clientOrderId);
+      if (existing === undefined) {
+        throw new Error("order insert returned no row and conflicted with nothing");
+      }
+      throw new DuplicateOrderError(existing);
+    }
+
+    try {
+      await reserve(tx, userId, reservation.asset, reservation.amount);
+    } catch (error) {
+      if (error instanceof LedgerError && error.code === "insufficient_funds") {
+        throw new OrderError(
+          "insufficient_funds",
+          `not enough ${reservation.asset} available for this order`,
+        );
+      }
+      throw error;
     }
     return { id: row.id };
   });
