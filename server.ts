@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
 import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
-import type { LogLevel } from "./config.ts";
+import { DEFAULT_WEB_ORIGIN, type LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
 import { feedChannels, publishUpdate } from "./feed.ts";
 import { registerMarketDataRoutes } from "./market.ts";
@@ -60,6 +61,8 @@ export type ServerOptions = {
   // Prefix for the market data channels in Redis. Tests give each server its own.
   marketDataPrefix?: string;
   webSocketLimits?: WebSocketLimits;
+  // The one browser origin allowed to call the API with credentials.
+  webOrigin?: string;
 };
 
 export const DEFAULT_MARKET_DATA_PREFIX = "slipstream:";
@@ -73,6 +76,7 @@ export function buildServer(
     orderRateLimit = DEFAULT_ORDER_RATE_LIMIT,
     marketDataPrefix = DEFAULT_MARKET_DATA_PREFIX,
     webSocketLimits = DEFAULT_WEBSOCKET_LIMITS,
+    webOrigin = DEFAULT_WEB_ORIGIN,
   }: ServerOptions = {},
 ) {
   const app = Fastify({
@@ -82,6 +86,15 @@ export function buildServer(
   });
 
   void app.register(cookie);
+  // The terminal is served from its own port, so every call it makes is cross-origin. Only
+  // its origin is allowed, and with credentials, so the refresh cookie travels on
+  // /session/refresh. A wildcard is not an option: browsers refuse credentials with "*". A
+  // list, not a bare string, so another origin gets no allow header at all instead of ours.
+  void app.register(cors, {
+    origin: [webOrigin],
+    credentials: true,
+    methods: ["GET", "POST", "DELETE"],
+  });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const statusCode = error.statusCode ?? 500;

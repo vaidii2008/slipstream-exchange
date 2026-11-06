@@ -14,6 +14,7 @@ describe("parseConfig", () => {
       PORT: 3000,
       ORDER_RATE_LIMIT: 20,
       LOG_LEVEL: "info",
+      WEB_ORIGIN: "http://localhost:3001",
     });
   });
 
@@ -23,6 +24,7 @@ describe("parseConfig", () => {
       PORT: 8080,
       ORDER_RATE_LIMIT: 20,
       LOG_LEVEL: "info",
+      WEB_ORIGIN: "http://localhost:3001",
     });
   });
 
@@ -32,6 +34,7 @@ describe("parseConfig", () => {
       PORT: 3000,
       ORDER_RATE_LIMIT: 20,
       LOG_LEVEL: "info",
+      WEB_ORIGIN: "http://localhost:3001",
     });
   });
 
@@ -74,6 +77,16 @@ describe("parseConfig", () => {
       expect(() => parseConfig({ ...base, REDIS_URL: url })).toThrow(/REDIS_URL/);
     },
   );
+
+  it("reduces WEB_ORIGIN to the origin a browser sends", () => {
+    expect(parseConfig({ ...base, WEB_ORIGIN: "https://trade.example.com/" })).toMatchObject({
+      WEB_ORIGIN: "https://trade.example.com",
+    });
+  });
+
+  it.each(["localhost:3001", "ftp://example.com", "*"])("rejects WEB_ORIGIN=%s", (origin) => {
+    expect(() => parseConfig({ ...base, WEB_ORIGIN: origin })).toThrow(/WEB_ORIGIN/);
+  });
 
   it("accepts a pino LOG_LEVEL", () => {
     expect(parseConfig({ ...base, LOG_LEVEL: "debug" })).toMatchObject({ LOG_LEVEL: "debug" });

@@ -63,3 +63,38 @@ describe("central error handling", () => {
     expect(response.json<unknown>()).toMatchObject({ error: "unsupported_media_type" });
   });
 });
+
+describe("cors", () => {
+  const preflight = (origin: string) =>
+    app.inject({
+      method: "OPTIONS",
+      url: "/session/refresh",
+      headers: { origin, "access-control-request-method": "POST" },
+    });
+
+  it("lets the web origin call the API with credentials", async () => {
+    const response = await preflight("http://localhost:3001");
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3001");
+    expect(response.headers["access-control-allow-credentials"]).toBe("true");
+    expect(response.headers["access-control-allow-methods"]).toContain("POST");
+  });
+
+  it("gives any other origin no permission to read responses", async () => {
+    const response = await preflight("https://evil.example.com");
+
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("marks a simple request from the web origin as readable by it", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/health",
+      headers: { origin: "http://localhost:3001" },
+    });
+
+    expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3001");
+    expect(response.headers.vary).toContain("Origin");
+  });
+});

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export const DEFAULT_WEB_ORIGIN = "http://localhost:3001";
+
 const envSchema = z
   .object({
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -16,6 +18,12 @@ const envSchema = z
     JWT_ACCESS_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
     // Orders one user may place per second before getting 429.
     ORDER_RATE_LIMIT: z.coerce.number().int().min(1).max(10_000).default(20),
+    // The trading terminal's origin, the only one CORS lets call the API with cookies. Reduced
+    // to scheme, host and port, since that is exactly what a browser sends in Origin.
+    WEB_ORIGIN: z
+      .url({ protocol: /^https?$/, hostname: /.+/, error: "must be an http(s):// origin" })
+      .transform((url) => new URL(url).origin)
+      .default(DEFAULT_WEB_ORIGIN),
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default("info"),
