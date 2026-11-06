@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
+import { formatAmount, fromNumeric, notional, parseAmount } from "./money.ts";
 
 describe("parseAmount", () => {
   it("scales a decimal string to integer minor units", () => {
@@ -93,5 +93,22 @@ describe("fromNumeric", () => {
     for (const units of [0n, 1n, -1n, 123_456_789n, -(10n ** 36n - 1n)]) {
       expect(fromNumeric(formatAmount(units, 18), 18)).toBe(units);
     }
+  });
+});
+
+describe("notional", () => {
+  it("prices a quantity in quote minor units", () => {
+    // 0.5 BTC at 60,000.25 USD is 30,000.125 USD, all at scale 8.
+    expect(notional(6_000_025_000_000n, 50_000_000n, 8)).toBe(3_000_012_500_000n);
+  });
+
+  it("prices one step at one tick exactly", () => {
+    // 0.0001 BTC at 0.01 USD is 0.000001 USD, which is 100 minor units at scale 8.
+    expect(notional(1_000_000n, 10_000n, 8)).toBe(100n);
+  });
+
+  it("refuses to round a value that is not a whole number of minor units", () => {
+    // 1 satoshi at 0.01 USD is 0.0000000001 USD, two digits past USD's scale.
+    expect(() => notional(1_000_000n, 1n, 8)).toThrow(RangeError);
   });
 });

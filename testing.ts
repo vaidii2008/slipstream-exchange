@@ -10,12 +10,23 @@ import { createAccessTokens } from "./tokens.ts";
 
 export const TEST_SECRET = "t".repeat(32);
 
-// The ledger never cascades, so test users' ledger rows go first. Whole transactions are
-// removed, system-account side included, which leaves every remaining transaction balanced.
-async function deleteLedgerHistory(pool: Pool, emails: string[]): Promise<void> {
+// Neither the ledger nor orders cascade, so test users' trading rows go first: trades, then
+// orders, then the ledger. Whole ledger transactions are removed, system-account side
+// included, which leaves every remaining transaction balanced.
+async function deleteTradingHistory(pool: Pool, emails: string[]): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("begin");
+    await client.query(
+      `delete from trades t
+       using orders o join users u on u.id = o.user_id
+       where u.email = any($1) and o.id in (t.maker_order_id, t.taker_order_id)`,
+      [emails],
+    );
+    await client.query(
+      "delete from orders where user_id in (select id from users where email = any($1))",
+      [emails],
+    );
     await client.query(
       `create temporary table doomed_transactions on commit drop as
          select distinct e.transaction_id as id
@@ -87,7 +98,7 @@ export function useTestServer() {
 
   afterAll(async () => {
     if (createdEmails.length > 0) {
-      await deleteLedgerHistory(pool, createdEmails);
+      await deleteTradingHistory(pool, createdEmails);
       await db.delete(users).where(inArray(users.email, createdEmails));
     }
     await app.close();

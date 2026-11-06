@@ -81,3 +81,17 @@ export function formatAmount(units: bigint, scale: number): string {
 
   return scale === 0 ? `${sign}${integer}` : `${sign}${integer}.${fraction}`;
 }
+
+// What a fill is worth in quote minor units. The price is quote minor units per whole base
+// unit and the quantity is in base minor units, so the product carries baseScale too many
+// decimals. Throws rather than rounds: every market's tick × step divides exactly, so a
+// remainder means a price or quantity got past validation off the grid.
+export function notional(price: bigint, quantity: bigint, baseScale: number): bigint {
+  assertScale(baseScale);
+
+  const divisor = 10n ** BigInt(baseScale);
+  if ((price * quantity) % divisor !== 0n) {
+    throw new RangeError(`${price} × ${quantity} is not a whole number of quote minor units`);
+  }
+  return (price * quantity) / divisor;
+}

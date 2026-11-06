@@ -106,7 +106,7 @@ Each entry: the decision, the alternative, why, and where it lives.
 - **Why:** deleting a user would silently delete half of every transaction they took part in,
   and the system account and counterparties would stop balancing. Tests delete whole
   transactions explicitly before deleting their users.
-- **Where:** `ledgerAccounts` and `ledgerEntries` in `schema.ts`; `deleteLedgerHistory` in
+- **Where:** `ledgerAccounts` and `ledgerEntries` in `schema.ts`; `deleteTradingHistory` in
   `testing.ts`.
 
 ## Matching engine
