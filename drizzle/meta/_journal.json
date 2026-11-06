@@ -36,6 +36,13 @@
       "when": 1793219578679,
       "tag": "0004_create_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793936701064,
+      "tag": "0005_raise_usd_scale_and_add_quantity_step",
+      "breakpoints": true
     }
   ]
 }

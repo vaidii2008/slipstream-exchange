@@ -60,12 +60,16 @@ export const markets = pgTable(
     quoteAsset: text("quote_asset")
       .notNull()
       .references(() => assets.code),
+    // A price must be a multiple of the tick, a quantity a multiple of the step. Together they
+    // make every fill's notional (price × quantity) a whole number of quote minor units.
     tickSize: money("tick_size").notNull(),
+    quantityStep: money("quantity_step").notNull(),
     minQuantity: money("min_quantity").notNull(),
   },
   (table) => [
     check("markets_distinct_assets", sql`${table.baseAsset} <> ${table.quoteAsset}`),
     check("markets_tick_size_positive", sql`${table.tickSize} > 0`),
+    check("markets_quantity_step_positive", sql`${table.quantityStep} > 0`),
     check("markets_min_quantity_positive", sql`${table.minQuantity} > 0`),
   ],
 );

@@ -66,7 +66,7 @@ describe("POST /deposits", () => {
     await postDeposit(authorization, { asset: "USD", amount: "100" });
     await postDeposit(authorization, { asset: "USD", amount: "0.01" });
 
-    await expect(ledgerBalance(userId, "USD", 2)).resolves.toBe(10_001n);
+    await expect(ledgerBalance(userId, "USD", 8)).resolves.toBe(10_001_000_000n);
   });
 
   it("requires an access token", async () => {
@@ -101,7 +101,7 @@ describe("POST /deposits", () => {
     ["0", "must be positive"],
     ["0.00", "must be positive"],
     ["-5", "must be positive"],
-    ["0.001", "has more decimals than the asset allows"],
+    ["0.000000001", "has more decimals than the asset allows"],
     ["1e3", "must be a plain decimal string such as 1.5"],
     ["1".repeat(19), "is too large"],
   ])("rejects a USD amount of %j: %s", async (amount, message) => {
@@ -114,7 +114,7 @@ describe("POST /deposits", () => {
       error: "invalid_request",
       issues: [{ field: "amount", message }],
     });
-    await expect(ledgerBalance(userId, "USD", 2)).resolves.toBe(0n);
+    await expect(ledgerBalance(userId, "USD", 8)).resolves.toBe(0n);
   });
 });
 
@@ -135,7 +135,7 @@ describe("GET /balances", () => {
       balances: [
         { asset: "BTC", available: "0.25000000", reserved: "0.00000000" },
         { asset: "ETH", available: "0.00000000", reserved: "0.00000000" },
-        { asset: "USD", available: "1000.00", reserved: "0.00" },
+        { asset: "USD", available: "1000.00000000", reserved: "0.00000000" },
       ],
     });
   });

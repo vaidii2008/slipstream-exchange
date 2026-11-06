@@ -169,7 +169,7 @@ describe("postTransaction", () => {
       ]),
     ).rejects.toThrow();
 
-    await expect(entriesOf(available, 2)).resolves.toEqual([]);
+    await expect(entriesOf(available, 8)).resolves.toEqual([]);
     const orphans = await db.execute<{ count: string }>(sql`
       select count(*) as count from ledger_transactions t
       where not exists (select 1 from ledger_entries e where e.transaction_id = t.id)`);
@@ -184,7 +184,7 @@ describe("balancesOf", () => {
     await expect(balancesOf(db, userId)).resolves.toEqual([
       { asset: "BTC", scale: 8, available: 0n, reserved: 0n },
       { asset: "ETH", scale: 8, available: 0n, reserved: 0n },
-      { asset: "USD", scale: 2, available: 0n, reserved: 0n },
+      { asset: "USD", scale: 8, available: 0n, reserved: 0n },
     ]);
   });
 
