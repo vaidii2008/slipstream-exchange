@@ -72,7 +72,9 @@ function run(sequence: Command[]): Run {
   return { events, orders, books, final: engine.snapshot() };
 }
 
-describe("engine invariants over random command sequences", () => {
+// 300 runs per property take a few seconds alone but can pass Vitest's 5 s default when
+// the whole suite shares the machine with Postgres and Redis.
+describe("engine invariants over random command sequences", { timeout: 30_000 }, () => {
   it("never leaves the book crossed, unsorted or with an empty level", () => {
     fc.assert(
       fc.property(commands, (sequence) => {
