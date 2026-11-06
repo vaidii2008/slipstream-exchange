@@ -1,14 +1,15 @@
 import { eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, describe, expect, it } from "vitest";
-import { Exchange, SerialQueue } from "./exchange.ts";
-import { balancesOf, deposit } from "./ledger.ts";
+import { randomUUID } from "node:crypto";
+import { Exchange, MarketBusyError, SerialQueue } from "./exchange.ts";
+import { balancesOf, deposit, openAccount } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import { orders, trades, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
-const { db, uniqueEmail } = useTestServer();
+const { pool, db, uniqueEmail } = useTestServer();
 
 // Every amount in these tests is written as the decimal a client would send.
 const units = (value: string, scale = 8): bigint => {
@@ -379,6 +380,66 @@ describe("Exchange.placeOrder", () => {
       available: units("6000"),
       reserved: 0n,
     });
+  });
+
+  // Holds a row lock on the user's USD available account from another connection, so an
+  // order of theirs is admitted and then waits inside its reservation until `release`.
+  async function blockReservations(userId: string) {
+    const client = await pool.connect();
+    await client.query("begin");
+    await client.query("select id from ledger_accounts where id = $1 for update", [
+      await openAccount(db, userId, "USD", "available"),
+    ]);
+    return async () => {
+      await client.query("commit");
+      client.release();
+    };
+  }
+
+  it("refuses commands past the cap before reserving, in that market only", async () => {
+    const exchange = new Exchange(db, { maxPendingCommands: 1 });
+    const first = await funded({ USD: "6000" });
+    const second = await funded({ USD: "6000" });
+    const release = await blockReservations(first);
+
+    let waiting;
+    try {
+      waiting = exchange.placeOrder(btcUsd, limit(first, "buy", "60000", "0.1"));
+
+      await expect(
+        exchange.placeOrder(btcUsd, limit(second, "buy", "60000", "0.1")),
+      ).rejects.toBeInstanceOf(MarketBusyError);
+      await expect(exchange.cancelOrder(btcUsd, randomUUID())).rejects.toBeInstanceOf(
+        MarketBusyError,
+      );
+      await expect(balanceOf(second, "USD")).resolves.toEqual({
+        available: units("6000"),
+        reserved: 0n,
+      });
+      await expect(
+        exchange.placeOrder(ethUsd, limit(second, "buy", "3000", "0.01")),
+      ).resolves.toMatchObject({ status: "open" });
+    } finally {
+      await release();
+    }
+
+    await expect(waiting).resolves.toMatchObject({ status: "open" });
+    // The slot is free again. 5,970 left after the ETH order's 30.
+    await expect(
+      exchange.placeOrder(btcUsd, limit(second, "buy", "59000", "0.1")),
+    ).resolves.toMatchObject({ status: "open" });
+  });
+
+  it("frees a slot when a command is refused for funds", async () => {
+    const exchange = new Exchange(db, { maxPendingCommands: 1 });
+    const user = await funded({ USD: "100" });
+
+    await expect(
+      exchange.placeOrder(btcUsd, limit(user, "buy", "60000", "0.1")),
+    ).rejects.toMatchObject({ code: "insufficient_funds" });
+    await expect(
+      exchange.placeOrder(btcUsd, limit(user, "buy", "1000", "0.1")),
+    ).resolves.toMatchObject({ status: "open" });
   });
 
   // Each round, one taker sweeps both buyers' bids in BTC-USD while another sweeps them in

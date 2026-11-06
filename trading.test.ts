@@ -746,3 +746,65 @@ describe("a market whose settlement fails", () => {
     expect(halts).toEqual(["BTC-USD"]);
   });
 });
+
+describe("a market with too many commands waiting", () => {
+  const app = buildServer({
+    pool,
+    redis,
+    db,
+    tokens,
+    exchange: new Exchange(db, { maxPendingCommands: 1 }),
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("answers 503 market_busy with a short Retry-After", async () => {
+    const first = await signedInUser(app);
+    const second = await signedInUser(app);
+    await fund(first, "USD", "100", app);
+    await fund(second, "USD", "100", app);
+    const me = await app.inject({ method: "GET", url: "/me", headers: { authorization: first } });
+    const firstId = me.json<{ id: string }>().id;
+
+    // The first order takes the market's only slot and waits on this lock inside its
+    // reservation, so the second arrives while the slot is taken.
+    const lock = await pool.connect();
+    let waiting;
+    let busy;
+    try {
+      await lock.query("begin");
+      await lock.query(
+        `select id from ledger_accounts
+         where user_id = $1 and asset = 'USD' and bucket = 'available' for update`,
+        [firstId],
+      );
+      const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");
+      const cheapBuy = { ...aBuy, price: "100", quantity: "0.01" };
+      waiting = postOrder(first, cheapBuy, app);
+      // Admission happens before the reservation's first query, so once the first order is
+      // waiting on this transaction's lock it holds the slot. Other test files run at the
+      // same time, so only waiters on this transaction count.
+      await expect
+        .poll(async () => {
+          const blocked = await pool.query<{ n: number }>(
+            `select count(*)::int as n from pg_locks
+             where locktype = 'transactionid' and not granted and transactionid::text = $1`,
+            [holder.rows[0]?.xid],
+          );
+          return blocked.rows[0]?.n;
+        })
+        .toBeGreaterThan(0);
+      busy = await postOrder(second, cheapBuy, app);
+    } finally {
+      await lock.query("commit");
+      lock.release();
+    }
+
+    expect(busy.statusCode).toBe(503);
+    expect(busy.headers["retry-after"]).toBe("1");
+    expect(busy.json<unknown>()).toMatchObject({ error: "market_busy" });
+    await expect(waiting).resolves.toMatchObject({ statusCode: 201 });
+  });
+});

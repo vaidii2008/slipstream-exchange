@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Side } from "./book.ts";
-import { type Exchange, MarketHaltedError } from "./exchange.ts";
+import { type Exchange, MarketBusyError, MarketHaltedError } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
 import { findOrder, listFills, listOrders, type OrderRow, takerFills } from "./history.ts";
@@ -89,11 +89,22 @@ function orderJson(row: OrderRow, market: Market) {
   };
 }
 
-function haltedJson(error: MarketHaltedError) {
-  return {
+// The two ways a market refuses a command it never started, both 503. Halted lasts until a
+// restart; busy clears as the queue drains, so it says to retry shortly.
+function unavailable(reply: FastifyReply, error: MarketHaltedError | MarketBusyError) {
+  if (error instanceof MarketBusyError) {
+    return reply
+      .code(503)
+      .header("retry-after", 1)
+      .send({
+        error: "market_busy",
+        message: `${error.market} has too many orders waiting, retry shortly`,
+      });
+  }
+  return reply.code(503).send({
     error: "market_halted",
     message: `${error.market} is halted and accepts no orders or cancels until it restarts`,
-  };
+  });
 }
 
 function marketOf(markets: Map<string, Market>, symbol: string): Market {
@@ -223,8 +234,8 @@ export function registerTradingRoutes(
           quantity: quantity.units,
         });
       }
-      if (error instanceof MarketHaltedError) {
-        return reply.code(503).send(haltedJson(error));
+      if (error instanceof MarketHaltedError || error instanceof MarketBusyError) {
+        return unavailable(reply, error);
       }
       if (!(error instanceof OrderError)) {
         throw error;
@@ -273,8 +284,8 @@ export function registerTradingRoutes(
     try {
       outcome = await exchange.cancelOrder(market, order.id);
     } catch (error) {
-      if (error instanceof MarketHaltedError) {
-        return reply.code(503).send(haltedJson(error));
+      if (error instanceof MarketHaltedError || error instanceof MarketBusyError) {
+        return unavailable(reply, error);
       }
       throw error;
     }

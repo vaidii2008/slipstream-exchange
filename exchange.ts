@@ -256,9 +256,35 @@ export class MarketHaltedError extends Error {
   }
 }
 
+// Backpressure: a market with this many commands admitted and not yet settled refuses more
+// instead of queueing them. An unbounded queue turns a burst into memory growth and into
+// latency for every order behind it; refusing early tells the client to back off now.
+export class MarketBusyError extends Error {
+  readonly market: string;
+
+  constructor(market: string) {
+    super(`market ${market} has too many commands waiting`);
+    this.name = "MarketBusyError";
+    this.market = market;
+  }
+}
+
 export type HaltListener = (market: string, error: unknown) => void;
 
-type RunningMarket = { engine: Engine; queue: SerialQueue; halted: boolean };
+export type ExchangeOptions = {
+  // Per market: commands admitted and not yet settled, counting from before an order's
+  // reservation, so a refused order has reserved nothing.
+  maxPendingCommands?: number;
+};
+
+export const DEFAULT_MAX_PENDING_COMMANDS = 10_000;
+
+type RunningMarket = {
+  engine: Engine;
+  queue: SerialQueue;
+  halted: boolean;
+  pending: number;
+};
 
 // One engine and one queue per market, created the first time the market is traded. The
 // books live in this process's memory: an order still open when the process stops stays
@@ -268,9 +294,14 @@ export class Exchange {
   readonly #db: Database;
   readonly #markets = new Map<string, RunningMarket>();
   readonly #haltListeners: HaltListener[] = [];
+  readonly #maxPending: number;
 
-  constructor(db: Database) {
+  constructor(
+    db: Database,
+    { maxPendingCommands = DEFAULT_MAX_PENDING_COMMANDS }: ExchangeOptions = {},
+  ) {
     this.#db = db;
+    this.#maxPending = maxPendingCommands;
   }
 
   // Called once per halt with the settlement's error. The server logs it at fatal.
@@ -283,8 +314,8 @@ export class Exchange {
   }
 
   // Throws DuplicateOrderError, without touching the book or the ledger, when the request
-  // repeats a client order id the user has already placed, and MarketHaltedError when the
-  // market is halted.
+  // repeats a client order id the user has already placed, MarketHaltedError when the market
+  // is halted and MarketBusyError when it has too many commands waiting.
   async placeOrder(market: Market, request: OrderRequest): Promise<PlacedOrder> {
     const running = this.#market(market.symbol);
     // Checked first so a retry gets its original order back even if the book or the balance
@@ -303,6 +334,10 @@ export class Exchange {
     if (running.halted) {
       throw new MarketHaltedError(market.symbol);
     }
+    return this.#admitted(running, market.symbol, () => this.#place(running, market, request));
+  }
+
+  async #place(running: RunningMarket, market: Market, request: OrderRequest) {
     // Read from the book as it is now, outside the queue. Commands queued ahead may move the
     // book before this order runs; the protection price still bounds what it can spend.
     const accepted =
@@ -337,13 +372,30 @@ export class Exchange {
       throw new MarketHaltedError(market.symbol);
     }
 
-    const events = await this.#execute(running, market, (engine) => engine.cancel(orderId), null);
-    return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
+    return this.#admitted(running, market.symbol, async () => {
+      const events = await this.#execute(running, market, (engine) => engine.cancel(orderId), null);
+      return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
+    });
   }
 
   // The public view of a market's book. A market nobody has traded yet has an empty one.
   depth(symbol: string, limit: number) {
     return this.#market(symbol).engine.depth(limit);
+  }
+
+  // Counts a command from admission until it has settled, failed or been refused. The check
+  // and the increment happen before the first await, so two callers cannot both take the
+  // last slot.
+  async #admitted<T>(running: RunningMarket, symbol: string, work: () => Promise<T>): Promise<T> {
+    if (running.pending >= this.#maxPending) {
+      throw new MarketBusyError(symbol);
+    }
+    running.pending++;
+    try {
+      return await work();
+    } finally {
+      running.pending--;
+    }
   }
 
   // Runs one engine command and its settlement as one task in the market's queue, halting the
@@ -378,7 +430,7 @@ export class Exchange {
   #market(symbol: string): RunningMarket {
     let market = this.#markets.get(symbol);
     if (market === undefined) {
-      market = { engine: new Engine(symbol), queue: new SerialQueue(), halted: false };
+      market = { engine: new Engine(symbol), queue: new SerialQueue(), halted: false, pending: 0 };
       this.#markets.set(symbol, market);
     }
     return market;
