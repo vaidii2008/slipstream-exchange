@@ -846,3 +846,103 @@ needs both `orders.ts` and `exchange.ts`, and `exchange.ts` already imports
 - `feat(api): rate limit order placement per user with Redis`
 - `test(orders): show a failed settlement leaves the ledger balanced`
 - Interview note in `DECISIONS.md`
+
+## Day 9 — Order lifecycle complete
+
+**Commits landed (11)**
+
+- `feat(orders): place market orders with a capped reservation`
+- `feat(orders): cancel an order and release its remaining reservation`
+- `refactor(orders): move reading orders back into history.ts`
+- `feat(orders): list open orders, order history and my trades`
+- `feat(api): serve public order book snapshots and recent trades`
+- `feat(orders): accept idempotency keys on order placement`
+- `feat(api): rate limit order placement per user with Redis`
+- `feat(orders): halt a market when its settlement fails`
+- `feat(orders): cap each market's queue at 10,000 pending commands`
+- `docs: record the order lifecycle decisions and the session 5 interview note`
+- `docs: record day 9 in PROGRESS.md`
+
+**What now works**
+
+- Market orders. On arrival each one gets a protection price: the best opposite price moved
+  5% against the taker, on the tick grid. A buy reserves quantity × that price. The engine
+  stops matching at it and cancels the rest, and settlement returns whatever was not spent.
+  A market order against an empty side is refused with 422 `no_liquidity`.
+- `DELETE /orders/:id` cancels through the market's queue and releases the unfilled
+  quantity's reservation. 409 `order_not_open` if it already filled or was cancelled. 404 for
+  another user's order, the same as for one that does not exist.
+- `GET /orders?status=open|closed|all&market=&limit=` (newest first, at most 500) and
+  `GET /fills` (the caller's side of each trade, maker or taker).
+- Public, no token: `GET /markets/:symbol/book?depth=` (price levels with total quantity,
+  plus the engine sequence) and `GET /markets/:symbol/trades?limit=` (newest first, with the
+  taker's side). Neither contains a user id or an order id; tests check the response bodies.
+- `clientOrderId` on `POST /orders`. A repeat returns the original order with 200 and
+  reserves nothing. The same key on a different order is 409. Five identical requests at once:
+  one 201, four 200s, one reservation.
+- Rate limit: `ORDER_RATE_LIMIT` orders per user per second (default 20), 429 `rate_limited`
+  with `Retry-After`. Fixed window on Redis. If Redis is unreachable, the order goes ahead and
+  the error is logged.
+- Fail-stop. A failed settlement halts its market and logs at fatal. From then on, every
+  order and cancel for that market gets 503 `market_halted` until restart; other markets keep
+  trading.
+- Each market admits at most 10,000 unfinished commands; past that, 503 `market_busy` with
+  `Retry-After: 1`. A refused order has reserved nothing.
+- 276 tests in 18 files, up from 214 in 16. Tests now use a real Redis client.
+
+**What is stubbed**
+
+- After a halt, the order whose settlement failed stays `pending` and reserved, and so does
+  any order queued behind it. Only a restart clears the halt, and after a restart the books are
+  empty (Session 10).
+- After a restart, an order that is `open` in Postgres is not on the book, so cancelling it
+  returns 409 and its reservation stays (Session 10).
+- A repeat of an order that is still queued returns it as `pending`.
+- Order and fill lists take a `limit` but have no cursor for the next page.
+- Only placement is rate limited, not cancels.
+- While node-redis is reconnecting it queues commands, so a Redis outage can delay orders by
+  up to the reconnect backoff (at most 2 s) before the limiter fails open.
+- Carried over: no test database separate from the dev one, `npm audit` dev-only findings
+  from drizzle-kit, the manual `vaidhyam@example.com` row, and the CI workflow has still not
+  run on GitHub.
+
+**Decisions and deviations from the plan**
+
+- "Show a failed settlement leaves the ledger balanced" became fail-stop. The test forces a
+  real failure with no test hook: it releases a seller's reserved BTC behind the exchange's
+  back, so the next fill's ledger posting fails for insufficient funds.
+- Added: the per-market cap of 10,000 pending commands, counted from admission rather than
+  from enqueue, so nothing is reserved for a command that will be refused.
+- The public book is summed inside `OrderBook.depth`, so per-order data never reaches the
+  route. That is stronger than stripping `userId` from a snapshot.
+- `recordOrder` now inserts the order before reserving, so the unique (user, client order id)
+  index serialises repeats. Six parallel identical sells against a balance that funds one gave
+  one order and one reservation.
+- `POST /orders` bodies are strict: an unknown field, or a price on a market order, is 400.
+- Scope: no Grafana dashboard. `/metrics` and the k6 numbers stay.
+
+**Repo shape**
+
+Still flat. New:
+
+- `history.ts`: reading a user's orders and fills back. It was split from `orders.ts` at 232
+  lines, which had two reasons to change.
+- `market.ts`: public market data. It has a different audience from `trading.ts`, which is
+  past 200 lines, and Session 6 builds on it.
+- `ratelimit.ts`: the window logic needs its own test against Redis with a controlled clock.
+
+`trading.ts` is now 351 lines, all order routes for a signed-in user. If Session 6 adds
+to it, it should split by route.
+
+**Next: Day 10 — Real-time market data**
+
+- `feat(ws): accept connections with a zod-validated subscribe protocol`
+- `feat(ws): stream an order book snapshot then sequenced deltas`
+- `feat(ws): stream public trades`
+- `feat(ws): stream private order and balance events on an authenticated channel`
+- `feat(ws): fan out market events through Redis pub/sub`
+- `feat(ws): send heartbeats and drop clients whose send buffer exceeds a cap`
+- `test(ws): show a client that misses a sequence detects the gap and resyncs`
+- Public channels follow the same rule as the public routes: price levels only, no user ids
+  or order ids.
+- Interview note in `DECISIONS.md`
