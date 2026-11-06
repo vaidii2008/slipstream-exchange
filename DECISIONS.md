@@ -465,3 +465,27 @@ reports.
 - **Why:** after a timeout the trader cannot know whether the order landed. Resubmitting the
   same id makes the API return the first order instead of placing a second.
 - **Where:** `edit` and the mutation in `web/components/order-form.tsx`.
+
+### The account channel waits for the server's "authenticated" reply
+
+- **Decision:** the socket sends the account subscription only after the server answers
+  the auth with "authenticated", once per connection. Public channels go out at once.
+- **Alternative:** send auth and subscribe back to back, relying on the server handling one
+  connection's messages in order.
+- **Why:** that order holds on a fresh connection, but logging in while connected sends the
+  auth after an async token read, and the balances panel can subscribe first. The server
+  refuses it and nothing retries. The reply cannot arrive before the auth was accepted.
+- **Where:** `#sendIfReady` and the `authenticated` branch of `#receive` in `web/lib/socket.ts`.
+
+### Order state from REST and the socket is merged by taking whichever is further along
+
+- **Decision:** open orders come from `GET /orders` and are patched by order events. Of two
+  reports about one order, the terminal keeps the later status (pending, open, then filled
+  or cancelled) and the larger filled quantity.
+- **Alternative:** let the last report to arrive win, or tag REST rows with the engine
+  sequence and compare that.
+- **Why:** a list read just before a fill can land after the fill's event; last-arrival
+  would move the order backwards. An order only moves forward, so the merge gives the same
+  answer in any arrival order and needs no API change. A unit test reduces the same reports
+  forwards and backwards and gets one answer.
+- **Where:** `furthest` in `web/lib/account.ts`; `useOpenOrders` in `web/lib/history.ts`.
