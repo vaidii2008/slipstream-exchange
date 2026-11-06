@@ -62,11 +62,13 @@ try {
     connectionTimeoutMillis: 5000,
   });
   const redis = createRedisClient(config.REDIS_URL);
+  // Same options; a connection in subscribe mode can run nothing else.
+  const subscriber = redis.duplicate();
   const db = drizzle({ client: pool });
 
   // Built before the connections are verified so every startup line goes through pino.
   app = buildServer(
-    { pool, redis, db, tokens, exchange: new Exchange(db) },
+    { pool, redis, subscriber, db, tokens, exchange: new Exchange(db) },
     {
       logLevel: config.LOG_LEVEL,
       orderRateLimit: { limit: config.ORDER_RATE_LIMIT, windowMs: 1000 },
@@ -80,11 +82,18 @@ try {
   redis.on("error", (error: unknown) => {
     log.error({ err: error }, "redis client error");
   });
+  subscriber.on("error", (error: unknown) => {
+    log.error({ err: error }, "redis subscriber error");
+  });
 
   // app.close() stops accepting connections and waits for in-flight requests before
   // running onClose, so no request loses its database halfway through.
   app.addHook("onClose", async () => {
-    await Promise.all([redis.isOpen ? redis.close() : undefined, pool.end()]);
+    await Promise.all([
+      redis.isOpen ? redis.close() : undefined,
+      subscriber.isOpen ? subscriber.close() : undefined,
+      pool.end(),
+    ]);
   });
   shutDownOn("SIGTERM", app);
   shutDownOn("SIGINT", app);
@@ -93,7 +102,8 @@ try {
   log.info("postgres connection verified");
 
   await verifyRedis(redis);
-  log.info("redis connection verified");
+  await verifyRedis(subscriber);
+  log.info("redis connections verified");
 
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
 } catch (error) {

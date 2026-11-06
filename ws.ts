@@ -17,16 +17,20 @@ import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
 import { type Exchange, SerialQueue } from "./exchange.ts";
-import { bookUpdate, orderMessage, type ServerMessage, tradeMessages } from "./feed.ts";
+import type { FeedChannels, MarketFeedMessage, ServerMessage } from "./feed.ts";
 import { accountState, type Database } from "./ledger.ts";
 import { formatAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
+import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
 
 export type WebSocketDependencies = {
   db: Database;
   exchange: Exchange;
   tokens: AccessTokens;
+  // A connection used only for SUBSCRIBE: Redis allows nothing else on it.
+  subscriber: RedisClient;
+  channels: FeedChannels;
 };
 
 // A client message larger than this closes the connection: commands are tiny.
@@ -183,7 +187,7 @@ async function balancesMessage(db: Database, userId: string): Promise<ServerMess
 
 export function registerWebSocketRoutes(
   app: FastifyInstance,
-  { db, exchange, tokens }: WebSocketDependencies,
+  { db, exchange, tokens, subscriber, channels }: WebSocketDependencies,
 ) {
   const hub = new MarketDataHub();
 
@@ -200,30 +204,60 @@ export function registerWebSocketRoutes(
     );
   }
 
-  const stopListening = exchange.onUpdate((update) => {
-    const { market } = update;
-    hub.publish(topicOf("book", market.symbol), bookUpdate(update));
-    for (const trade of tradeMessages(update)) {
-      hub.publish(topicOf("trades", market.symbol), trade);
+  // Messages on the feed come only from publishUpdate in this codebase, so they are parsed,
+  // not validated.
+  function onMarketMessage(text: string): void {
+    const { book, trades } = JSON.parse(text) as MarketFeedMessage;
+    if (book.type === "book_update") {
+      hub.publish(topicOf("book", book.market), book);
     }
-
-    const owners = new Set<string>();
-    for (const order of update.orders) {
-      const topic = topicOf("account", order.userId);
-      if (!hub.has(topic)) {
-        continue;
+    for (const trade of trades) {
+      if (trade.type === "trade") {
+        hub.publish(topicOf("trades", trade.market), trade);
       }
-      hub.publish(topic, orderMessage(market, order));
-      owners.add(order.userId);
     }
-    for (const userId of owners) {
+  }
+
+  app.addHook("onReady", async () => {
+    await subscriber.pSubscribe(channels.marketPattern, onMarketMessage);
+  });
+  app.addHook("onClose", async () => {
+    if (subscriber.isReady) {
+      await subscriber.pUnsubscribe(channels.marketPattern, onMarketMessage);
+    }
+  });
+
+  // A user's channel is subscribed while at least one of their connections here is on the
+  // account channel. One listener per user, so the last one out can remove exactly it.
+  const userListeners = new Map<string, (text: string) => void>();
+
+  async function watchUser(userId: string): Promise<void> {
+    if (userListeners.has(userId)) {
+      return;
+    }
+    const listener = (text: string) => {
+      hub.publish(topicOf("account", userId), JSON.parse(text) as ServerMessage);
       sendBalances(userId);
+    };
+    userListeners.set(userId, listener);
+    try {
+      await subscriber.subscribe(channels.user(userId), listener);
+    } catch (error) {
+      userListeners.delete(userId);
+      throw error;
     }
-  });
-  app.addHook("onClose", (_instance, done) => {
-    stopListening();
-    done();
-  });
+  }
+
+  function unwatchUserIfIdle(userId: string): void {
+    const listener = userListeners.get(userId);
+    if (listener === undefined || hub.has(topicOf("account", userId))) {
+      return;
+    }
+    userListeners.delete(userId);
+    subscriber.unsubscribe(channels.user(userId), listener).catch((error: unknown) => {
+      app.log.warn({ err: error, userId }, "unsubscribing a user channel failed");
+    });
+  }
 
   async function authenticate(connection: Connection, token: string): Promise<void> {
     const verification = await tokens.verify(token);
@@ -275,11 +309,13 @@ export function registerWebSocketRoutes(
       }
       const topic = topicOf("account", connection.userId);
       if (op === "subscribe") {
+        await watchUser(connection.userId);
         hub.subscribe(connection, topic);
         connection.send({ type: "subscribed", channel });
         connection.send(await balancesMessage(db, connection.userId));
       } else {
         hub.unsubscribe(connection, topic);
+        unwatchUserIfIdle(connection.userId);
         connection.send({ type: "unsubscribed", channel });
       }
       return;
@@ -323,6 +359,9 @@ export function registerWebSocketRoutes(
     socket.on("close", () => {
       clearTimeout(connection.expiry);
       hub.disconnect(connection);
+      if (connection.userId !== undefined) {
+        unwatchUserIfIdle(connection.userId);
+      }
     });
   }
 

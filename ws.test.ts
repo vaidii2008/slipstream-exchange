@@ -6,11 +6,11 @@ import { parseAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
-import { TEST_SECRET, useTestServer } from "./testing.ts";
+import { TEST_SECRET, uniqueMarketDataPrefix, useTestServer } from "./testing.ts";
 import { createAccessTokens } from "./tokens.ts";
 import { decode, TOKEN_EXPIRED_CLOSE_CODE } from "./ws.ts";
 
-const { app, pool, redis, db, tokens, uniqueEmail } = useTestServer();
+const { app, pool, redis, subscriber, db, tokens, uniqueEmail } = useTestServer();
 
 const units = (value: string): bigint => {
   const parsed = parseAmount(value, 8);
@@ -35,9 +35,12 @@ async function funded(holdings: Record<string, string>): Promise<string> {
 }
 
 // A server around a fresh exchange, so its sequences start at 1 and its book is empty.
-function freshServer() {
+function freshServer(marketDataPrefix = uniqueMarketDataPrefix()) {
   const exchange = new Exchange(db);
-  const server = buildServer({ pool, redis, db, tokens, exchange });
+  const server = buildServer(
+    { pool, redis, subscriber, db, tokens, exchange },
+    { marketDataPrefix },
+  );
   afterAll(async () => {
     await server.close();
   });
@@ -407,5 +410,45 @@ describe("the account channel", () => {
     await expect(client.next()).resolves.toMatchObject({ type: "authenticated" });
 
     await expect(closed).resolves.toBe(TOKEN_EXPIRED_CLOSE_CODE);
+  });
+});
+
+describe("fan-out through Redis", () => {
+  // Two servers on one prefix stand in for two API processes: the first runs the market, the
+  // second only holds sockets.
+  const prefix = uniqueMarketDataPrefix();
+  const { exchange } = freshServer(prefix);
+  const { server: gateway } = freshServer(prefix);
+
+  it("delivers trades and private events to a client connected to another process", async () => {
+    const market = await btcUsd();
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "10000" });
+    const client = await connect(gateway);
+    client.send({ op: "auth", token: await tokens.issue(seller) });
+    await client.next();
+    client.send({ op: "subscribe", channel: "account" });
+    await client.next();
+    await client.next();
+    client.send({ op: "subscribe", channel: "trades", market: "BTC-USD" });
+    await client.next();
+
+    const ask = await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.1"));
+    await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1"));
+
+    // Open, balances, trade, filled, balances.
+    const received = [];
+    for (let message = 0; message < 5; message++) {
+      received.push(await client.next());
+    }
+    // Per channel, messages arrive in publish order; the balances reads race the rest.
+    expect(received.filter((m) => (m as { type: string }).type === "order")).toEqual([
+      expect.objectContaining({ id: ask.id, status: "open" }),
+      expect.objectContaining({ id: ask.id, status: "filled" }),
+    ]);
+    expect(received.filter((m) => (m as { type: string }).type === "trade")).toEqual([
+      expect.objectContaining({ sequence: 2, price: "60000.00000000", quantity: "0.10000000" }),
+    ]);
+    client.close();
   });
 });

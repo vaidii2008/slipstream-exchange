@@ -7,7 +7,7 @@ import { buildServer } from "./server.ts";
 import { createRedisClient } from "./redis.ts";
 import { redisProxy, useTestServer } from "./testing.ts";
 
-const { pool, redis, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
+const { pool, redis, subscriber, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
 
 // Each helper takes the server to talk to. Most tests share the file's server; a scenario that
 // needs an empty book builds its own around a fresh Exchange.
@@ -326,6 +326,7 @@ describe("GET /orders and GET /fills", () => {
   const app = buildServer({
     pool,
     redis,
+    subscriber,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -432,6 +433,7 @@ describe("POST /orders with a market order", () => {
   const app = buildServer({
     pool,
     redis,
+    subscriber,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -482,6 +484,7 @@ describe("two users trading through the API", () => {
   const app = buildServer({
     pool,
     redis,
+    subscriber,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -579,13 +582,13 @@ describe("two users trading through the API", () => {
 describe("POST /orders rate limit", () => {
   // A minute-long window, so the test cannot straddle a window boundary in practice.
   const limited = buildServer(
-    { pool, redis, db, tokens, exchange: new Exchange(db) },
+    { pool, redis, subscriber, db, tokens, exchange: new Exchange(db) },
     { orderRateLimit: { limit: 2, windowMs: 60_000 } },
   );
   // Never connected: every command fails, as if Redis were down.
   const unreachable = createClient({ url: "redis://127.0.0.1:1" });
   const withoutRedis = buildServer(
-    { pool, redis: unreachable, db, tokens, exchange: new Exchange(db) },
+    { pool, redis: unreachable, subscriber, db, tokens, exchange: new Exchange(db) },
     { orderRateLimit: { limit: 1, windowMs: 60_000 } },
   );
 
@@ -644,7 +647,7 @@ describe("POST /orders rate limit", () => {
     slowRedis.on("error", () => undefined);
     await slowRedis.connect();
     const slow = buildServer(
-      { pool, redis: slowRedis, db, tokens, exchange: new Exchange(db) },
+      { pool, redis: slowRedis, subscriber, db, tokens, exchange: new Exchange(db) },
       { orderRateLimit: { limit: 1, windowMs: 60_000 } },
     );
     try {
@@ -671,7 +674,7 @@ describe("a market whose settlement fails", () => {
     halts.push(market);
     causes.push(error);
   });
-  const app = buildServer({ pool, redis, db, tokens, exchange });
+  const app = buildServer({ pool, redis, subscriber, db, tokens, exchange });
 
   afterAll(async () => {
     await app.close();
@@ -776,6 +779,7 @@ describe("a market with too many commands waiting", () => {
   const app = buildServer({
     pool,
     redis,
+    subscriber,
     db,
     tokens,
     exchange: new Exchange(db, { maxPendingCommands: 1 }),

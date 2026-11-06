@@ -6,6 +6,7 @@ import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
 import type { LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
+import { feedChannels, publishUpdate } from "./feed.ts";
 import { registerMarketDataRoutes } from "./market.ts";
 import type { RateLimit } from "./ratelimit.ts";
 import type { RedisClient } from "./redis.ts";
@@ -23,6 +24,8 @@ type PostgresProbe = {
 export type ServerDependencies = AuthDependencies & {
   pool: PostgresProbe;
   redis: RedisClient;
+  // A second connection, used only to subscribe to the market data feed.
+  subscriber: RedisClient;
   exchange: Exchange;
 };
 
@@ -54,13 +57,21 @@ export type ServerOptions = {
   logLevel?: LogLevel;
   // Per user, on POST /orders.
   orderRateLimit?: RateLimit;
+  // Prefix for the market data channels in Redis. Tests give each server its own.
+  marketDataPrefix?: string;
 };
+
+export const DEFAULT_MARKET_DATA_PREFIX = "slipstream:";
 
 export const DEFAULT_ORDER_RATE_LIMIT: RateLimit = { limit: 20, windowMs: 1000 };
 
 export function buildServer(
-  { pool, redis, db, tokens, exchange }: ServerDependencies,
-  { logLevel, orderRateLimit = DEFAULT_ORDER_RATE_LIMIT }: ServerOptions = {},
+  { pool, redis, subscriber, db, tokens, exchange }: ServerDependencies,
+  {
+    logLevel,
+    orderRateLimit = DEFAULT_ORDER_RATE_LIMIT,
+    marketDataPrefix = DEFAULT_MARKET_DATA_PREFIX,
+  }: ServerOptions = {},
 ) {
   const app = Fastify({
     logger: logLevel === undefined ? false : { level: logLevel },
@@ -114,7 +125,15 @@ export function buildServer(
   registerWalletRoutes(app, { db, tokens });
   registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
   registerMarketDataRoutes(app, { db, exchange });
-  registerWebSocketRoutes(app, { db, exchange, tokens });
+  const channels = feedChannels(marketDataPrefix);
+  const stopPublishing = exchange.onUpdate((update) => {
+    publishUpdate(redis, channels, update, app.log);
+  });
+  app.addHook("onClose", (_instance, done) => {
+    stopPublishing();
+    done();
+  });
+  registerWebSocketRoutes(app, { db, exchange, tokens, subscriber, channels });
 
   return app;
 }

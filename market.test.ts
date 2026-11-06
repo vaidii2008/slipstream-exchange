@@ -3,12 +3,13 @@ import { Exchange } from "./exchange.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, redis, db, tokens, uniqueEmail } = useTestServer();
+const { pool, redis, subscriber, db, tokens, uniqueEmail } = useTestServer();
 
 // Its own exchange, so the book holds only what these tests rest.
 const app = buildServer({
   pool,
   redis,
+  subscriber,
   db,
   tokens,
   exchange: new Exchange(db),

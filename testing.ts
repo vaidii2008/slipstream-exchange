@@ -59,6 +59,12 @@ async function deleteTradingHistory(pool: Pool, emails: string[]): Promise<void>
   }
 }
 
+// Test files share one Redis. A server that streams market data gets its own channel prefix,
+// so it never hears another file's trades.
+export function uniqueMarketDataPrefix(): string {
+  return `test:${randomUUID()}:`;
+}
+
 // Each test file calls this once at the top level. Vitest gives every file its own module
 // graph, so each file gets its own pool and app, and the hooks attach to that file.
 export function useTestServer() {
@@ -80,8 +86,12 @@ export function useTestServer() {
   const tokens = createAccessTokens(TEST_SECRET);
   // Connected in beforeAll; nothing sends it a command before the tests run.
   const redis = createClient({ url: redisUrl });
+  const subscriber = redis.duplicate();
   const exchange = new Exchange(db);
-  const app = buildServer({ pool, redis, db, tokens, exchange });
+  const app = buildServer(
+    { pool, redis, subscriber, db, tokens, exchange },
+    { marketDataPrefix: uniqueMarketDataPrefix() },
+  );
 
   const createdEmails: string[] = [];
 
@@ -94,7 +104,7 @@ export function useTestServer() {
   beforeAll(async () => {
     try {
       await pool.query("select 1");
-      await redis.connect();
+      await Promise.all([redis.connect(), subscriber.connect()]);
     } catch (error) {
       throw new Error("cannot reach postgres or redis: run `docker compose up -d --wait` first", {
         cause: error,
@@ -108,10 +118,14 @@ export function useTestServer() {
       await db.delete(users).where(inArray(users.email, createdEmails));
     }
     await app.close();
-    await Promise.all([pool.end(), redis.isOpen ? redis.close() : undefined]);
+    await Promise.all([
+      pool.end(),
+      redis.isOpen ? redis.close() : undefined,
+      subscriber.isOpen ? subscriber.close() : undefined,
+    ]);
   });
 
-  return { pool, redis, db, tokens, exchange, app, uniqueEmail };
+  return { pool, redis, subscriber, db, tokens, exchange, app, uniqueEmail };
 }
 
 // A TCP proxy in front of the compose Redis. A test connects its own client through it and
