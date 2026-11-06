@@ -2,12 +2,49 @@
 
 import { useState } from "react";
 import { Balances } from "@/components/balances";
+import { Fills, OrderHistory } from "@/components/history";
 import { OpenOrders } from "@/components/open-orders";
 import { OrderBook } from "@/components/order-book";
 import { OrderForm } from "@/components/order-form";
 import { TradesFeed } from "@/components/trades-feed";
-import { useMarkets } from "@/lib/markets";
+import { type MarketInfo, useMarkets } from "@/lib/markets";
 import { useSession } from "@/lib/session";
+
+const ACCOUNT_TABS = [
+  { id: "open", label: "Open orders", Panel: OpenOrders },
+  { id: "history", label: "Order history", Panel: OrderHistory },
+  { id: "fills", label: "Fills", Panel: Fills },
+] as const;
+
+type AccountTab = (typeof ACCOUNT_TABS)[number]["id"];
+
+// Only the chosen tab is mounted, so history and fills fetch and refetch only while shown.
+function AccountPanel({ markets }: { markets: MarketInfo[] }) {
+  const [tab, setTab] = useState<AccountTab>("open");
+  const { Panel } = ACCOUNT_TABS.find((entry) => entry.id === tab) ?? ACCOUNT_TABS[0];
+
+  return (
+    <section aria-label="Your orders" className="border-t">
+      <div role="tablist" aria-label="Your orders" className="flex gap-1 px-2">
+        {ACCOUNT_TABS.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            role="tab"
+            aria-selected={entry.id === tab}
+            onClick={() => setTab(entry.id)}
+            className="border-b-2 border-transparent px-3 py-2 text-sm aria-selected:border-foreground aria-selected:font-medium"
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+      <div role="tabpanel" className="pb-2">
+        <Panel markets={markets} />
+      </div>
+    </section>
+  );
+}
 
 export function Terminal() {
   const markets = useMarkets();
@@ -52,14 +89,7 @@ export function Terminal() {
           <OrderForm market={market} />
         </div>
       </div>
-      {status === "signed_in" ? (
-        <section aria-label="Open orders" className="border-t">
-          <header className="px-3 py-2">
-            <h2 className="text-sm font-medium">Open orders</h2>
-          </header>
-          <OpenOrders markets={markets.data} />
-        </section>
-      ) : null}
+      {status === "signed_in" ? <AccountPanel markets={markets.data} /> : null}
     </div>
   );
 }
