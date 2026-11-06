@@ -16,8 +16,8 @@ import websocket from "@fastify/websocket";
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
-import type { Side } from "./book.ts";
-import { type Exchange, type MarketUpdate, SerialQueue } from "./exchange.ts";
+import { type Exchange, SerialQueue } from "./exchange.ts";
+import { bookUpdate, orderMessage, type ServerMessage, tradeMessages } from "./feed.ts";
 import { accountState, type Database } from "./ledger.ts";
 import { formatAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
@@ -54,47 +54,6 @@ const clientMessage = z.discriminatedUnion("op", [
 ]);
 type ClientMessage = z.infer<typeof clientMessage>;
 
-type Level = { price: string; quantity: string };
-
-export type ServerMessage =
-  | { type: "subscribed" | "unsubscribed"; channel: string; market?: string }
-  | { type: "authenticated"; expiresAt: string }
-  | { type: "error"; error: string; message: string }
-  | {
-      type: "order";
-      market: string;
-      id: string;
-      clientOrderId: string | null;
-      status: string;
-      filledQuantity: string;
-      sequence: number;
-    }
-  | {
-      // The whole balance sheet. Keep the one with the highest version: two markets can
-      // settle for the same user at once, and their balance reads can arrive out of order.
-      type: "balances";
-      version: number;
-      balances: { asset: string; available: string; reserved: string }[];
-    }
-  | { type: "book"; market: string; sequence: number; bids: Level[]; asks: Level[] }
-  | {
-      type: "book_update";
-      market: string;
-      firstSequence: number;
-      sequence: number;
-      // The new total at each level the command changed; "0" removes the level.
-      changes: (Level & { side: Side })[];
-    }
-  | {
-      type: "trade";
-      market: string;
-      sequence: number;
-      price: string;
-      quantity: string;
-      takerSide: Side;
-      time: string;
-    };
-
 // Every level, best first. The book is in memory and bounded by what users rest, so a full
 // snapshot keeps deltas simple: a client never has to fetch a level it was not sent.
 const WHOLE_BOOK = Number.MAX_SAFE_INTEGER;
@@ -111,45 +70,6 @@ function bookSnapshot(exchange: Exchange, market: Market): ServerMessage {
     sequence,
     bids: bids.map(level),
     asks: asks.map(level),
-  };
-}
-
-// One message per trade, in sequence order. Trades are not every sequence number, so this
-// channel cannot show a gap; the book channel is where a client checks continuity.
-export function tradeMessages({ market, events, settledAt }: MarketUpdate): ServerMessage[] {
-  return events.flatMap((event) =>
-    event.type === "trade"
-      ? [
-          {
-            type: "trade" as const,
-            market: market.symbol,
-            sequence: event.sequence,
-            price: formatAmount(event.price, market.quoteScale),
-            quantity: formatAmount(event.quantity, market.baseScale),
-            takerSide: event.takerSide,
-            time: settledAt.toISOString(),
-          },
-        ]
-      : [],
-  );
-}
-
-export function bookUpdate({
-  market,
-  firstSequence,
-  sequence,
-  levels,
-}: MarketUpdate): ServerMessage {
-  return {
-    type: "book_update",
-    market: market.symbol,
-    firstSequence,
-    sequence,
-    changes: levels.map(({ side, price, quantity }) => ({
-      side,
-      price: formatAmount(price, market.quoteScale),
-      quantity: formatAmount(quantity, market.baseScale),
-    })),
   };
 }
 
@@ -293,15 +213,7 @@ export function registerWebSocketRoutes(
       if (!hub.has(topic)) {
         continue;
       }
-      hub.publish(topic, {
-        type: "order",
-        market: market.symbol,
-        id: order.id,
-        clientOrderId: order.clientOrderId,
-        status: order.status,
-        filledQuantity: formatAmount(order.filledQuantity, market.baseScale),
-        sequence: order.sequence,
-      });
+      hub.publish(topic, orderMessage(market, order));
       owners.add(order.userId);
     }
     for (const userId of owners) {
