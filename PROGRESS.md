@@ -946,3 +946,122 @@ to it, it should split by route.
 - Public channels follow the same rule as the public routes: price levels only, no user ids
   or order ids.
 - Interview note in `DECISIONS.md`
+
+## Day 10 — Real-time market data
+
+**Commits landed (13)**
+
+- `refactor(redis): move the Redis client factory out of main.ts`
+- `fix(api): fail the order rate limit open within 100 ms when Redis is down or slow`
+- `refactor(orders): move settlement out of exchange.ts into settlement.ts`
+- `feat(ws): accept connections with a zod-validated subscribe protocol`
+- `feat(ws): stream an order book snapshot then sequenced deltas`
+- `feat(ws): stream public trades`
+- `feat(ws): stream private order and balance events on an authenticated channel`
+- `refactor(ws): move market data message formatting into feed.ts`
+- `feat(ws): fan out market events through Redis pub/sub`
+- `feat(ws): send heartbeats and drop clients whose send buffer exceeds a cap`
+- `test(ws): show a client that misses a sequence detects the gap and resyncs`
+- `docs: record the market data decisions and the session 6 interview note`
+- `docs: record day 10 in PROGRESS.md`
+
+**Correction to Day 9**
+
+Day 9 said a Redis outage could delay orders "by up to the reconnect backoff (at most
+2 s)". That was wrong. The 2 s is only the interval between reconnect attempts. With the
+offline queue on, a command issued during an outage waited until Redis came back, however
+long that took, so POST /orders hung and the waiting commands grew without bound. It is
+fixed below.
+
+**What now works**
+
+- The rate limiter fails open quickly in both bad cases:
+  - The API's Redis client has `disableOfflineQueue`.
+  - The limiter refuses on its own while the client is reconnecting. node-redis 6 still
+    queues a `MULTI` offline even with that option.
+  - It gives up after 100 ms, which covers a connected but slow Redis.
+  - Tests use a per-test TCP proxy in front of Redis that can hold replies back, cut the
+    connection or come back. Before the fix both tests hung until the 5 s test timeout.
+- `/ws`, one WebSocket for everything, with zod-validated JSON commands:
+  - `subscribe` and `unsubscribe` for `book` and `trades` per market, and `account`.
+  - `auth` with an access token. The connection closes with code 4001 when the token
+    expires.
+  - A bad message gets an `invalid_message` error and the connection stays open; anything
+    over 4 KB closes it.
+- Book channel: the whole book with its sequence, then one `book_update` per settled
+  command, carrying the first and last sequence and the new total at each changed level. A
+  client resyncs by subscribing again.
+- Trades channel: one message per trade with sequence, price, quantity, taker side and time.
+  Public channels contain no user id or order id; the tests check message bodies for them.
+- Account channel: the user's balances on subscribe, then an `order` event for each of
+  their orders a command changed, each followed by the user's balances. Balances carry a
+  version, the highest ledger entry id they include, and a client keeps the highest.
+- Fan-out through Redis pub/sub:
+  - Each market's update goes to `<prefix>market:<symbol>` and each order event to
+    `<prefix>user:<id>`.
+  - The gateway pattern-subscribes to the market channels, and subscribes to a user's
+    channel only while that user is on the account channel.
+  - Publishing is fire and forget.
+  - A test with two servers on one prefix shows an order matched on one reaching a client
+    on the other.
+- Heartbeats every 15 s, and termination of a connection that misses a pong or has more
+  than 1 MiB unsent.
+- Gap test: one real publish is lost while the publisher's Redis is cut. The client counts
+  one gap, resyncs at sequence 3 and matches the REST book.
+- 303 tests in 20 files, up from 276 in 18.
+
+**What is stubbed**
+
+- A book snapshot comes from the engine in this process. A gateway process without the
+  engine would send an empty snapshot; that is fine while there is one API process (multiple
+  engine processes are out of scope).
+- Delivery is at most once. The trades channel has no sequence continuity of its own, so a
+  trade lost in an outage is only visible on the book channel; a client that wants it reads
+  `GET /markets/:symbol/trades`.
+- A halted market stops publishing. Its subscribers keep the last book they had and get no
+  message saying it halted.
+- After a restart every market numbers from 1 again. A client that reconnects must take a
+  fresh snapshot rather than compare sequences across the restart (Session 10 keeps
+  sequences across restarts).
+- A connection is authenticated for the life of its token. There is no revocation for a
+  socket that is already open.
+- Carried over: no test database separate from the dev one, `npm audit` dev-only findings
+  from drizzle-kit, the manual `vaidhyam@example.com` row, and the CI workflow has still not
+  run on GitHub.
+
+**Decisions and deviations from the plan**
+
+- Added before the WebSocket work: the rate limiter fix, and two refactors (the Redis client
+  into `redis.ts`, settlement into `settlement.ts`).
+- New dev dependency `@types/ws`: `@fastify/websocket`'s types import `ws` but list its types
+  only as a dev dependency, so without it every socket was an unresolved type.
+- The book delta carries absolute level totals, not increments, and a sequence range per
+  command, not per event.
+- Balances on the account channel are read at the gateway, after the order event, rather
+  than in the market's queue.
+- In tests, an `injectWS` client never answers pings, so the heartbeat test uses Node's own
+  `WebSocket` over a real port for the healthy client. The in-memory pipe also absorbs about
+  130 KB before the server's send buffer grows, so the slow-consumer test makes a paused
+  client request snapshots until it passes the cap.
+
+**Repo shape**
+
+Still flat. New:
+
+- `redis.ts`: the Redis client factory. The rate limiter test needs production's options,
+  and `main.ts` starts the server when imported.
+- `settlement.ts`: split from `exchange.ts` at 438 lines.
+- `ws.ts`: the WebSocket gateway, a new transport.
+- `feed.ts`: the publishing side of market data, split from `ws.ts` at 426 lines.
+
+`ws.ts` is at 431 lines again, mostly the gateway's command handling. If Session 7 adds
+to it, the account channel is the piece to split out.
+
+**Next: Day 11 — Trading terminal, part 1**
+
+- `chore(web): create the Next.js app with Tailwind and shadcn/ui`
+- `feat(web): register and log in with silent token refresh`
+- `feat(web): connect to the socket with reconnect, resubscribe and gap recovery`
+- `feat(web): show a live order book that updates rows without re-rendering the book`
+- `feat(web): show the recent trades feed`
+- `feat(web): add an order entry form for limit and market orders`
