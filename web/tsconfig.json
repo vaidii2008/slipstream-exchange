@@ -19,7 +19,8 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "@slipstream/protocol": ["../protocol.ts"]
     }
   },
   "include": [
