@@ -17,18 +17,23 @@ export type TradingDependencies = {
   exchange: Exchange;
 };
 
-// Prices and quantities travel as strings, like deposit amounts. Only limit orders for now:
-// a market order needs the capped reservation that arrives in Session 5.
-const orderBody = z.object({
+// Prices and quantities travel as strings, like deposit amounts. A market order has no price,
+// and sending one is rejected rather than ignored: the client may think it set a limit.
+const orderFields = {
   market: z.string().min(1).max(32),
   side: z.enum(["buy", "sell"]),
-  type: z.literal("limit"),
-  price: z.string().max(64),
   quantity: z.string().max(64),
-});
+};
+const orderBody = z.discriminatedUnion("type", [
+  z.strictObject({ ...orderFields, type: z.literal("limit"), price: z.string().max(64) }),
+  z.strictObject({ ...orderFields, type: z.literal("market") }),
+]);
 
 // Which field each grid rejection is about, and what to tell the client.
-const GRID_ERRORS: Record<Exclude<OrderErrorCode, "insufficient_funds">, [string, string]> = {
+const GRID_ERRORS: Record<
+  Exclude<OrderErrorCode, "insufficient_funds" | "no_liquidity">,
+  [string, string]
+> = {
   price_not_positive: ["price", "must be positive"],
   price_off_tick: ["price", "must be a multiple of the market's tick size"],
   quantity_below_minimum: ["quantity", "is below the market's minimum quantity"],
@@ -55,29 +60,32 @@ export function registerTradingRoutes(
       return reply.code(400).send(fieldError("market", "is not a listed market"));
     }
 
-    const price = parseAmount(body.price, market.quoteScale);
-    if (!price.ok) {
-      return reply.code(400).send(fieldError("price", AMOUNT_MESSAGES[price.reason]));
+    let price: bigint | null = null;
+    if (body.type === "limit") {
+      const parsedPrice = parseAmount(body.price, market.quoteScale);
+      if (!parsedPrice.ok) {
+        return reply.code(400).send(fieldError("price", AMOUNT_MESSAGES[parsedPrice.reason]));
+      }
+      price = parsedPrice.units;
     }
     const quantity = parseAmount(body.quantity, market.baseScale);
     if (!quantity.ok) {
       return reply.code(400).send(fieldError("quantity", AMOUNT_MESSAGES[quantity.reason]));
     }
 
+    const fields = { userId, side: body.side, quantity: quantity.units };
     let placed;
     try {
-      placed = await exchange.placeLimitOrder(market, {
-        userId,
-        side: body.side,
-        price: price.units,
-        quantity: quantity.units,
-      });
+      placed = await exchange.placeOrder(
+        market,
+        price === null ? { ...fields, type: "market" } : { ...fields, type: "limit", price },
+      );
     } catch (error) {
       if (!(error instanceof OrderError)) {
         throw error;
       }
-      if (error.code === "insufficient_funds") {
-        return reply.code(422).send({ error: "insufficient_funds", message: error.message });
+      if (error.code === "insufficient_funds" || error.code === "no_liquidity") {
+        return reply.code(422).send({ error: error.code, message: error.message });
       }
       const [field, message] = GRID_ERRORS[error.code];
       return reply.code(400).send(fieldError(field, message));
@@ -90,7 +98,7 @@ export function registerTradingRoutes(
       market: market.symbol,
       side: body.side,
       type: body.type,
-      price: quote(price.units),
+      price: price === null ? null : quote(price),
       quantity: base(quantity.units),
       status: placed.status,
       filledQuantity: base(placed.filledQuantity),

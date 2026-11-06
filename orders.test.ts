@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market, OrderError, recordLimitOrder } from "./orders.ts";
+import { loadMarket, type Market, OrderError, protectionPrice, recordOrder } from "./orders.ts";
 import { orders, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
@@ -82,12 +82,32 @@ describe("loadMarket", () => {
   });
 });
 
-describe("recordLimitOrder", () => {
+describe("protectionPrice", () => {
+  it("moves the best opposite price 5% against the taker", () => {
+    expect(protectionPrice(btcUsd, "buy", units("60000"))).toBe(units("63000"));
+    expect(protectionPrice(btcUsd, "sell", units("60000"))).toBe(units("57000"));
+  });
+
+  it("rounds the band down onto the tick grid, so the bound never passes 5%", () => {
+    // 5% of 100.07 is 5.0035: 5.00 on a 0.01 tick.
+    expect(protectionPrice(btcUsd, "buy", units("100.07"))).toBe(units("105.07"));
+    expect(protectionPrice(btcUsd, "sell", units("100.07"))).toBe(units("95.07"));
+  });
+
+  it("rejects a market order with nothing on the other side", () => {
+    expect(() => protectionPrice(btcUsd, "buy", undefined)).toThrow(
+      expect.objectContaining({ code: "no_liquidity" }),
+    );
+  });
+});
+
+describe("recordOrder", () => {
   it("reserves price × quantity of USD for a buy and records it pending", async () => {
     const userId = await createUser();
     await deposit(db, userId, "USD", units("1000"));
 
-    const order = await recordLimitOrder(db, btcUsd, {
+    const order = await recordOrder(db, btcUsd, {
+      type: "limit",
       userId,
       side: "buy",
       price: units("2000.50"),
@@ -117,7 +137,8 @@ describe("recordLimitOrder", () => {
     const userId = await createUser();
     await deposit(db, userId, "BTC", units("1"));
 
-    await recordLimitOrder(db, btcUsd, {
+    await recordOrder(db, btcUsd, {
+      type: "limit",
       userId,
       side: "sell",
       price: units("60000"),
@@ -140,7 +161,8 @@ describe("recordLimitOrder", () => {
     await deposit(db, userId, "USD", units("1000"));
 
     await expectOrderError(
-      recordLimitOrder(db, btcUsd, {
+      recordOrder(db, btcUsd, {
+        type: "limit",
         userId,
         side: "buy",
         price: units(price),
@@ -156,12 +178,34 @@ describe("recordLimitOrder", () => {
     await expect(ordersOf(userId)).resolves.toEqual([]);
   });
 
+  it("reserves quantity × protection price for a market buy and records it without a price", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "USD", units("10000"));
+
+    await recordOrder(db, btcUsd, {
+      type: "market",
+      userId,
+      side: "buy",
+      quantity: units("0.1"),
+      protectionPrice: units("63000"),
+    });
+
+    await expect(balanceOf(userId, "USD")).resolves.toEqual({
+      available: units("3700"),
+      reserved: units("6300"),
+    });
+    await expect(ordersOf(userId)).resolves.toEqual([
+      expect.objectContaining({ type: "market", price: null, status: "pending" }),
+    ]);
+  });
+
   it("rejects an order the user cannot fund and records nothing", async () => {
     const userId = await createUser();
     await deposit(db, userId, "USD", units("100"));
 
     await expectOrderError(
-      recordLimitOrder(db, btcUsd, {
+      recordOrder(db, btcUsd, {
+        type: "limit",
         userId,
         side: "buy",
         price: units("100.01"),
@@ -183,7 +227,8 @@ describe("recordLimitOrder", () => {
 
     const results = await Promise.allSettled(
       Array.from({ length: 12 }, () =>
-        recordLimitOrder(db, btcUsd, {
+        recordOrder(db, btcUsd, {
+          type: "limit",
           userId,
           side: "sell",
           price: units("50000"),

@@ -13,7 +13,14 @@ import {
   postTransaction,
 } from "./ledger.ts";
 import { formatAmount, notional } from "./money.ts";
-import { type LimitOrderRequest, type Market, recordLimitOrder, reservationFor } from "./orders.ts";
+import {
+  type Market,
+  type OrderRequest,
+  protectionPrice,
+  recordOrder,
+  reservationFor,
+  worstPrice,
+} from "./orders.ts";
 import { orders, trades } from "./schema.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
@@ -89,14 +96,15 @@ async function fillPostings(
   return postings;
 }
 
-// What a cancelled remainder had reserved, by the same rule as reservationFor.
-function cancelledReservation(market: Market, event: Extract<EngineEvent, { type: "cancelled" }>) {
-  if (event.price === null) {
-    // Market orders reserve differently, and are not placed until Session 5's capped
-    // reservation exists; reaching this means one got into the engine anyway.
-    throw new Error(`cannot release order ${event.orderId}: market orders are not supported`);
-  }
-  return reservationFor(market, event.side, event.price, event.quantity);
+// What a cancelled remainder had reserved, by the same rule as reservationFor. A market
+// order's event has no price; only the incoming order can be one, and it reserved at
+// `takerLimit`, its protection price.
+function cancelledReservation(
+  market: Market,
+  event: Extract<EngineEvent, { type: "cancelled" }>,
+  takerLimit: bigint,
+) {
+  return reservationFor(market, event.side, event.price ?? takerLimit, event.quantity);
 }
 
 async function applyFill(
@@ -140,7 +148,8 @@ async function setStatus(
 
 // Writes everything one engine command did, in one transaction: a trade row and a ledger
 // transaction per fill, each order's filled quantity and status, and the release of whatever
-// a cancelled remainder had reserved. `takerLimit` is the incoming order's limit price.
+// a cancelled remainder had reserved. `takerLimit` is the incoming order's worst price: its
+// limit, or a market order's protection price.
 export async function settle(
   db: Database,
   market: Market,
@@ -158,7 +167,7 @@ export async function settle(
           postings: await fillPostings(accounts, market, event, takerLimit),
         });
       } else if (event.type === "cancelled") {
-        const { asset, amount } = cancelledReservation(market, event);
+        const { asset, amount } = cancelledReservation(market, event, takerLimit);
         ledgerWork.push({
           kind: "release",
           postings: [
@@ -236,14 +245,27 @@ export class Exchange {
     this.#db = db;
   }
 
-  async placeLimitOrder(market: Market, request: LimitOrderRequest): Promise<PlacedOrder> {
-    const order = await recordLimitOrder(this.#db, market, request);
+  async placeOrder(market: Market, request: OrderRequest): Promise<PlacedOrder> {
     const { engine, queue } = this.#market(market.symbol);
+    // Read from the book as it is now, outside the queue. Commands queued ahead may move the
+    // book before this order runs; the protection price still bounds what it can spend.
+    const accepted =
+      request.type === "limit"
+        ? request
+        : {
+            ...request,
+            protectionPrice: protectionPrice(
+              market,
+              request.side,
+              engine.bestPrice(request.side === "buy" ? "sell" : "buy"),
+            ),
+          };
+    const { id } = await recordOrder(this.#db, market, accepted);
 
     return queue.run(async () => {
-      const events = engine.submit({ type: "limit", ...request, id: order.id });
-      await settle(this.#db, market, events, request.price);
-      return summarize(order.id, events);
+      const events = engine.submit({ ...accepted, id });
+      await settle(this.#db, market, events, worstPrice(accepted));
+      return summarize(id, events);
     });
   }
 

@@ -132,7 +132,8 @@ describe("POST /orders", () => {
   });
 
   it.each([
-    ["a market order, until Session 5", { type: "market" }],
+    ["a market order with a price", { type: "market" }],
+    ["a field the API does not know", { timeInForce: "IOC" }],
     ["a JSON number price, which has been through a float", { price: 60000 }],
     ["an unknown side", { side: "short" }],
   ])("rejects %s", async (_label, change) => {
@@ -142,6 +143,56 @@ describe("POST /orders", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json<unknown>()).toMatchObject({ error: "invalid_request" });
+  });
+});
+
+describe("POST /orders with a market order", () => {
+  const app = buildServer({
+    pool,
+    redis: { ping: () => Promise.resolve("PONG") },
+    db,
+    tokens,
+    exchange: new Exchange(db),
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("fills against the book and returns no price of its own", async () => {
+    const seller = await signedInUser(app);
+    const buyer = await signedInUser(app);
+    await fund(seller, "BTC", "1", app);
+    await fund(buyer, "USD", "10000", app);
+    await postOrder(seller, { ...aBuy, side: "sell", price: "60000" }, app);
+
+    const response = await postOrder(
+      buyer,
+      { market: "BTC-USD", side: "buy", type: "market", quantity: "0.1" },
+      app,
+    );
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json<unknown>()).toMatchObject({
+      type: "market",
+      price: null,
+      status: "filled",
+      fills: [{ price: "60000.00000000", quantity: "0.10000000" }],
+    });
+  });
+
+  it("refuses one with nothing to trade against with 422 no_liquidity", async () => {
+    const buyer = await signedInUser(app);
+    await fund(buyer, "USD", "10000", app);
+
+    const response = await postOrder(
+      buyer,
+      { market: "ETH-USD", side: "buy", type: "market", quantity: "1" },
+      app,
+    );
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json<unknown>()).toMatchObject({ error: "no_liquidity" });
   });
 });
 

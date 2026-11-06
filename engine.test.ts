@@ -241,10 +241,62 @@ describe("Engine.submit with a market order", () => {
     expect(remaining(engine.snapshot().bids)).toEqual([[100n, [["bid", 3n]]]]);
   });
 
-  it("rejects a zero quantity", () => {
+  it("buys no higher than its protection price and cancels the rest", () => {
+    const engine = new Engine("TEST");
+    engine.submit(limit("a", "sell", 100n, 2n));
+    engine.submit(limit("b", "sell", 105n, 2n));
+    engine.submit(limit("c", "sell", 106n, 2n));
+
+    const events = engine.submit({ ...market("buy", "buy", 5n), protectionPrice: 105n });
+
+    expect(trades(events)).toEqual([
+      ["a", "buy", 100n, 2n],
+      ["b", "buy", 105n, 2n],
+    ]);
+    expect(unstamped(events).at(-1)).toMatchObject({
+      type: "cancelled",
+      orderId: "buy",
+      price: null,
+      quantity: 1n,
+      reason: "no_liquidity",
+    });
+    expect(remaining(engine.snapshot().asks)).toEqual([[106n, [["c", 2n]]]]);
+  });
+
+  it("sells no lower than its protection price and cancels the rest", () => {
+    const engine = new Engine("TEST");
+    engine.submit(limit("high", "buy", 100n, 1n));
+    engine.submit(limit("low", "buy", 94n, 1n));
+
+    const events = engine.submit({ ...market("sell", "sell", 2n), protectionPrice: 95n });
+
+    expect(trades(events)).toEqual([["high", "sell", 100n, 1n]]);
+    expect(unstamped(events).at(-1)).toMatchObject({ type: "cancelled", quantity: 1n });
+    expect(remaining(engine.snapshot().bids)).toEqual([[94n, [["low", 1n]]]]);
+  });
+
+  it("rejects a zero quantity or protection price", () => {
     const engine = new Engine("TEST");
 
     expect(() => engine.submit(market("m", "buy", 0n))).toThrow(RangeError);
+    expect(() => engine.submit({ ...market("p", "buy", 1n), protectionPrice: 0n })).toThrow(
+      RangeError,
+    );
+    expect(engine.sequence).toBe(0);
+  });
+});
+
+describe("Engine.bestPrice", () => {
+  it("reports the best resting price on each side, or undefined when it is empty", () => {
+    const engine = new Engine("TEST");
+    expect(engine.bestPrice("sell")).toBeUndefined();
+
+    engine.submit(limit("low", "buy", 98n, 1n));
+    engine.submit(limit("high", "buy", 99n, 1n));
+    engine.submit(limit("ask", "sell", 101n, 1n));
+
+    expect(engine.bestPrice("buy")).toBe(99n);
+    expect(engine.bestPrice("sell")).toBe(101n);
   });
 });
 

@@ -12,13 +12,16 @@ export type LimitOrder = {
   quantity: bigint;
 };
 
-// Takes whatever the book offers at any price, up to `quantity`, and never rests.
+// Takes whatever the book offers, up to `quantity`, and never rests. With a protection price
+// it trades no worse than that price (a buy pays at most it, a sell receives at least it) and
+// cancels the rest; without one it takes any price.
 export type MarketOrder = {
   type: "market";
   id: string;
   userId: string;
   side: Side;
   quantity: bigint;
+  protectionPrice?: bigint;
 };
 
 export type NewOrder = LimitOrder | MarketOrder;
@@ -96,7 +99,9 @@ export class Engine {
   }
 
   #match(order: NewOrder): EventBody[] {
-    if (order.quantity <= 0n || (order.type === "limit" && order.price <= 0n)) {
+    // The worst price the order may trade at, if it has one.
+    const limit = order.type === "limit" ? order.price : order.protectionPrice;
+    if (order.quantity <= 0n || (limit !== undefined && limit <= 0n)) {
       throw new RangeError(`order ${order.id} needs a positive price and quantity`);
     }
     // Checked before matching: failing at rest time would leave the trades half applied.
@@ -107,10 +112,9 @@ export class Engine {
     const events: EventBody[] = [];
     const makerSide = opposite(order.side);
     // A buy crosses any ask at or below its limit; a sell crosses any bid at or above it. A
-    // market order crosses everything.
+    // market order without a protection price crosses everything.
     const crosses = (price: bigint) =>
-      order.type === "market" ||
-      (order.side === "buy" ? price <= order.price : price >= order.price);
+      limit === undefined || (order.side === "buy" ? price <= limit : price >= limit);
 
     let remaining = order.quantity;
     let selfTrade = false;
@@ -197,6 +201,11 @@ export class Engine {
 
   snapshot(): BookSnapshot {
     return this.#book.snapshot();
+  }
+
+  // The best resting price on one side, undefined when that side is empty.
+  bestPrice(side: Side): bigint | undefined {
+    return this.#book.best(side)?.price;
   }
 
   // Numbers events only once a command has run to completion, so a command that throws on

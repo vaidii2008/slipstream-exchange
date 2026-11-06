@@ -90,7 +90,7 @@ describe("SerialQueue", () => {
   });
 });
 
-describe("Exchange.placeLimitOrder", () => {
+describe("Exchange.placeOrder", () => {
   // A fresh exchange per test, so every test starts from empty books.
   async function funded(holdings: Record<string, string>): Promise<string> {
     const userId = await createUser();
@@ -101,6 +101,7 @@ describe("Exchange.placeLimitOrder", () => {
   }
 
   const limit = (userId: string, side: "buy" | "sell", price: string, quantity: string) => ({
+    type: "limit" as const,
     userId,
     side,
     price: units(price),
@@ -123,7 +124,7 @@ describe("Exchange.placeLimitOrder", () => {
     const exchange = new Exchange(db);
     const buyer = await funded({ USD: "30000" });
 
-    const placed = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
+    const placed = await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
 
     expect(placed).toEqual({ id: placed.id, status: "open", filledQuantity: 0n, fills: [] });
     await expect(orderRow(placed.id)).resolves.toEqual({
@@ -142,8 +143,8 @@ describe("Exchange.placeLimitOrder", () => {
     const seller = await funded({ BTC: "1" });
     const buyer = await funded({ USD: "30050" });
 
-    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "60000", "0.5"));
-    const buy = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60100", "0.5"));
+    const sell = await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.5"));
+    const buy = await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60100", "0.5"));
 
     expect(buy).toEqual({
       id: buy.id,
@@ -195,8 +196,8 @@ describe("Exchange.placeLimitOrder", () => {
     const seller = await funded({ BTC: "0.2" });
     const buyer = await funded({ USD: "30000" });
 
-    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "60000", "0.2"));
-    const buy = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
+    const sell = await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.2"));
+    const buy = await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
 
     expect(buy).toMatchObject({ status: "open", filledQuantity: units("0.2") });
     await expect(orderRow(buy.id)).resolves.toEqual({
@@ -222,9 +223,9 @@ describe("Exchange.placeLimitOrder", () => {
     const low = await funded({ USD: "599" });
     const seller = await funded({ BTC: "0.02" });
 
-    await exchange.placeLimitOrder(btcUsd, limit(low, "buy", "59900", "0.01"));
-    await exchange.placeLimitOrder(btcUsd, limit(high, "buy", "60000", "0.01"));
-    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "59900", "0.02"));
+    await exchange.placeOrder(btcUsd, limit(low, "buy", "59900", "0.01"));
+    await exchange.placeOrder(btcUsd, limit(high, "buy", "60000", "0.01"));
+    const sell = await exchange.placeOrder(btcUsd, limit(seller, "sell", "59900", "0.02"));
 
     expect(sell.fills).toEqual([
       { price: units("60000"), quantity: units("0.01") },
@@ -245,8 +246,8 @@ describe("Exchange.placeLimitOrder", () => {
     const exchange = new Exchange(db);
     const user = await funded({ BTC: "1", USD: "30000" });
 
-    await exchange.placeLimitOrder(btcUsd, limit(user, "sell", "60000", "0.5"));
-    const buy = await exchange.placeLimitOrder(btcUsd, limit(user, "buy", "60000", "0.5"));
+    await exchange.placeOrder(btcUsd, limit(user, "sell", "60000", "0.5"));
+    const buy = await exchange.placeOrder(btcUsd, limit(user, "buy", "60000", "0.5"));
 
     expect(buy).toEqual({ id: buy.id, status: "cancelled", filledQuantity: 0n, fills: [] });
     await expect(orderRow(buy.id)).resolves.toMatchObject({ status: "cancelled" });
@@ -257,6 +258,91 @@ describe("Exchange.placeLimitOrder", () => {
     await expect(balanceOf(user, "BTC")).resolves.toEqual({
       available: units("0.5"),
       reserved: units("0.5"),
+    });
+  });
+
+  const marketOrder = (userId: string, side: "buy" | "sell", quantity: string) => ({
+    type: "market" as const,
+    userId,
+    side,
+    quantity: units(quantity),
+  });
+
+  it("buys at market up to the protection price, then cancels and releases the rest", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "0.3" });
+    const buyer = await funded({ USD: "20000" });
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.1"));
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "63000", "0.1"));
+    const beyond = await exchange.placeOrder(btcUsd, limit(seller, "sell", "63000.01", "0.1"));
+
+    // Best ask 60,000, so the bound is 63,000 and 0.3 × 63,000 = 18,900 is reserved.
+    const buy = await exchange.placeOrder(btcUsd, marketOrder(buyer, "buy", "0.3"));
+
+    expect(buy).toEqual({
+      id: buy.id,
+      status: "cancelled",
+      filledQuantity: units("0.2"),
+      fills: [
+        { price: units("60000"), quantity: units("0.1") },
+        { price: units("63000"), quantity: units("0.1") },
+      ],
+    });
+    // Paid 6,000 + 6,300. The first fill's 300 improvement and the unfilled 0.1's 6,300 came
+    // back, so nothing stays reserved.
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: units("7700"),
+      reserved: 0n,
+    });
+    await expect(orderRow(buy.id)).resolves.toMatchObject({
+      status: "cancelled",
+      filledQuantity: "0.200000000000000000",
+    });
+    await expect(orderRow(beyond.id)).resolves.toMatchObject({ status: "open" });
+  });
+
+  it("sells at market into the best bid and reports the order filled", async () => {
+    const exchange = new Exchange(db);
+    const buyer = await funded({ USD: "6000" });
+    const seller = await funded({ BTC: "1" });
+    await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.1"));
+
+    const sell = await exchange.placeOrder(btcUsd, marketOrder(seller, "sell", "0.05"));
+
+    expect(sell).toMatchObject({ status: "filled", filledQuantity: units("0.05") });
+    await expect(orderRow(sell.id)).resolves.toMatchObject({ status: "filled" });
+    await expect(balanceOf(seller, "BTC")).resolves.toEqual({
+      available: units("0.95"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(seller, "USD")).resolves.toEqual({
+      available: units("3000"),
+      reserved: 0n,
+    });
+  });
+
+  it("refuses a market buy the user cannot fund at the protection price", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "1" });
+    // Enough for 0.1 at the 60,000 ask, not for 0.1 at the 63,000 bound.
+    const buyer = await funded({ USD: "6000" });
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "1"));
+
+    await expect(
+      exchange.placeOrder(btcUsd, marketOrder(buyer, "buy", "0.1")),
+    ).rejects.toMatchObject({ code: "insufficient_funds" });
+  });
+
+  it("refuses a market order against an empty side and reserves nothing", async () => {
+    const exchange = new Exchange(db);
+    const buyer = await funded({ USD: "6000" });
+
+    await expect(
+      exchange.placeOrder(btcUsd, marketOrder(buyer, "buy", "0.01")),
+    ).rejects.toMatchObject({ code: "no_liquidity" });
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: units("6000"),
+      reserved: 0n,
     });
   });
 
@@ -272,14 +358,14 @@ describe("Exchange.placeLimitOrder", () => {
 
     for (let round = 0; round < 15; round++) {
       await Promise.all([
-        exchange.placeLimitOrder(btcUsd, limit(first, "buy", "60010", "0.01")),
-        exchange.placeLimitOrder(btcUsd, limit(second, "buy", "60000", "0.01")),
-        exchange.placeLimitOrder(ethUsd, limit(second, "buy", "3010", "0.01")),
-        exchange.placeLimitOrder(ethUsd, limit(first, "buy", "3000", "0.01")),
+        exchange.placeOrder(btcUsd, limit(first, "buy", "60010", "0.01")),
+        exchange.placeOrder(btcUsd, limit(second, "buy", "60000", "0.01")),
+        exchange.placeOrder(ethUsd, limit(second, "buy", "3010", "0.01")),
+        exchange.placeOrder(ethUsd, limit(first, "buy", "3000", "0.01")),
       ]);
       const [btc, eth] = await Promise.all([
-        exchange.placeLimitOrder(btcUsd, limit(btcSeller, "sell", "60000", "0.02")),
-        exchange.placeLimitOrder(ethUsd, limit(ethSeller, "sell", "3000", "0.02")),
+        exchange.placeOrder(btcUsd, limit(btcSeller, "sell", "60000", "0.02")),
+        exchange.placeOrder(ethUsd, limit(ethSeller, "sell", "3000", "0.02")),
       ]);
       expect([btc.status, eth.status]).toEqual(["filled", "filled"]);
     }

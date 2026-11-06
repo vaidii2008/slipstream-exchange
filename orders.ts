@@ -57,7 +57,8 @@ export type OrderErrorCode =
   | "price_off_tick"
   | "quantity_off_step"
   | "quantity_below_minimum"
-  | "insufficient_funds";
+  | "insufficient_funds"
+  | "no_liquidity";
 
 // A rejection the client caused and can fix. Anything else thrown from here is our bug.
 export class OrderError extends Error {
@@ -70,25 +71,53 @@ export class OrderError extends Error {
   }
 }
 
-export type LimitOrderRequest = {
+type OrderFields = {
   userId: string;
   side: Side;
-  // Minor units: price at the quote scale, quantity at the base scale.
-  price: bigint;
+  // Minor units at the base scale.
   quantity: bigint;
 };
 
-export type RecordedOrder = LimitOrderRequest & { id: string; market: Market };
+// Price in minor units at the quote scale.
+export type LimitOrderRequest = OrderFields & { type: "limit"; price: bigint };
+export type MarketOrderRequest = OrderFields & { type: "market" };
+export type OrderRequest = LimitOrderRequest | MarketOrderRequest;
+
+// An order whose worst price is fixed: a limit order's own price, or the protection price a
+// market order was given on arrival. A buy reserves at that price.
+export type AcceptedOrder = LimitOrderRequest | (MarketOrderRequest & { protectionPrice: bigint });
+
+export function worstPrice(order: AcceptedOrder): bigint {
+  return order.type === "limit" ? order.price : order.protectionPrice;
+}
+
+// How far beyond the best opposite price a market order may trade, in percent.
+export const MARKET_PROTECTION_PERCENT = 5n;
+
+// A market order has no price of its own, so it gets a bound from the book as it stands on
+// arrival: the best opposite price moved 5% against the taker, rounded towards it onto the
+// tick grid. The bound caps what a buy reserves and how far either side can sweep a thin book.
+export function protectionPrice(market: Market, side: Side, bestOpposite: bigint | undefined) {
+  if (bestOpposite === undefined) {
+    throw new OrderError("no_liquidity", `no ${side === "buy" ? "asks" : "bids"} to trade with`);
+  }
+  const band =
+    ((bestOpposite * MARKET_PROTECTION_PERCENT) / 100n / market.tickSize) * market.tickSize;
+  return side === "buy" ? bestOpposite + band : bestOpposite - band;
+}
 
 // The grid is what keeps every fill's notional exact, so an order off it never reaches the
 // ledger or the engine.
-function checkGrid(market: Market, price: bigint, quantity: bigint): void {
-  if (price <= 0n) {
-    throw new OrderError("price_not_positive", "price must be positive");
+function checkGrid(market: Market, order: AcceptedOrder): void {
+  if (order.type === "limit") {
+    if (order.price <= 0n) {
+      throw new OrderError("price_not_positive", "price must be positive");
+    }
+    if (order.price % market.tickSize !== 0n) {
+      throw new OrderError("price_off_tick", `price must be a multiple of the tick size`);
+    }
   }
-  if (price % market.tickSize !== 0n) {
-    throw new OrderError("price_off_tick", `price must be a multiple of the tick size`);
-  }
+  const { quantity } = order;
   if (quantity < market.minQuantity) {
     throw new OrderError("quantity_below_minimum", "quantity is below the market minimum");
   }
@@ -97,7 +126,7 @@ function checkGrid(market: Market, price: bigint, quantity: bigint): void {
   }
 }
 
-// The most a limit order can spend: a buy pays at most its own price for every unit, a sell
+// The most an order can spend: a buy pays at most its worst price for every unit, a sell
 // gives up at most its quantity.
 export function reservationFor(
   market: Market,
@@ -113,14 +142,14 @@ export function reservationFor(
 // Phase one of placing an order: reserve and record in one transaction, so there is never
 // a reservation without its order or an order without its reservation. The order is left
 // pending for the engine.
-export async function recordLimitOrder(
+export async function recordOrder(
   db: Database,
   market: Market,
-  request: LimitOrderRequest,
-): Promise<RecordedOrder> {
-  const { userId, side, price, quantity } = request;
-  checkGrid(market, price, quantity);
-  const reservation = reservationFor(market, side, price, quantity);
+  order: AcceptedOrder,
+): Promise<{ id: string }> {
+  const { userId, side, quantity } = order;
+  checkGrid(market, order);
+  const reservation = reservationFor(market, side, worstPrice(order), quantity);
 
   return db.transaction(async (tx) => {
     try {
@@ -141,14 +170,15 @@ export async function recordLimitOrder(
         userId,
         market: market.symbol,
         side,
-        type: "limit",
-        price: formatAmount(price, market.quoteScale),
+        type: order.type,
+        // The protection price is not the order's price: a market order has none.
+        price: order.type === "limit" ? formatAmount(order.price, market.quoteScale) : null,
         quantity: formatAmount(quantity, market.baseScale),
       })
       .returning({ id: orders.id });
     if (row === undefined) {
       throw new Error("order insert returned no row");
     }
-    return { ...request, id: row.id, market };
+    return { id: row.id };
   });
 }
