@@ -8,53 +8,12 @@
 // subscribers the gap, and they resync from a fresh snapshot.
 
 import type { FastifyBaseLogger } from "fastify";
-import type { Side } from "./book.ts";
 import type { MarketUpdate } from "./exchange.ts";
 import { formatAmount } from "./money.ts";
 import type { Market } from "./orders.ts";
+import type { ServerMessage } from "./protocol.ts";
 import type { RedisClient } from "./redis.ts";
 import type { SettledOrder } from "./settlement.ts";
-
-type Level = { price: string; quantity: string };
-
-export type ServerMessage =
-  | { type: "subscribed" | "unsubscribed"; channel: string; market?: string }
-  | { type: "authenticated"; expiresAt: string }
-  | { type: "error"; error: string; message: string }
-  | {
-      type: "order";
-      market: string;
-      id: string;
-      clientOrderId: string | null;
-      status: string;
-      filledQuantity: string;
-      sequence: number;
-    }
-  | {
-      // The whole balance sheet. Keep the one with the highest version: two markets can
-      // settle for the same user at once, and their balance reads can arrive out of order.
-      type: "balances";
-      version: number;
-      balances: { asset: string; available: string; reserved: string }[];
-    }
-  | { type: "book"; market: string; sequence: number; bids: Level[]; asks: Level[] }
-  | {
-      type: "book_update";
-      market: string;
-      firstSequence: number;
-      sequence: number;
-      // The new total at each level the command changed; "0" removes the level.
-      changes: (Level & { side: Side })[];
-    }
-  | {
-      type: "trade";
-      market: string;
-      sequence: number;
-      price: string;
-      quantity: string;
-      takerSide: Side;
-      time: string;
-    };
 
 // One message per trade, in sequence order. Trades are not every sequence number, so this
 // channel cannot show a gap; the book channel is where a client checks continuity.

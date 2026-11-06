@@ -17,10 +17,11 @@ import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
 import { type Exchange, SerialQueue } from "./exchange.ts";
-import type { FeedChannels, MarketFeedMessage, ServerMessage } from "./feed.ts";
+import type { FeedChannels, MarketFeedMessage } from "./feed.ts";
 import { accountState, type Database } from "./ledger.ts";
 import { formatAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
+import type { ClientMessage, ServerMessage } from "./protocol.ts";
 import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
 
@@ -48,7 +49,8 @@ const MARKET_RULE = {
   message: "market is required for book and trades, and not allowed for account",
   path: ["market"],
 };
-const clientMessage = z.discriminatedUnion("op", [
+// Annotated with the shared type, so the schema and what the terminal sends cannot drift.
+const clientMessage: z.ZodType<ClientMessage> = z.discriminatedUnion("op", [
   z.strictObject({ op: z.literal("auth"), token: z.string().min(1).max(4096) }),
   z
     .strictObject({ op: z.literal("subscribe"), ...channelFields })
@@ -57,7 +59,6 @@ const clientMessage = z.discriminatedUnion("op", [
     .strictObject({ op: z.literal("unsubscribe"), ...channelFields })
     .refine(marketMatchesChannel, MARKET_RULE),
 ]);
-type ClientMessage = z.infer<typeof clientMessage>;
 
 // Every level, best first. The book is in memory and bounded by what users rest, so a full
 // snapshot keeps deltas simple: a client never has to fetch a level it was not sent.
