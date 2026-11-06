@@ -1,0 +1,1 @@
+ALTER TABLE "trades" DROP CONSTRAINT "trades_market_engine_sequence";

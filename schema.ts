@@ -201,9 +201,9 @@ export const trades = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    // One engine event is one trade, so settling the same event twice fails instead of
-    // paying both sides twice.
-    unique("trades_market_engine_sequence").on(table.market, table.engineSequence),
+    // Not unique on (market, engine_sequence) yet: every engine numbers from 1 when the
+    // process starts, so after a restart new trades reuse old numbers. The constraint comes
+    // back once Session 10's recovery restores each market's sequence.
     index("trades_maker_order_id_idx").on(table.makerOrderId),
     index("trades_taker_order_id_idx").on(table.takerOrderId),
     check("trades_price_positive", sql`${table.price} > 0`),

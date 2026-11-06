@@ -50,6 +50,13 @@
       "when": 1793936780857,
       "tag": "0006_create_orders_and_trades",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793937170976,
+      "tag": "0007_drop_unique_trade_sequence",
+      "breakpoints": true
     }
   ]
 }
