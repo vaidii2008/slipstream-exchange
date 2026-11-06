@@ -338,3 +338,77 @@ restart, and a busy one turns clients away with 503 rather than queueing without
 identical requests at once give one 201, four 200s and one reservation. A settlement forced to
 fail leaves the ledger summing to zero and the buy pending and reserved with no trade written,
 while BTC-USD refuses the next order and ETH-USD still accepts one.
+
+## Real-time market data
+
+### The rate limiter gives up after 100 ms and refuses while Redis is reconnecting
+
+- **Decision:** the API's Redis client has no offline queue. The limiter also refuses on its
+  own when the client is not ready, and gives up after 100 ms; either way the order goes
+  ahead.
+- **Alternative:** rely on `disableOfflineQueue` alone.
+- **Why:** with the offline queue, POST /orders hung for as long as Redis was down, and the
+  waiting commands grew without bound. node-redis 6 checks `disableOfflineQueue` only for
+  single commands and still queues a `MULTI`. A slow but connected Redis is not offline at
+  all, so only a timeout covers it. Before the fix both cases hung until the test timed out
+  at 5 s; after it, the tests require under 50 ms (down) and under 300 ms (slow).
+- **Where:** `hitFixedWindow` in `ratelimit.ts`; `createRedisClient` in `redis.ts`.
+
+### The book channel is a snapshot plus deltas that carry absolute level totals
+
+- **Decision:** subscribing sends the whole book with its sequence. Each delta carries the
+  command's first and last sequence and the new total at every level it changed. A client
+  drops deltas at or below what it has; a `firstSequence` other than last + 1 is a gap, and
+  subscribing again re-sends the snapshot.
+- **Alternative:** deltas as increments (+0.1 at 60,000), or a separate resync endpoint.
+- **Why:** an absolute total means a delta applied twice does no harm, and the first and last
+  sequence mean a command that emitted several events still reads as one contiguous step.
+  Resync reuses subscribe, so a client has one code path for joining and for recovering.
+- **Where:** `bookUpdate` in `feed.ts`; `levelsTouched` in `engine.ts`; `#announce` in
+  `exchange.ts`.
+
+### Market data publishes are fire and forget
+
+- **Decision:** the exchange's update listener publishes to Redis without awaiting it. A
+  failed publish is logged and dropped.
+- **Alternative:** await each publish inside the market's queue, or retry.
+- **Why:** awaiting would make every order wait on Redis, and a slow Redis would stall
+  matching. Retrying would need a buffer, which an outage would make unbounded. The sequence
+  numbers already let a client detect a loss and resync from the engine's own book. The gap
+  test drops a real publish during a cut connection and the client converges.
+- **Where:** `publishUpdate` in `feed.ts`; the gap test in `ws.test.ts`.
+
+### A balances message carries a version: the highest ledger entry id it includes
+
+- **Decision:** after an order event for a connected user, the gateway reads their balances
+  together with `max(ledger_entries.id)` in one statement, and the client keeps the message
+  with the highest version.
+- **Alternative:** send balances from inside the market's queue, or send deltas.
+- **Why:** two markets can settle for the same user at once, so two balance reads can
+  finish in either order. Entry ids only grow, so the higher version saw at least what the
+  other did. Reading at the gateway also means only users with a connection cost a query.
+- **Where:** `accountState` in `ledger.ts`; `sendBalances` in `ws.ts`.
+
+### Slow and dead sockets are terminated, not buffered for
+
+- **Decision:** ping every 15 s and terminate a connection that missed the previous pong.
+  Terminate any connection with more than 1 MiB unsent.
+- **Alternative:** let the operating system time out dead connections; let the buffer grow.
+- **Why:** a dead network path never sends a close, so without pings its subscriptions live
+  forever. A client that reads slower than the market moves would make the server's memory
+  grow with every update. Terminate rather than close, because a close frame would queue
+  behind the backlog it is meant to stop.
+- **Where:** `Connection.sendText` and the heartbeat in `registerWebSocketRoutes`, `ws.ts`.
+
+### Interview note: Session 6, real-time market data
+
+The problem was streaming a live order book to many clients without the stream ever
+silently diverging from the engine, and without one slow client, a dead connection or a Redis
+outage holding up matching. Each settled command becomes one delta with absolute level totals
+and its first and last sequence. It is published fire and forget through Redis to the socket
+gateways, and a client that sees a sequence jump resubscribes for a fresh snapshot. The
+trade-off is that delivery is at most once: a publish lost in an outage is not retried, and
+the client pays a snapshot to recover instead of the exchange paying an unbounded buffer. In
+the gap test a real publish is lost while the connection is cut; the client counts exactly
+one gap, resyncs at sequence 3, and ends with the same three ask levels the REST endpoint
+reports.
