@@ -129,8 +129,9 @@ export function useTestServer() {
 }
 
 // A TCP proxy in front of the compose Redis. A test connects its own client through it and
-// can then make Redis slow (pause: replies are held back) or drop it after startup (cut: every
-// connection is closed and new ones are refused), while other test files keep using Redis.
+// can then make Redis slow (pause: replies are held back), drop it after startup (cut: every
+// connection is closed and new ones are refused) and bring it back on the same port
+// (restore), while other test files keep using Redis.
 export async function redisProxy() {
   const redisUrl = process.env.REDIS_URL;
   if (redisUrl === undefined) {
@@ -140,7 +141,7 @@ export async function redisProxy() {
   const sockets = new Set<Socket>();
   let paused = false;
 
-  const server = createServer((client) => {
+  const relay = (client: Socket) => {
     const upstream = connect(Number(target.port), target.hostname);
     for (const socket of [client, upstream]) {
       sockets.add(socket);
@@ -160,15 +161,22 @@ export async function redisProxy() {
         client.write(chunk);
       }
     });
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("proxy has no port");
-  }
+  };
+
+  const listen = async (port: number) => {
+    const server = createServer(relay);
+    await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("proxy has no port");
+    }
+    return { server, port: address.port };
+  };
+
+  let { server, port } = await listen(0);
 
   return {
-    url: `redis://127.0.0.1:${address.port}`,
+    url: `redis://127.0.0.1:${port}`,
     pause() {
       paused = true;
     },
@@ -177,6 +185,9 @@ export async function redisProxy() {
       for (const socket of sockets) {
         socket.destroy();
       }
+    },
+    async restore() {
+      ({ server, port } = await listen(port));
     },
   };
 }

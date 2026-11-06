@@ -7,7 +7,8 @@ import { parseAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
 import { buildServer, type ServerOptions } from "./server.ts";
-import { TEST_SECRET, uniqueMarketDataPrefix, useTestServer } from "./testing.ts";
+import { createRedisClient } from "./redis.ts";
+import { redisProxy, TEST_SECRET, uniqueMarketDataPrefix, useTestServer } from "./testing.ts";
 import { createAccessTokens } from "./tokens.ts";
 import { decode, TOKEN_EXPIRED_CLOSE_CODE } from "./ws.ts";
 
@@ -531,5 +532,111 @@ describe("a subscriber that falls behind", () => {
     await exchange.placeOrder(market, limit(seller, "sell", "80000", "0.01"));
     await expect(fast.next()).resolves.toMatchObject({ type: "book_update", sequence: 21 });
     fast.close();
+  });
+});
+
+// The client side of the book protocol, written the way a terminal would: keep the last
+// sequence, drop what is not newer, and on a gap ask for a fresh snapshot.
+class ClientBook {
+  sequence = -1;
+  gaps = 0;
+  readonly levels = { buy: new Map<string, string>(), sell: new Map<string, string>() };
+
+  // Returns true when the client must resubscribe.
+  apply(message: unknown): boolean {
+    const book = message as {
+      type: string;
+      sequence: number;
+      firstSequence: number;
+      bids: { price: string; quantity: string }[];
+      asks: { price: string; quantity: string }[];
+      changes: { side: "buy" | "sell"; price: string; quantity: string }[];
+    };
+    if (book.type === "book") {
+      this.levels.buy = new Map(book.bids.map((level) => [level.price, level.quantity]));
+      this.levels.sell = new Map(book.asks.map((level) => [level.price, level.quantity]));
+      this.sequence = book.sequence;
+      return false;
+    }
+    if (book.type !== "book_update" || book.sequence <= this.sequence) {
+      return false;
+    }
+    if (book.firstSequence !== this.sequence + 1) {
+      this.gaps++;
+      return true;
+    }
+    for (const change of book.changes) {
+      if (Number(change.quantity) === 0) {
+        this.levels[change.side].delete(change.price);
+      } else {
+        this.levels[change.side].set(change.price, change.quantity);
+      }
+    }
+    this.sequence = book.sequence;
+    return false;
+  }
+
+  asks() {
+    return [...this.levels.sell]
+      .map(([price, quantity]) => ({ price, quantity }))
+      .sort((a, b) => Number(a.price) - Number(b.price));
+  }
+}
+
+describe("a client that misses a sequence", () => {
+  it("detects the gap and resyncs to the server's book", async () => {
+    // The publishing server's Redis goes through a proxy, so one publish can be lost to an
+    // outage while the gateway's subscriber connection stays up.
+    const proxy = await redisProxy();
+    const publisher = createRedisClient(proxy.url);
+    publisher.on("error", () => undefined);
+    await publisher.connect();
+    const exchange = new Exchange(db);
+    const server = buildServer(
+      { pool, redis: publisher, subscriber, db, tokens, exchange },
+      { marketDataPrefix: uniqueMarketDataPrefix() },
+    );
+    try {
+      const market = await btcUsd();
+      const seller = await funded({ BTC: "1" });
+      const client = await connect(server);
+      const book = new ClientBook();
+      const read = async () => {
+        const message = await client.next();
+        if (book.apply(message)) {
+          client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+        }
+        return message;
+      };
+      client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+      await read();
+      await read();
+
+      await exchange.placeOrder(market, limit(seller, "sell", "70000", "0.1"));
+      await expect(read()).resolves.toMatchObject({ sequence: 1 });
+
+      // Redis drops; the next command's publish is refused and lost.
+      proxy.cut();
+      await expect.poll(() => publisher.isReady).toBe(false);
+      await exchange.placeOrder(market, limit(seller, "sell", "70100", "0.2"));
+      await proxy.restore();
+      await expect.poll(() => publisher.isReady, { timeout: 3000 }).toBe(true);
+
+      // Sequence 3 arrives when the client expects 2: it resubscribes and takes the snapshot.
+      await exchange.placeOrder(market, limit(seller, "sell", "70200", "0.3"));
+      await expect(read()).resolves.toMatchObject({ firstSequence: 3, sequence: 3 });
+      await expect(read()).resolves.toMatchObject({ type: "subscribed" });
+      await expect(read()).resolves.toMatchObject({ type: "book", sequence: 3 });
+
+      expect(book.gaps).toBe(1);
+      const rest = await server.inject({ method: "GET", url: "/markets/BTC-USD/book" });
+      expect(book.asks()).toEqual(rest.json<{ asks: unknown[] }>().asks);
+      expect(book.asks()).toHaveLength(3);
+      client.close();
+    } finally {
+      await server.close();
+      proxy.cut();
+      publisher.destroy();
+    }
   });
 });
