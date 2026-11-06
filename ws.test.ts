@@ -273,3 +273,42 @@ describe("the book channel", () => {
     client.close();
   });
 });
+
+describe("the trades channel", () => {
+  const { exchange, server } = freshServer();
+
+  it("sends each trade with its sequence and the taker's side, naming no user or order", async () => {
+    const market = await btcUsd();
+    const buyer = await funded({ USD: "100000" });
+    const seller = await funded({ BTC: "1" });
+    const client = await connect(server);
+    client.send({ op: "subscribe", channel: "trades", market: "BTC-USD" });
+    await client.next();
+
+    const bids = [
+      await exchange.placeOrder(market, limit(buyer, "buy", "60100", "0.1")),
+      await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1")),
+    ];
+    // One sell sweeps both bids: two trades, best price first.
+    const sell = await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.15"));
+
+    const trades = [await client.next(), await client.next()];
+    expect(trades).toEqual([
+      {
+        type: "trade",
+        market: "BTC-USD",
+        sequence: 3,
+        price: "60100.00000000",
+        quantity: "0.10000000",
+        takerSide: "sell",
+        time: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) as unknown,
+      },
+      expect.objectContaining({ sequence: 4, price: "60000.00000000", quantity: "0.05000000" }),
+    ]);
+    const sent = JSON.stringify(trades);
+    for (const id of [buyer, seller, sell.id, ...bids.map((bid) => bid.id)]) {
+      expect(sent).not.toContain(id);
+    }
+    client.close();
+  });
+});

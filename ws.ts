@@ -53,6 +53,15 @@ export type ServerMessage =
       sequence: number;
       // The new total at each level the command changed; "0" removes the level.
       changes: (Level & { side: Side })[];
+    }
+  | {
+      type: "trade";
+      market: string;
+      sequence: number;
+      price: string;
+      quantity: string;
+      takerSide: Side;
+      time: string;
     };
 
 // Every level, best first. The book is in memory and bounded by what users rest, so a full
@@ -72,6 +81,26 @@ function bookSnapshot(exchange: Exchange, market: Market): ServerMessage {
     bids: bids.map(level),
     asks: asks.map(level),
   };
+}
+
+// One message per trade, in sequence order. Trades are not every sequence number, so this
+// channel cannot show a gap; the book channel is where a client checks continuity.
+export function tradeMessages({ market, events, settledAt }: MarketUpdate): ServerMessage[] {
+  return events.flatMap((event) =>
+    event.type === "trade"
+      ? [
+          {
+            type: "trade" as const,
+            market: market.symbol,
+            sequence: event.sequence,
+            price: formatAmount(event.price, market.quoteScale),
+            quantity: formatAmount(event.quantity, market.baseScale),
+            takerSide: event.takerSide,
+            time: settledAt.toISOString(),
+          },
+        ]
+      : [],
+  );
 }
 
 export function bookUpdate({
@@ -185,6 +214,9 @@ export function registerWebSocketRoutes(
 
   const stopListening = exchange.onUpdate((update) => {
     hub.publish(topicOf("book", update.market.symbol), bookUpdate(update));
+    for (const trade of tradeMessages(update)) {
+      hub.publish(topicOf("trades", update.market.symbol), trade);
+    }
   });
   app.addHook("onClose", (_instance, done) => {
     stopListening();

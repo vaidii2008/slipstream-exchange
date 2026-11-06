@@ -94,6 +94,8 @@ export type MarketUpdate = {
   firstSequence: number;
   sequence: number;
   events: EngineEvent[];
+  // When the settlement committed: the time a trade happened, as far as anyone outside sees.
+  settledAt: Date;
   // Each price level the command changed, with the total now resting there (0: gone).
   levels: { side: Side; price: bigint; quantity: bigint }[];
 };
@@ -280,6 +282,7 @@ export class Exchange {
       firstSequence: first.sequence,
       sequence: last.sequence,
       events,
+      settledAt: new Date(),
       levels: levelsTouched(events).map(({ side, price }) => ({
         side,
         price,
