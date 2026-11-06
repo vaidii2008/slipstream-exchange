@@ -412,3 +412,56 @@ the client pays a snapshot to recover instead of the exchange paying an unbounde
 the gap test a real publish is lost while the connection is cut; the client counts exactly
 one gap, resyncs at sequence 3, and ends with the same three ask levels the REST endpoint
 reports.
+
+## Trading terminal
+
+### The terminal calls the API directly across origins, not through a Next.js proxy
+
+- **Decision:** the web app on port 3001 calls the API on 3000 with `credentials: "include"`.
+  `@fastify/cors` allows exactly one origin, `WEB_ORIGIN`, with credentials.
+- **Alternative:** proxy the API through Next.js rewrites under `/api`, which avoids CORS.
+- **Why:** the refresh cookie has `Path=/session`, so the browser would never send it to
+  `/api/session/refresh` and silent refresh would fail. A wildcard origin is not possible
+  either, since browsers refuse credentials with `*`.
+- **Where:** the `cors` registration in `server.ts`; `WEB_ORIGIN` in `config.ts`.
+
+### The access token lives in memory, and refreshes never race
+
+- **Decision:** the access token is a module variable, never in localStorage. A reload trades
+  the httpOnly refresh cookie for a new one. Within a tab, concurrent callers share one
+  in-flight refresh; across tabs, refreshes take turns under a Web Lock.
+- **Alternative:** localStorage (any injected script can read it), or refresh without
+  coordination.
+- **Why:** the API rotates the refresh token and revokes the whole family when one is used
+  twice. Two refreshes that send the same cookie would log the user out everywhere.
+- **Where:** `refreshAccessToken` and `acrossTabs` in `web/lib/session.ts`.
+
+### The socket resubscribes to what the page wants, on every connection
+
+- **Decision:** the client keeps a reference-counted set of wanted topics. Each connection
+  authenticates and subscribes to all of them; drops retry with exponential backoff and
+  jitter, capped at 10 s. Close code 4001 refreshes the token and reconnects at once.
+- **Alternative:** track what the server confirmed and replay only the difference.
+- **Why:** one path for the first connection and every reconnect, and a book subscription
+  always brings a fresh snapshot, so a reconnect is also a resync. The jitter stops every
+  tab from reconnecting in the same instant after an API restart.
+- **Where:** `MarketSocket` in `web/lib/socket.ts`.
+
+### Book rows re-render alone: the price list changes identity only when levels change
+
+- **Decision:** the book store keeps the sorted prices per side apart from a quantity map
+  keyed by side and price. The book component reads only the price lists; each memoised row
+  reads its own quantity.
+- **Alternative:** keep the book as one array of levels and render it from the top.
+- **Why:** most updates change the size at an existing price. In a browser check, changing
+  the size at one level rendered that one row and not the book component.
+- **Where:** `applyUpdate` in `web/lib/book.ts`; `Row` in `web/components/order-book.tsx`.
+
+### A draft order keeps its client order id until it changes
+
+- **Decision:** the form creates a client order id per draft. A failed submit keeps it; an
+  edit or a placed order replaces it.
+- **Alternative:** a new id per click, or none.
+- **Why:** after a timeout the trader cannot know whether the order landed. Resubmitting the
+  same id makes the API return the first order instead of placing a second.
+- **Where:** `edit` and the mutation in `web/components/order-form.tsx`.
