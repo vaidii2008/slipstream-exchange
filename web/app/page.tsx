@@ -1,5 +1,6 @@
 import { ConnectionStatus } from "@/components/connection-status";
 import { SessionMenu } from "@/components/session-menu";
+import { Terminal } from "@/components/terminal";
 
 export default function Home() {
   return (
@@ -11,6 +12,7 @@ export default function Home() {
         </div>
         <SessionMenu />
       </header>
+      <Terminal />
     </div>
   );
 }
