@@ -1,8 +1,8 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { createClient } from "redis";
 import { parseConfig } from "./config.ts";
 import { Exchange } from "./exchange.ts";
+import { createRedisClient } from "./redis.ts";
 import { buildServer } from "./server.ts";
 import { createAccessTokens } from "./tokens.ts";
 
@@ -13,21 +13,6 @@ async function verifyPostgres(pool: Pool): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`postgres is unreachable: ${reason}`, { cause: error });
   }
-}
-
-function createRedisClient(url: string) {
-  let hasConnected = false;
-  const client = createClient({
-    url,
-    socket: {
-      connectTimeout: 5000,
-      reconnectStrategy: (retries, cause) => (hasConnected ? Math.min(retries * 200, 2000) : cause),
-    },
-  });
-  client.on("ready", () => {
-    hasConnected = true;
-  });
-  return client;
 }
 
 async function verifyRedis(redis: ReturnType<typeof createRedisClient>): Promise<void> {

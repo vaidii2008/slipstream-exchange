@@ -17,7 +17,8 @@ import {
   OrderError,
   type OrderErrorCode,
 } from "./orders.ts";
-import { hitFixedWindow, type RateLimit, type RedisClient } from "./ratelimit.ts";
+import { hitFixedWindow, type RateLimit } from "./ratelimit.ts";
+import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 

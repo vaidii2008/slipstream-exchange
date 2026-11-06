@@ -7,9 +7,7 @@
 // cost of more Redis work per hit; here the limit is a brake on a runaway client, and the
 // per-market queue cap stops overload whatever the limiter lets through.
 
-import type { RedisClientType } from "redis";
-
-export type RedisClient = RedisClientType;
+import type { RedisClient } from "./redis.ts";
 
 export type RateLimit = { limit: number; windowMs: number };
 
