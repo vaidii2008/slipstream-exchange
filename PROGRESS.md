@@ -1215,9 +1215,8 @@ to it, the account channel is the piece to split out.
   React testing library, which is not on the approved list. The merge rules they rely on are
   unit tested.
 - Carried over: no separate test database, drizzle-kit's dev-only audit findings, the
-  generated web dependencies' moderate audit findings, Safari unchecked, the CI workflow has
-  still not run on GitHub. This session added `s8-*@example.com` users and BTC-USD orders to
-  the dev database.
+  generated web dependencies' moderate audit findings, Safari unchecked. This session added
+  `s8-*@example.com` users and BTC-USD orders to the dev database.
 
 **Decisions and deviations from the plan**
 
@@ -1237,6 +1236,78 @@ to it, the account channel is the piece to split out.
 **Next: Day 13 — Trading bots**
 
 - Click through balances, open orders, cancel, history and fills in a browser.
+- `feat(bots): add an agent runner with lifecycle and per-agent accounts`
+- `feat(bots): add a noise trader`
+- `feat(bots): add a market maker that skews quotes by inventory`
+- `feat(bots): enforce per-agent risk limits with a kill switch`
+- `feat(bots): seed and start the default fleet with one command`
+
+## Day 12b — Candles
+
+**Commits landed (7)**
+
+- `test(engine): give the property tests a 30 second timeout`
+- `fix(settlement): stamp each trade with the time the feed reports`
+- `feat(market): aggregate trades into one-minute OHLCV candles`
+- `feat(api): serve candles and stream live candle updates`
+- `feat(web): draw a candlestick chart with lightweight-charts`
+- `docs: record the candle decisions`
+- `docs: record day 12b in PROGRESS.md`
+
+**What now works**
+
+- `GET /markets/:symbol/candles?limit=&before=`: one-minute candles (open, high, low, close,
+  volume, trade count), oldest first, computed from `trades` on each request. `before` pages
+  back. Prices at the quote scale, volume at the base scale.
+- A `candles` socket channel per market. After each command that trades, the process that
+  settled it sends the whole candle in progress. At boot it loads the latest candle from
+  Postgres, so a restart mid-minute carries on that candle.
+- A trade's stored `created_at` is now the same time the feed reports. Before, the two
+  differed by a few milliseconds, which could put one trade in different candles live and
+  after a reload.
+- A candlestick chart above the book in the terminal: history from REST, live candles from
+  the socket, the copy with more trades kept. The last bar updates in place; the chart
+  redraws only when an earlier bar changes (first load, refetch after a reconnect).
+- Checked against the running API by script: a fill of 0.1 at 70,000 and 0.05 at 70,500
+  sent two candle messages for the minute (1 trade, then 2), and REST returned the same
+  candle as the second. After restarting the API in the same minute, one more fill at
+  71,000 sent a candle with 3 trades and volume 0.25, matching REST.
+- The engine property tests have a 30 s timeout.
+- CI: every push so far has passed (latest 1ca4a3b).
+- 376 tests in 28 files, up from 356 in 26.
+
+**What is stubbed**
+
+- The chart was not clicked through in a browser; the web app built and served the page
+  (HTTP 200) and the data paths were checked by script.
+- No paging back past the latest 500 candles in the chart; the API supports `before`.
+- No index on `trades (market, created_at)`: each history read scans the market's trades.
+  Adding one is a migration, so it is a proposal for when the bots make it slow.
+- Minutes with no trades have no candle; the chart leaves a gap.
+- Chart colours are read once when it is created, so switching theme needs a reload.
+- Carried over: no separate test database, drizzle-kit's dev-only audit findings, the
+  generated web dependencies' moderate audit findings (13 before and after adding
+  `lightweight-charts`), Safari unchecked, the click-through from Day 12. This session added
+  `s8b-*@example.com` users and BTC-USD trades to the dev database.
+
+**Decisions and deviations from the plan**
+
+- Candles are back. The 6 November note cut them unconditionally, but the plan's own
+  checkpoint only cuts them if Session 9 is not done by the end of 8 November. Grafana and
+  snapshots stay cut.
+- Added the trade-time fix, which the plan did not list. Candles exposed the mismatch.
+
+**Repo shape**
+
+- `candles.ts`: the candle fold, the SQL aggregation and the live candle per market.
+  Pressure: two consumers (the REST route in `market.ts` and the feed in `feed.ts`) and its
+  own unit tests.
+- `web/lib/candles.ts`, `web/components/candle-chart.tsx`.
+
+**Next: Day 13 — Trading bots**
+
+- Click through the terminal in a browser: balances, open orders, cancel, history, fills and
+  the chart.
 - `feat(bots): add an agent runner with lifecycle and per-agent accounts`
 - `feat(bots): add a noise trader`
 - `feat(bots): add a market maker that skews quotes by inventory`
