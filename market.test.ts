@@ -167,3 +167,31 @@ describe("market data requests", () => {
     expect(response.statusCode).toBe(400);
   });
 });
+
+describe("GET /markets", () => {
+  it("lists every market with its tick, step and minimum at the asset's scale", async () => {
+    const response = await app.inject({ method: "GET", url: "/markets" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<unknown>()).toEqual({
+      markets: [
+        {
+          symbol: "BTC-USD",
+          baseAsset: "BTC",
+          quoteAsset: "USD",
+          tickSize: "0.01000000",
+          quantityStep: "0.00010000",
+          minQuantity: "0.00010000",
+        },
+        {
+          symbol: "ETH-USD",
+          baseAsset: "ETH",
+          quoteAsset: "USD",
+          tickSize: "0.01000000",
+          quantityStep: "0.00100000",
+          minQuantity: "0.00100000",
+        },
+      ],
+    });
+  });
+});

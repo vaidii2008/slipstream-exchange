@@ -11,7 +11,7 @@ import type { DepthLevel } from "./book.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric } from "./money.ts";
-import { loadMarket, type Market } from "./orders.ts";
+import { loadMarket, loadMarkets, type Market } from "./orders.ts";
 import { orders, trades } from "./schema.ts";
 
 export type MarketDataDependencies = {
@@ -59,6 +59,22 @@ export function registerMarketDataRoutes(
 ) {
   // A path parameter is always a string; one that names no market is a 404.
   type ByMarket = { Params: { symbol: string } };
+
+  // What a client needs to build a valid order and show amounts at the market's precision.
+  app.get("/markets", async (_request, reply) => {
+    const listed = [...(await loadMarkets(db)).values()];
+    listed.sort((a, b) => a.symbol.localeCompare(b.symbol));
+    return reply.code(200).send({
+      markets: listed.map((market) => ({
+        symbol: market.symbol,
+        baseAsset: market.baseAsset,
+        quoteAsset: market.quoteAsset,
+        tickSize: formatAmount(market.tickSize, market.quoteScale),
+        quantityStep: formatAmount(market.quantityStep, market.baseScale),
+        minQuantity: formatAmount(market.minQuantity, market.baseScale),
+      })),
+    });
+  });
 
   app.get<ByMarket>("/markets/:symbol/book", async (request, reply) => {
     const market = await loadMarket(db, request.params.symbol);
