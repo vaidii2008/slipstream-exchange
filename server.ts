@@ -12,6 +12,7 @@ import type { RedisClient } from "./redis.ts";
 import { registerSessionRoutes } from "./sessions.ts";
 import { registerTradingRoutes } from "./trading.ts";
 import { registerWalletRoutes } from "./wallet.ts";
+import { registerWebSocketRoutes } from "./ws.ts";
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
 
@@ -113,6 +114,7 @@ export function buildServer(
   registerWalletRoutes(app, { db, tokens });
   registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
   registerMarketDataRoutes(app, { db, exchange });
+  registerWebSocketRoutes(app, { db });
 
   return app;
 }
