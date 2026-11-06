@@ -8,6 +8,11 @@
 // A dropped connection is retried with exponential backoff and jitter, so a restarted API is
 // not hit by every open tab in the same instant. Close code 4001 means the access token
 // expired; the client refreshes it first and reconnects at once.
+//
+// The account channel waits for the server's "authenticated" reply. Sending auth then
+// subscribe back to back works on a fresh connection, but a user who logs in while the
+// socket is open authenticates asynchronously, and a subscribe that overtakes the auth is
+// refused with nothing to retry it. The reply is the one signal that cannot arrive early.
 
 import { useEffect } from "react";
 import { create } from "zustand";
@@ -54,6 +59,8 @@ export class MarketSocket {
   // True once the current connection has sent its auth and subscriptions. Until then a new
   // subscription is only remembered, and goes out with the rest.
   #ready = false;
+  // True once the server has accepted this connection's token.
+  #authenticated = false;
   #failures = 0;
   #retry: ReturnType<typeof setTimeout> | undefined;
   #stopSession: (() => void) | undefined;
@@ -133,13 +140,18 @@ export class MarketSocket {
   }
 
   #sendIfReady(message: ClientMessage): void {
-    if (this.#ready) {
-      this.#send(message);
+    if (!this.#ready) {
+      return;
     }
+    if (message.op !== "auth" && message.channel === "account" && !this.#authenticated) {
+      return;
+    }
+    this.#send(message);
   }
 
   #connect(): void {
     useConnection.setState({ status: this.#failures === 0 ? "connecting" : "reconnecting" });
+    this.#authenticated = false;
     const socket = this.#createSocket(this.#url);
     this.#socket = socket;
 
@@ -181,9 +193,11 @@ export class MarketSocket {
         this.#send({ op: "auth", token });
       }
     }
-    // The server handles one connection's messages in order, so these follow the auth.
+    // Public channels need no auth. The account channel follows the "authenticated" reply.
     for (const { topic } of this.#wanted.values()) {
-      this.#send({ op: "subscribe", ...topic });
+      if (topic.channel !== "account") {
+        this.#send({ op: "subscribe", ...topic });
+      }
     }
     this.#ready = true;
     this.#failures = 0;
@@ -209,6 +223,13 @@ export class MarketSocket {
     }
     if (message.type === "trade") {
       useTrades.getState().receive(message);
+    }
+    // A refreshed token is accepted again on the same connection; subscribe only the first time.
+    if (message.type === "authenticated" && !this.#authenticated) {
+      this.#authenticated = true;
+      if (this.#wanted.has("account")) {
+        this.#send({ op: "subscribe", channel: "account" });
+      }
     }
     // The token in memory had expired before the server checked it; get a new one and retry.
     if (message.type === "error" && message.error === "token_expired") {

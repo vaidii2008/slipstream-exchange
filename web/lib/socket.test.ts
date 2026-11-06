@@ -199,14 +199,42 @@ describe("market socket", () => {
     expect(useTrades.getState().live).toEqual({});
   });
 
-  it("authenticates before subscribing when signed in", async () => {
+  it("subscribes to the account channel only after the server accepts the token", async () => {
     useSession.setState({ status: "signed_in" });
     session.current.mockResolvedValue("token-1");
     socket.start();
     socket.subscribe({ channel: "account" });
+    socket.subscribe({ channel: "book", market: "BTC-USD" });
 
     latest().open();
     await vi.runAllTimersAsync();
+
+    expect(latest().sent).toEqual([
+      { op: "auth", token: "token-1" },
+      { op: "subscribe", channel: "book", market: "BTC-USD" },
+    ]);
+
+    latest().receive({ type: "authenticated", expiresAt: "2026-11-06T00:15:00.000Z" });
+
+    expect(latest().sent.at(-1)).toEqual({ op: "subscribe", channel: "account" });
+  });
+
+  it("holds an account subscription made after logging in until the auth is accepted", async () => {
+    socket.start();
+    latest().open();
+    await vi.runAllTimersAsync();
+
+    // Logging in while connected: the auth goes out asynchronously, and the component that
+    // wants balances subscribes as soon as it renders, possibly first.
+    session.current.mockResolvedValue("token-1");
+    useSession.setState({ status: "signed_in" });
+    socket.subscribe({ channel: "account" });
+    await vi.runAllTimersAsync();
+
+    expect(latest().sent).toEqual([{ op: "auth", token: "token-1" }]);
+
+    latest().receive({ type: "authenticated", expiresAt: "2026-11-06T00:15:00.000Z" });
+    latest().receive({ type: "authenticated", expiresAt: "2026-11-06T00:30:00.000Z" });
 
     expect(latest().sent).toEqual([
       { op: "auth", token: "token-1" },
