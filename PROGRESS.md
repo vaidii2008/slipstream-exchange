@@ -1164,3 +1164,81 @@ to it, the account channel is the piece to split out.
 - `feat(web): draw a candlestick chart with lightweight-charts`
 - `feat(web): show available and reserved balances`
 - `feat(web): show open orders with cancel, order history and fills`
+
+## Day 12 — Trading terminal, part 2
+
+**Commits landed (7)**
+
+- `fix(web): subscribe to the account channel only once the socket is authenticated`
+- `feat(web): show available and reserved balances`
+- `feat(web): show open orders with cancel`
+- `refactor(web): move reading orders back into history.ts`
+- `feat(web): show order history and fills`
+- `docs: record the account channel and order merge decisions`
+- `docs: record day 12 in PROGRESS.md`
+
+**What now works**
+
+- Balances panel above the order form: available and in-orders per asset, at the asset's
+  full scale, live from the account channel. The sheet with the highest version wins, so a
+  late, older read never replaces a newer one. Signing out clears it.
+- The account subscription now goes out only after the server's `authenticated` reply.
+  Before, logging in while the socket was open could send the subscribe ahead of the auth,
+  and the server refused it with nothing to retry.
+- Open orders, all markets, with a cancel button per row. REST list plus order events,
+  merged so an order only moves forward: the later status and the larger filled quantity
+  win, whatever order they arrive in. A cancel removes the row when the API answers; "already
+  closed", busy and halted are shown on the row. The list refetches when an order it has not
+  seen appears and after a reconnect.
+- Order history (filled and cancelled) and fills (price, quantity, maker or taker) in tabs
+  next to open orders. Each refetches after any order event or reconnect, only while shown.
+- Every private query is keyed under `account` and dropped on sign out, so the next user on
+  the tab never sees the last one's orders.
+- Checked against the running API with a script that does what the terminal does: two users,
+  a partial fill of 0.2 of a 0.5 BTC sell at 90,000, then a cancel of a 0.1 BTC buy at 10.
+  Open orders, history and fills listed the right rows; the socket sent `authenticated`, the
+  balance sheet, the order's `cancelled` event, then a newer sheet with the 1 USD reservation
+  released.
+- 356 tests in 26 files, up from 343 in 25.
+
+**What is stubbed**
+
+- Not checked in a browser this session: no browser tool could reach the local dev servers.
+  The panels compile, the gate builds them, and the API paths they call were checked by
+  script. A click-through is the first thing to do next session.
+- Candles (chart, API and aggregation) are cut under the 6 Nov rule and sit at the end of the
+  stretch list.
+- Open orders show at most 500, history and fills the latest 100; no paging.
+- The `["me"]` query is not under the `account` key, so after switching users the old email
+  can show until it refetches.
+- No hook tests for the refetch triggers in `web/lib/history.ts`: testing hooks would need a
+  React testing library, which is not on the approved list. The merge rules they rely on are
+  unit tested.
+- Carried over: no separate test database, drizzle-kit's dev-only audit findings, the
+  generated web dependencies' moderate audit findings, Safari unchecked, the CI workflow has
+  still not run on GitHub. This session added `s8-*@example.com` users and BTC-USD orders to
+  the dev database.
+
+**Decisions and deviations from the plan**
+
+- Candles skipped under the cut rule applied on 6 November.
+- The plan's last bullet ("open orders with cancel, order history and fills") became two
+  commits, plus the socket fix that the balances panel exposed.
+
+**Repo shape**
+
+- `web/lib/account.ts`: the account channel's state (balances, order updates), for a third
+  data stream next to `book.ts` and `trades.ts`.
+- `web/lib/history.ts`: listing, cancelling and refetching the user's orders and fills, out
+  of `orders.ts`, which keeps only placing. Pressure: `orders.ts` would pass 200 lines with
+  two reasons to change.
+- `web/components/balances.tsx`, `open-orders.tsx`, `history.tsx`.
+
+**Next: Day 13 — Trading bots**
+
+- Click through balances, open orders, cancel, history and fills in a browser.
+- `feat(bots): add an agent runner with lifecycle and per-agent accounts`
+- `feat(bots): add a noise trader`
+- `feat(bots): add a market maker that skews quotes by inventory`
+- `feat(bots): enforce per-agent risk limits with a kill switch`
+- `feat(bots): seed and start the default fleet with one command`
