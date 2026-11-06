@@ -6,8 +6,15 @@ import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
-import { formatAmount, parseAmount } from "./money.ts";
-import { loadMarket, OrderError, type OrderErrorCode } from "./orders.ts";
+import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
+import {
+  findOrder,
+  loadMarket,
+  type Market,
+  OrderError,
+  type OrderErrorCode,
+  type OrderRow,
+} from "./orders.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 
@@ -39,6 +46,33 @@ const GRID_ERRORS: Record<
   quantity_below_minimum: ["quantity", "is below the market's minimum quantity"],
   quantity_off_step: ["quantity", "must be a multiple of the market's quantity step"],
 };
+
+const orderParams = z.object({ id: z.uuid() });
+
+// Postgres pads NUMERIC to 18 decimals; clients see the asset's own scale, as on placement.
+function orderJson(row: OrderRow, market: Market) {
+  const rescale = (value: string, scale: number) => formatAmount(fromNumeric(value, scale), scale);
+  return {
+    id: row.id,
+    market: row.market,
+    side: row.side,
+    type: row.type,
+    price: row.price === null ? null : rescale(row.price, market.quoteScale),
+    quantity: rescale(row.quantity, market.baseScale),
+    filledQuantity: rescale(row.filledQuantity, market.baseScale),
+    status: row.status,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+async function marketOf(db: Database, row: OrderRow): Promise<Market> {
+  const market = await loadMarket(db, row.market);
+  if (market === undefined) {
+    throw new Error(`order ${row.id} is in market ${row.market}, which is not listed`);
+  }
+  return market;
+}
 
 export function registerTradingRoutes(
   app: FastifyInstance,
@@ -107,5 +141,33 @@ export function registerTradingRoutes(
         quantity: base(fill.quantity),
       })),
     });
+  });
+  app.delete("/orders/:id", { onRequest: authenticate }, async (request, reply) => {
+    const userId = authenticatedUserId(request);
+
+    const parsed = orderParams.safeParse(request.params);
+    if (!parsed.success) {
+      return reply.code(400).send(invalidRequest(parsed.error));
+    }
+
+    const order = await findOrder(db, userId, parsed.data.id);
+    if (order === undefined) {
+      return reply.code(404).send({ error: "not_found" });
+    }
+    const market = await marketOf(db, order);
+
+    const outcome = await exchange.cancelOrder(market, order.id);
+    // Read back after the queue has run the cancel, so the status and filled quantity are
+    // what settlement wrote, including any fill that landed just before.
+    const current = await findOrder(db, userId, order.id);
+    if (current === undefined) {
+      throw new Error(`order ${order.id} disappeared while being cancelled`);
+    }
+    if (outcome === "not_open") {
+      return reply
+        .code(409)
+        .send({ error: "order_not_open", message: `order is ${current.status}` });
+    }
+    return reply.code(200).send(orderJson(current, market));
   });
 }

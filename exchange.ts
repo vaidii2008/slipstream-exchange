@@ -72,8 +72,11 @@ async function fillPostings(
   accounts: Accounts,
   market: Market,
   trade: Trade,
-  takerLimit: bigint,
+  takerLimit: bigint | null,
 ): Promise<Posting[]> {
+  if (takerLimit === null) {
+    throw new Error(`trade ${trade.sequence} settled without the taker's limit`);
+  }
   const buyer = trade.takerSide === "buy" ? trade.takerUserId : trade.makerUserId;
   const seller = trade.takerSide === "buy" ? trade.makerUserId : trade.takerUserId;
   const buyerLimit = trade.takerSide === "buy" ? takerLimit : trade.price;
@@ -102,9 +105,13 @@ async function fillPostings(
 function cancelledReservation(
   market: Market,
   event: Extract<EngineEvent, { type: "cancelled" }>,
-  takerLimit: bigint,
+  takerLimit: bigint | null,
 ) {
-  return reservationFor(market, event.side, event.price ?? takerLimit, event.quantity);
+  const price = event.price ?? takerLimit;
+  if (price === null) {
+    throw new Error(`cancelled order ${event.orderId} has no price to release at`);
+  }
+  return reservationFor(market, event.side, price, event.quantity);
 }
 
 async function applyFill(
@@ -149,12 +156,12 @@ async function setStatus(
 // Writes everything one engine command did, in one transaction: a trade row and a ledger
 // transaction per fill, each order's filled quantity and status, and the release of whatever
 // a cancelled remainder had reserved. `takerLimit` is the incoming order's worst price: its
-// limit, or a market order's protection price.
+// limit, or a market order's protection price. Null for a cancel, which has no incoming order.
 export async function settle(
   db: Database,
   market: Market,
   events: EngineEvent[],
-  takerLimit: bigint,
+  takerLimit: bigint | null,
 ): Promise<void> {
   await db.transaction(async (tx) => {
     const accounts = new Accounts(tx);
@@ -266,6 +273,19 @@ export class Exchange {
       const events = engine.submit({ ...accepted, id });
       await settle(this.#db, market, events, worstPrice(accepted));
       return summarize(id, events);
+    });
+  }
+
+  // Takes a resting order off the book and releases what its unfilled quantity had reserved.
+  // Queued behind every command already waiting, so an order still pending is matched first
+  // and the cancel then finds it resting, filled or gone. Ownership is the caller's check.
+  async cancelOrder(market: Market, orderId: string): Promise<"cancelled" | "not_open"> {
+    const { engine, queue } = this.#market(market.symbol);
+
+    return queue.run(async () => {
+      const events = engine.cancel(orderId);
+      await settle(this.#db, market, events, null);
+      return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
     });
   }
 

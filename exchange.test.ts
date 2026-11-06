@@ -346,6 +346,41 @@ describe("Exchange.placeOrder", () => {
     });
   });
 
+  it("cancels a partly filled buy and releases only its unfilled quantity at its limit", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "0.1" });
+    const buyer = await funded({ USD: "30000" });
+    const buy = await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.1"));
+
+    await expect(exchange.cancelOrder(btcUsd, buy.id)).resolves.toBe("cancelled");
+
+    // 0.1 filled for 6,000; the other 0.4 × 60,000 = 24,000 comes back.
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: units("24000"),
+      reserved: 0n,
+    });
+    await expect(orderRow(buy.id)).resolves.toMatchObject({
+      status: "cancelled",
+      filledQuantity: "0.100000000000000000",
+    });
+  });
+
+  it("reports an order that is no longer on the book as not open and changes nothing", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "0.1" });
+    const buyer = await funded({ USD: "6000" });
+    const sell = await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.1"));
+    await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.1"));
+
+    await expect(exchange.cancelOrder(btcUsd, sell.id)).resolves.toBe("not_open");
+    await expect(orderRow(sell.id)).resolves.toMatchObject({ status: "filled" });
+    await expect(balanceOf(seller, "USD")).resolves.toEqual({
+      available: units("6000"),
+      reserved: 0n,
+    });
+  });
+
   // Each round, one taker sweeps both buyers' bids in BTC-USD while another sweeps them in
   // ETH-USD in the opposite order, so the two settlements debit the same two USD reserved
   // accounts in opposite fill order at the same time.

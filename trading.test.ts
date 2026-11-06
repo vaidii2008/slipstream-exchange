@@ -146,6 +146,82 @@ describe("POST /orders", () => {
   });
 });
 
+describe("DELETE /orders/:id", () => {
+  function cancel(authorization: string, id: string) {
+    return sharedApp.inject({ method: "DELETE", url: `/orders/${id}`, headers: { authorization } });
+  }
+
+  async function restingBuy(authorization: string): Promise<string> {
+    await fund(authorization, "USD", "1000");
+    // Far below any ask another test could rest, so it never fills.
+    const response = await postOrder(authorization, { ...aBuy, price: "100", quantity: "1" });
+    expect(response.json<unknown>()).toMatchObject({ status: "open" });
+    return response.json<{ id: string }>().id;
+  }
+
+  it("cancels the caller's open order and returns its reservation", async () => {
+    const authorization = await signedInUser();
+    const id = await restingBuy(authorization);
+
+    const response = await cancel(authorization, id);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<unknown>()).toMatchObject({
+      id,
+      type: "limit",
+      price: "100.00000000",
+      quantity: "1.00000000",
+      filledQuantity: "0.00000000",
+      status: "cancelled",
+    });
+    const balances = await sharedApp.inject({
+      method: "GET",
+      url: "/balances",
+      headers: { authorization },
+    });
+    expect(balances.json<{ balances: unknown[] }>().balances).toContainEqual({
+      asset: "USD",
+      available: "1000.00000000",
+      reserved: "0.00000000",
+    });
+  });
+
+  it("answers 409 for an order that is already cancelled", async () => {
+    const authorization = await signedInUser();
+    const id = await restingBuy(authorization);
+    await cancel(authorization, id);
+
+    const response = await cancel(authorization, id);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json<unknown>()).toEqual({
+      error: "order_not_open",
+      message: "order is cancelled",
+    });
+  });
+
+  it("answers 404 for another user's order, exactly as for one that does not exist", async () => {
+    const owner = await signedInUser();
+    const id = await restingBuy(owner);
+    const stranger = await signedInUser();
+
+    const theirs = await cancel(stranger, id);
+    const missing = await cancel(stranger, "00000000-0000-4000-8000-000000000000");
+
+    expect(theirs.statusCode).toBe(404);
+    expect(theirs.json<unknown>()).toEqual(missing.json<unknown>());
+    await expect(cancel(owner, id)).resolves.toMatchObject({ statusCode: 200 });
+  });
+
+  it("rejects an id that is not a uuid with 400", async () => {
+    const authorization = await signedInUser();
+
+    const response = await cancel(authorization, "42");
+
+    expect(response.statusCode).toBe(400);
+  });
+});
+
 describe("POST /orders with a market order", () => {
   const app = buildServer({
     pool,
