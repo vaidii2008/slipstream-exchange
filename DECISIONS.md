@@ -489,3 +489,41 @@ reports.
   answer in any arrival order and needs no API change. A unit test reduces the same reports
   forwards and backwards and gets one answer.
 - **Where:** `furthest` in `web/lib/account.ts`; `useOpenOrders` in `web/lib/history.ts`.
+
+## Candles
+
+### Candles are computed from trades, never stored
+
+- **Decision:** history is one `GROUP BY` minute over `trades` (`date_bin`, with open and
+  close picked by trade id). The candle in progress is kept in memory by the process that
+  settles the market, folded one trade at a time, and loaded from Postgres at boot.
+- **Alternative:** a `candles` table updated in the settlement transaction.
+- **Why:** a second copy of every trade has to be kept in step and migrated. No new table
+  means no data-model change. A test checks that the SQL gives the same candles as folding
+  the same trades one by one. The cost is a scan of the market's trades on each history
+  read, with no index on time yet.
+- **Where:** `loadCandles`, `addTrade` and `LiveCandles` in `candles.ts`.
+
+### A command's trades are stored at the time the feed reports
+
+- **Decision:** the exchange takes one timestamp per command before settling, writes it as
+  each trade's `created_at` and sends the same value on the feed.
+- **Alternative:** keep Postgres's `now()` default for stored trades and a separate time
+  taken after commit for the feed.
+- **Why:** the two clocks differed by milliseconds (9 ms in the failing test), so a trade
+  near a minute boundary could land in one candle live and in the next after a reload. One
+  time per command also means a command's trades never span two minutes.
+- **Where:** `#execute` in `exchange.ts`, `settle` in `settlement.ts`.
+
+### The live candle is sent whole, and the copy with more trades wins
+
+- **Decision:** after each command that trades, the server sends the whole candle in
+  progress. The terminal keeps whichever copy of a minute, from REST or from the socket,
+  has more trades.
+- **Alternative:** stream trades and let the terminal fold them into the REST candles,
+  dropping duplicates by engine sequence.
+- **Why:** sequences restart at 1 when the API restarts, so they cannot order copies across
+  a restart, and folding a trade twice double-counts its volume. A candle only ever gains
+  trades, so the count orders the copies in any arrival order. A restart mid-minute was
+  checked by hand: the next candle went from 2 trades to 3, not back to 1.
+- **Where:** `candleMessages` in `feed.ts`; `mergeCandles` in `web/lib/candles.ts`.
