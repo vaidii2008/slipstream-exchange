@@ -1,7 +1,7 @@
 // The matching engine: pure, synchronous, no I/O. Prices and quantities are bigint minor
 // units; the engine never needs to know the scale, only to compare and subtract them.
 
-import { type BookSnapshot, OrderBook, type Side } from "./book.ts";
+import { type BookSnapshot, type DepthLevel, OrderBook, type Side } from "./book.ts";
 
 export type LimitOrder = {
   type: "limit";
@@ -201,6 +201,11 @@ export class Engine {
 
   snapshot(): BookSnapshot {
     return this.#book.snapshot();
+  }
+
+  // The book aggregated by price level, with the sequence number it is current as of.
+  depth(limit: number): { sequence: number; bids: DepthLevel[]; asks: DepthLevel[] } {
+    return { sequence: this.#sequence, ...this.#book.depth(limit) };
   }
 
   // The best resting price on one side, undefined when that side is empty.

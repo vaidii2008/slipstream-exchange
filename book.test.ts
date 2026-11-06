@@ -151,3 +151,30 @@ describe("OrderBook.remove", () => {
     expect(shape(book.snapshot().bids)).toEqual([[99n, ["a"]]]);
   });
 });
+
+describe("OrderBook.depth", () => {
+  it("sums each price level, best first, and stops at the limit", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "buy", 100n, 2n));
+    book.rest(order("b", "buy", 100n, 3n));
+    book.rest(order("c", "buy", 99n, 1n));
+    book.rest(order("d", "buy", 98n, 1n));
+    book.rest(order("e", "sell", 102n, 4n));
+    book.rest(order("f", "sell", 101n, 1n));
+
+    expect(book.depth(2)).toEqual({
+      bids: [
+        { price: 100n, quantity: 5n },
+        { price: 99n, quantity: 1n },
+      ],
+      asks: [
+        { price: 101n, quantity: 1n },
+        { price: 102n, quantity: 4n },
+      ],
+    });
+  });
+
+  it("rejects a depth below one", () => {
+    expect(() => new OrderBook().depth(0)).toThrow(RangeError);
+  });
+});

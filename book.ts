@@ -19,6 +19,9 @@ type PriceLevel = {
   orders: RestingOrder[];
 };
 
+// One price level as the public sees it: how much rests there, not who rests it.
+export type DepthLevel = { price: bigint; quantity: bigint };
+
 export type BookSnapshot = {
   bids: { price: bigint; orders: RestingOrder[] }[];
   asks: { price: bigint; orders: RestingOrder[] }[];
@@ -117,6 +120,24 @@ export class OrderBook {
         orders: level.orders.map((order) => ({ ...order })),
       }));
     return { bids: copy(this.#bids), asks: copy(this.#asks) };
+  }
+
+  // The best `limit` levels on each side, best first, each summed to one quantity. Nothing
+  // about the orders inside a level comes out.
+  depth(limit: number): { bids: DepthLevel[]; asks: DepthLevel[] } {
+    if (!Number.isInteger(limit) || limit < 1) {
+      // slice(-0) would return every level.
+      throw new RangeError(`depth must be a positive integer, got ${limit}`);
+    }
+    const sum = (levels: PriceLevel[]) =>
+      levels
+        .slice(-limit)
+        .reverse()
+        .map((level) => ({
+          price: level.price,
+          quantity: level.orders.reduce((total, order) => total + order.remaining, 0n),
+        }));
+    return { bids: sum(this.#bids), asks: sum(this.#asks) };
   }
 
   #levels(side: Side): PriceLevel[] {

@@ -289,6 +289,11 @@ export class Exchange {
     });
   }
 
+  // The public view of a market's book. A market nobody has traded yet has an empty one.
+  depth(symbol: string, limit: number) {
+    return this.#market(symbol).engine.depth(limit);
+  }
+
   #market(symbol: string): { engine: Engine; queue: SerialQueue } {
     let market = this.#markets.get(symbol);
     if (market === undefined) {

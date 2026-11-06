@@ -6,6 +6,7 @@ import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
 import type { LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
+import { registerMarketDataRoutes } from "./market.ts";
 import { registerSessionRoutes } from "./sessions.ts";
 import { registerTradingRoutes } from "./trading.ts";
 import { registerWalletRoutes } from "./wallet.ts";
@@ -105,6 +106,7 @@ export function buildServer(
   registerSessionRoutes(app, { db, tokens });
   registerWalletRoutes(app, { db, tokens });
   registerTradingRoutes(app, { db, tokens, exchange });
+  registerMarketDataRoutes(app, { db, exchange });
 
   return app;
 }
