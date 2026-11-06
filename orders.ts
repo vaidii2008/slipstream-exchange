@@ -1,7 +1,7 @@
 // Accepting an order: checks it against its market's grid, reserves what it could spend and
 // records it, before the engine sees it. Matching and settlement live in exchange.ts.
 
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Side } from "./book.ts";
 import { type Database, LedgerError, reserve } from "./ledger.ts";
@@ -181,47 +181,4 @@ export async function recordOrder(
     }
     return { id: row.id };
   });
-}
-
-// An order as stored. Amounts are NUMERIC strings; the caller converts them at the market's
-// scales.
-export const orderColumns = {
-  id: orders.id,
-  market: orders.market,
-  side: orders.side,
-  type: orders.type,
-  price: orders.price,
-  quantity: orders.quantity,
-  filledQuantity: orders.filledQuantity,
-  status: orders.status,
-  createdAt: orders.createdAt,
-  updatedAt: orders.updatedAt,
-};
-
-export type OrderRow = {
-  id: string;
-  market: string;
-  side: Side;
-  type: "limit" | "market";
-  price: string | null;
-  quantity: string;
-  filledQuantity: string;
-  status: "pending" | "open" | "filled" | "cancelled";
-  createdAt: Date;
-  updatedAt: Date;
-};
-
-// Undefined when there is no such order or it belongs to someone else: the caller cannot
-// tell the two apart, so order ids reveal nothing about other users.
-export async function findOrder(
-  db: Database,
-  userId: string,
-  orderId: string,
-): Promise<OrderRow | undefined> {
-  const [row] = await db
-    .select(orderColumns)
-    .from(orders)
-    .where(and(eq(orders.id, orderId), eq(orders.userId, userId)))
-    .limit(1);
-  return row;
 }

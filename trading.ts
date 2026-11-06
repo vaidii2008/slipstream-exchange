@@ -7,14 +7,8 @@ import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
-import {
-  findOrder,
-  loadMarket,
-  type Market,
-  OrderError,
-  type OrderErrorCode,
-  type OrderRow,
-} from "./orders.ts";
+import { findOrder, type OrderRow } from "./history.ts";
+import { loadMarket, type Market, OrderError, type OrderErrorCode } from "./orders.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 
