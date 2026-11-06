@@ -7,6 +7,7 @@ import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
 import type { LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
 import { registerMarketDataRoutes } from "./market.ts";
+import type { RateLimit, RedisClient } from "./ratelimit.ts";
 import { registerSessionRoutes } from "./sessions.ts";
 import { registerTradingRoutes } from "./trading.ts";
 import { registerWalletRoutes } from "./wallet.ts";
@@ -17,13 +18,9 @@ type PostgresProbe = {
   query: (sql: string) => Promise<unknown>;
 };
 
-type RedisProbe = {
-  ping: () => Promise<unknown>;
-};
-
 export type ServerDependencies = AuthDependencies & {
   pool: PostgresProbe;
-  redis: RedisProbe;
+  redis: RedisClient;
   exchange: Exchange;
 };
 
@@ -53,11 +50,15 @@ async function probe(check: () => Promise<unknown>): Promise<"up" | "down"> {
 export type ServerOptions = {
   // Left unset in tests so the suite output stays readable.
   logLevel?: LogLevel;
+  // Per user, on POST /orders.
+  orderRateLimit?: RateLimit;
 };
+
+export const DEFAULT_ORDER_RATE_LIMIT: RateLimit = { limit: 20, windowMs: 1000 };
 
 export function buildServer(
   { pool, redis, db, tokens, exchange }: ServerDependencies,
-  { logLevel }: ServerOptions = {},
+  { logLevel, orderRateLimit = DEFAULT_ORDER_RATE_LIMIT }: ServerOptions = {},
 ) {
   const app = Fastify({
     logger: logLevel === undefined ? false : { level: logLevel },
@@ -105,7 +106,7 @@ export function buildServer(
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
   registerWalletRoutes(app, { db, tokens });
-  registerTradingRoutes(app, { db, tokens, exchange });
+  registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
   registerMarketDataRoutes(app, { db, exchange });
 
   return app;

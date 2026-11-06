@@ -82,7 +82,10 @@ try {
   // Built before the connections are verified so every startup line goes through pino.
   app = buildServer(
     { pool, redis, db, tokens, exchange: new Exchange(db) },
-    { logLevel: config.LOG_LEVEL },
+    {
+      logLevel: config.LOG_LEVEL,
+      orderRateLimit: { limit: config.ORDER_RATE_LIMIT, windowMs: 1000 },
+    },
   );
   const log = app.log;
 

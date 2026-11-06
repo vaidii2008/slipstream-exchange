@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
+import { createClient } from "redis";
 import { afterAll, beforeAll } from "vitest";
 import { Exchange } from "./exchange.ts";
 import { users } from "./schema.ts";
@@ -68,18 +69,18 @@ export function useTestServer() {
   if (databaseUrl === undefined) {
     throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
   }
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl === undefined) {
+    throw new Error("REDIS_URL is not set: these tests talk to a real redis");
+  }
 
   const pool = new Pool({ connectionString: databaseUrl });
   const db = drizzle({ client: pool });
   const tokens = createAccessTokens(TEST_SECRET);
+  // Connected in beforeAll; nothing sends it a command before the tests run.
+  const redis = createClient({ url: redisUrl });
   const exchange = new Exchange(db);
-  const app = buildServer({
-    pool,
-    redis: { ping: () => Promise.resolve("PONG") },
-    db,
-    tokens,
-    exchange,
-  });
+  const app = buildServer({ pool, redis, db, tokens, exchange });
 
   const createdEmails: string[] = [];
 
@@ -92,8 +93,9 @@ export function useTestServer() {
   beforeAll(async () => {
     try {
       await pool.query("select 1");
+      await redis.connect();
     } catch (error) {
-      throw new Error("cannot reach postgres: run `docker compose up -d --wait` first", {
+      throw new Error("cannot reach postgres or redis: run `docker compose up -d --wait` first", {
         cause: error,
       });
     }
@@ -105,8 +107,8 @@ export function useTestServer() {
       await db.delete(users).where(inArray(users.email, createdEmails));
     }
     await app.close();
-    await pool.end();
+    await Promise.all([pool.end(), redis.isOpen ? redis.close() : undefined]);
   });
 
-  return { pool, db, tokens, exchange, app, uniqueEmail };
+  return { pool, redis, db, tokens, exchange, app, uniqueEmail };
 }

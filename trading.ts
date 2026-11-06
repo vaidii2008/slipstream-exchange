@@ -1,7 +1,7 @@
 // The order API. It needs both orders.ts (markets, rejections) and exchange.ts (placing), and
 // exchange.ts already imports orders.ts, so the routes live here rather than in either.
 
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Side } from "./book.ts";
@@ -17,6 +17,7 @@ import {
   OrderError,
   type OrderErrorCode,
 } from "./orders.ts";
+import { hitFixedWindow, type RateLimit, type RedisClient } from "./ratelimit.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 
@@ -24,6 +25,8 @@ export type TradingDependencies = {
   db: Database;
   tokens: AccessTokens;
   exchange: Exchange;
+  redis: RedisClient;
+  orderRateLimit: RateLimit;
 };
 
 // Prices and quantities travel as strings, like deposit amounts. A market order has no price,
@@ -96,9 +99,30 @@ function marketOf(markets: Map<string, Market>, symbol: string): Market {
 
 export function registerTradingRoutes(
   app: FastifyInstance,
-  { db, tokens, exchange }: TradingDependencies,
+  { db, tokens, exchange, redis, orderRateLimit }: TradingDependencies,
 ) {
   const authenticate = bearerAuth(tokens);
+
+  // Fails open: if Redis is unreachable the order goes ahead and the failure is logged. The
+  // limiter is a brake on runaway clients, not part of what makes an order correct, and the
+  // per-market queue cap still bounds the load.
+  async function underOrderLimit(request: FastifyRequest, reply: FastifyReply, userId: string) {
+    let verdict;
+    try {
+      verdict = await hitFixedWindow(redis, `ratelimit:orders:${userId}`, orderRateLimit);
+    } catch (error) {
+      request.log.error({ err: error }, "order rate limit unavailable, allowing the order");
+      return true;
+    }
+    if (verdict.allowed) {
+      return true;
+    }
+    void reply
+      .code(429)
+      .header("retry-after", Math.ceil(verdict.retryAfterMs / 1000))
+      .send({ error: "rate_limited", message: "too many orders, slow down" });
+    return false;
+  }
 
   // A repeated client order id. The same order again gets the original back, in its current
   // state, with 200 rather than 201 since nothing new was placed. The same key on a different
@@ -141,6 +165,10 @@ export function registerTradingRoutes(
 
   app.post("/orders", { onRequest: authenticate }, async (request, reply) => {
     const userId = authenticatedUserId(request);
+    // Counted before validation, so malformed requests use up the allowance too.
+    if (!(await underOrderLimit(request, reply, userId))) {
+      return reply;
+    }
 
     const parsed = orderBody.safeParse(request.body);
     if (!parsed.success) {

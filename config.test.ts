@@ -9,13 +9,19 @@ const base = {
 
 describe("parseConfig", () => {
   it("defaults PORT to 3000 when it is not set", () => {
-    expect(parseConfig(base)).toEqual({ ...base, PORT: 3000, LOG_LEVEL: "info" });
+    expect(parseConfig(base)).toEqual({
+      ...base,
+      PORT: 3000,
+      ORDER_RATE_LIMIT: 20,
+      LOG_LEVEL: "info",
+    });
   });
 
   it("converts a numeric PORT string into a number", () => {
     expect(parseConfig({ ...base, PORT: "8080" })).toEqual({
       ...base,
       PORT: 8080,
+      ORDER_RATE_LIMIT: 20,
       LOG_LEVEL: "info",
     });
   });
@@ -24,8 +30,19 @@ describe("parseConfig", () => {
     expect(parseConfig({ ...base, AWS_SECRET_ACCESS_KEY: "leak" })).toEqual({
       ...base,
       PORT: 3000,
+      ORDER_RATE_LIMIT: 20,
       LOG_LEVEL: "info",
     });
+  });
+
+  it("reads ORDER_RATE_LIMIT as a whole number of orders per second", () => {
+    expect(parseConfig({ ...base, ORDER_RATE_LIMIT: "50" })).toMatchObject({
+      ORDER_RATE_LIMIT: 50,
+    });
+  });
+
+  it.each(["0", "2.5", "many"])("rejects ORDER_RATE_LIMIT=%s", (limit) => {
+    expect(() => parseConfig({ ...base, ORDER_RATE_LIMIT: limit })).toThrow(/ORDER_RATE_LIMIT/);
   });
 
   it("rejects an empty PORT instead of falling back to the default", () => {

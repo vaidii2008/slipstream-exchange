@@ -2,13 +2,13 @@ import { afterAll, describe, expect, it } from "vitest";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, db, tokens, exchange, app } = useTestServer();
+const { pool, redis, db, tokens, exchange, app } = useTestServer();
 
 describe("central error handling", () => {
   const leakyMessage = 'duplicate key value violates "users_email_unique": argon2id$secret';
   const failing = buildServer({
     pool,
-    redis: { ping: () => Promise.resolve("PONG") },
+    redis,
     db,
     tokens,
     exchange,

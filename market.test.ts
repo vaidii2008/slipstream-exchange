@@ -3,12 +3,12 @@ import { Exchange } from "./exchange.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, db, tokens, uniqueEmail } = useTestServer();
+const { pool, redis, db, tokens, uniqueEmail } = useTestServer();
 
 // Its own exchange, so the book holds only what these tests rest.
 const app = buildServer({
   pool,
-  redis: { ping: () => Promise.resolve("PONG") },
+  redis,
   db,
   tokens,
   exchange: new Exchange(db),

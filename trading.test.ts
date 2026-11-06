@@ -1,9 +1,10 @@
+import { createClient } from "redis";
 import { afterAll, describe, expect, it } from "vitest";
 import { Exchange } from "./exchange.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
+const { pool, redis, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
 
 // Each helper takes the server to talk to. Most tests share the file's server; a scenario that
 // needs an empty book builds its own around a fresh Exchange.
@@ -321,7 +322,7 @@ describe("DELETE /orders/:id", () => {
 describe("GET /orders and GET /fills", () => {
   const app = buildServer({
     pool,
-    redis: { ping: () => Promise.resolve("PONG") },
+    redis,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -427,7 +428,7 @@ describe("GET /orders and GET /fills", () => {
 describe("POST /orders with a market order", () => {
   const app = buildServer({
     pool,
-    redis: { ping: () => Promise.resolve("PONG") },
+    redis,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -477,7 +478,7 @@ describe("POST /orders with a market order", () => {
 describe("two users trading through the API", () => {
   const app = buildServer({
     pool,
-    redis: { ping: () => Promise.resolve("PONG") },
+    redis,
     db,
     tokens,
     exchange: new Exchange(db),
@@ -569,5 +570,68 @@ describe("two users trading through the API", () => {
       USD: ["58000.00000000", "0.00000000"],
     });
     // Nothing created or lost: 1 BTC and 100,000 USD between them, as deposited.
+  });
+});
+
+describe("POST /orders rate limit", () => {
+  // A minute-long window, so the test cannot straddle a window boundary in practice.
+  const limited = buildServer(
+    { pool, redis, db, tokens, exchange: new Exchange(db) },
+    { orderRateLimit: { limit: 2, windowMs: 60_000 } },
+  );
+  // Never connected: every command fails, as if Redis were down.
+  const unreachable = createClient({ url: "redis://127.0.0.1:1" });
+  const withoutRedis = buildServer(
+    { pool, redis: unreachable, db, tokens, exchange: new Exchange(db) },
+    { orderRateLimit: { limit: 1, windowMs: 60_000 } },
+  );
+
+  afterAll(async () => {
+    await Promise.all([limited.close(), withoutRedis.close()]);
+  });
+
+  const cheapBuy = { ...aBuy, price: "100", quantity: "0.01" };
+
+  it("refuses a user's orders past the limit with 429 and when to retry", async () => {
+    const authorization = await signedInUser(limited);
+    await fund(authorization, "USD", "100", limited);
+
+    const statuses = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      statuses.push((await postOrder(authorization, cheapBuy, limited)).statusCode);
+    }
+    const refused = await postOrder(authorization, cheapBuy, limited);
+
+    expect(statuses).toEqual([201, 201, 429]);
+    expect(refused.statusCode).toBe(429);
+    expect(refused.json<unknown>()).toEqual({
+      error: "rate_limited",
+      message: "too many orders, slow down",
+    });
+    const retryAfter = Number(refused.headers["retry-after"]);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+  });
+
+  it("counts malformed orders too, and each user separately", async () => {
+    const noisy = await signedInUser(limited);
+    const quiet = await signedInUser(limited);
+    await fund(quiet, "USD", "100", limited);
+
+    await postOrder(noisy, { side: "short" }, limited);
+    await postOrder(noisy, { side: "short" }, limited);
+
+    await expect(postOrder(noisy, cheapBuy, limited)).resolves.toMatchObject({ statusCode: 429 });
+    await expect(postOrder(quiet, cheapBuy, limited)).resolves.toMatchObject({ statusCode: 201 });
+  });
+
+  it("lets orders through when Redis cannot be reached", async () => {
+    const authorization = await signedInUser(withoutRedis);
+    await fund(authorization, "USD", "100", withoutRedis);
+
+    const first = await postOrder(authorization, cheapBuy, withoutRedis);
+    const second = await postOrder(authorization, cheapBuy, withoutRedis);
+
+    expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
   });
 });

@@ -14,6 +14,8 @@ const envSchema = z
       error: "must be a redis:// connection string",
     }),
     JWT_ACCESS_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
+    // Orders one user may place per second before getting 429.
+    ORDER_RATE_LIMIT: z.coerce.number().int().min(1).max(10_000).default(20),
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default("info"),
