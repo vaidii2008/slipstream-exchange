@@ -94,7 +94,8 @@ export type MarketUpdate = {
   firstSequence: number;
   sequence: number;
   events: EngineEvent[];
-  // When the settlement committed: the time a trade happened, as far as anyone outside sees.
+  // The time every trade in this command happened, as far as anyone outside sees. Taken
+  // just before the settlement and stored on each trade row, so the feed and Postgres agree.
   settledAt: Date;
   // Each price level the command changed, with the total now resting there (0: gone).
   levels: { side: Side; price: bigint; quantity: bigint }[];
@@ -257,9 +258,10 @@ export class Exchange {
         throw new MarketHaltedError(market.symbol);
       }
       const events = command(running.engine);
+      const settledAt = new Date();
       let settled;
       try {
-        settled = await settle(this.#db, market, events, takerLimit);
+        settled = await settle(this.#db, market, events, takerLimit, settledAt);
       } catch (error) {
         running.halted = true;
         for (const listener of this.#haltListeners) {
@@ -267,14 +269,20 @@ export class Exchange {
         }
         throw new MarketHaltedError(market.symbol, { cause: error });
       }
-      this.#announce(running.engine, market, events, settled);
+      this.#announce(running.engine, market, events, settled, settledAt);
       return events;
     });
   }
 
   // Every command emits at least one event (a cancel of a missing order emits a rejection),
   // so every sequence number reaches the listeners unless a settlement failed.
-  #announce(engine: Engine, market: Market, events: EngineEvent[], orders: SettledOrder[]): void {
+  #announce(
+    engine: Engine,
+    market: Market,
+    events: EngineEvent[],
+    orders: SettledOrder[],
+    settledAt: Date,
+  ): void {
     const first = events[0];
     const last = events.at(-1);
     if (first === undefined || last === undefined || this.#updateListeners.size === 0) {
@@ -285,7 +293,7 @@ export class Exchange {
       firstSequence: first.sequence,
       sequence: last.sequence,
       events,
-      settledAt: new Date(),
+      settledAt,
       levels: levelsTouched(events).map(({ side, price }) => ({
         side,
         price,

@@ -149,12 +149,15 @@ async function setStatus(
 // transaction per fill, each order's filled quantity and status, and the release of whatever
 // a cancelled remainder had reserved. `takerLimit` is the incoming order's worst price: its
 // limit, or a market order's protection price. Null for a cancel, which has no incoming order.
+// `settledAt` is each trade's recorded time: the caller reports the same time on the feed, so
+// a trade read back from Postgres falls in the same minute it was streamed in.
 // Returns each order the command touched as it now stands, in the order first touched.
 export async function settle(
   db: Database,
   market: Market,
   events: EngineEvent[],
   takerLimit: bigint | null,
+  settledAt: Date,
 ): Promise<SettledOrder[]> {
   return db.transaction(async (tx) => {
     const accounts = new Accounts(tx);
@@ -208,6 +211,7 @@ export async function settle(
           price: formatAmount(event.price, market.quoteScale),
           quantity,
           engineSequence: event.sequence,
+          createdAt: settledAt,
         });
         record(await applyFill(tx, event.makerOrderId, quantity, event.sequence), event.sequence);
         record(await applyFill(tx, event.takerOrderId, quantity, event.sequence), event.sequence);

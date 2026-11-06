@@ -192,6 +192,25 @@ describe("Exchange.placeOrder", () => {
     ]);
   });
 
+  it("stores each trade at the time its update reports, so the feed and Postgres agree", async () => {
+    const exchange = new Exchange(db);
+    const reported: Date[] = [];
+    exchange.onUpdate((update) => reported.push(update.settledAt));
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "60000" });
+
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.1"));
+    await exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.2"));
+    const buy = await exchange.placeOrder(btcUsd, limit(buyer, "buy", "60000", "0.3"));
+
+    const stored = await db
+      .select({ createdAt: trades.createdAt })
+      .from(trades)
+      .where(eq(trades.takerOrderId, buy.id));
+    // Both fills came from one command, so they share its update's time.
+    expect(stored.map((row) => row.createdAt)).toEqual([reported[2], reported[2]]);
+  });
+
   it("fills part of an order and rests the rest, still reserved at its own limit", async () => {
     const exchange = new Exchange(db);
     const seller = await funded({ BTC: "0.2" });
