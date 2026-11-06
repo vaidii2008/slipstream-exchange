@@ -123,6 +123,23 @@ Each entry: the decision, the alternative, why, and where it lives.
   matters before anything fancier goes in.
 - **Where:** `OrderBook` in `book.ts`.
 
+### Baseline: no engine optimisation, because the numbers show no hotspot
+
+- **Decision:** keep arrays for price levels and queues. `npm run bench` (Apple M4, Node 24.21,
+  1,000,000 timed commands, seed 20261106, two runs):
+  - **Mixed book**, held near 5,000 resting orders: about 4.4 million commands/s; p50 0.17 µs,
+    p99 0.58 µs.
+  - **One price level held near 10,000 orders**: about 2.28 million commands/s. Cancels p50
+    1.25 to 1.29 µs and p99 1.54 to 1.71 µs. Fills from the front p50 0.21 µs.
+- **Alternative:** a doubly linked list per level, so a cancel unlinks in O(1) instead of
+  scanning the level with `indexOf`.
+- **Why:** the scan is visible, a cancel costs about 6 times a fill on a deep level, but it is
+  1.3 µs. Settling one order in Postgres takes milliseconds, so the engine is not the
+  bottleneck. A first version of the benchmark let the level grow to 137,000 orders and showed
+  cancels at 180 µs p99; that was the generator's bug, not the engine's. Maximums of 1 to 8 ms
+  in every run are garbage-collection pauses, not slow paths.
+- **Where:** `engine.bench.ts`; the scan is `OrderBook.remove` in `book.ts`.
+
 ### Self-trade prevention cancels the incoming order
 
 - **Decision:** when the next maker in priority belongs to the taker's own user, matching stops and
