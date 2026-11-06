@@ -20,6 +20,7 @@ vi.mock("./session", async () => {
 
 const { MarketSocket, TOKEN_EXPIRED_CLOSE_CODE } = await import("./socket");
 const { useBooks } = await import("./book");
+const { useTrades } = await import("./trades");
 const { useSession } = await import("./session");
 
 class FakeSocket {
@@ -59,6 +60,7 @@ beforeEach(() => {
   session.current.mockReset();
   session.refresh.mockReset();
   useBooks.setState({ books: {} });
+  useTrades.setState({ live: {} });
   socket = new MarketSocket({
     url: "ws://test/ws",
     createSocket: () => {
@@ -175,6 +177,26 @@ describe("market socket", () => {
     ]);
     latest().receive(book(7));
     expect(useBooks.getState().books["BTC-USD"]).toMatchObject({ synced: true, gaps: 1 });
+  });
+
+  it("keeps live trades until the connection drops", async () => {
+    socket.start();
+    latest().open();
+    await vi.runAllTimersAsync();
+    latest().receive({
+      type: "trade",
+      market: "BTC-USD",
+      sequence: 3,
+      price: "100.00000000",
+      quantity: "1.00000000",
+      takerSide: "sell",
+      time: "2026-11-06T00:00:00.000Z",
+    });
+    expect(useTrades.getState().live["BTC-USD"]).toHaveLength(1);
+
+    latest().drop();
+
+    expect(useTrades.getState().live).toEqual({});
   });
 
   it("authenticates before subscribing when signed in", async () => {

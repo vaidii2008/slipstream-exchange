@@ -13,6 +13,7 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import type { Channel, ClientMessage, ServerMessage } from "@slipstream/protocol";
 import { useBooks } from "./book";
+import { useTrades } from "./trades";
 import { API_URL, currentAccessToken, refreshAccessToken, useSession } from "./session";
 
 export const SOCKET_URL = `${API_URL.replace(/^http/, "ws")}/ws`;
@@ -158,6 +159,8 @@ export class MarketSocket {
       this.#socket = undefined;
       this.#ready = false;
       useBooks.getState().markAllUnsynced();
+      // Whatever trades while the socket is down come back with the history refetch.
+      useTrades.getState().clearAll();
       this.#scheduleReconnect(event.code);
     };
   }
@@ -203,6 +206,9 @@ export class MarketSocket {
       if (useBooks.getState().receive(message) === "gap") {
         this.resync({ channel: "book", market: message.market });
       }
+    }
+    if (message.type === "trade") {
+      useTrades.getState().receive(message);
     }
     // The token in memory had expired before the server checked it; get a new one and retry.
     if (message.type === "error" && message.error === "token_expired") {

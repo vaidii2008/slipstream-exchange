@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { OrderBook } from "@/components/order-book";
+import { TradesFeed } from "@/components/trades-feed";
 import { useMarkets } from "@/lib/markets";
 
 export function Terminal() {
@@ -37,6 +38,9 @@ export function Terminal() {
       <div className="grid flex-1 grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_minmax(16rem,22rem)_1fr]">
         <div className="border-r">
           <OrderBook market={market} />
+        </div>
+        <div className="border-r">
+          <TradesFeed market={market} />
         </div>
       </div>
     </div>
