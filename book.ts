@@ -122,6 +122,15 @@ export class OrderBook {
     return { bids: copy(this.#bids), asks: copy(this.#asks) };
   }
 
+  // Everything resting at one price on one side; zero when there is no such level.
+  quantityAt(side: Side, price: bigint): bigint {
+    const level = this.#levels(side)[this.#search(side, price)];
+    if (level === undefined || level.price !== price) {
+      return 0n;
+    }
+    return level.orders.reduce((total, order) => total + order.remaining, 0n);
+  }
+
   // The best `limit` levels on each side, best first, each summed to one quantity. Nothing
   // about the orders inside a level comes out.
   depth(limit: number): { bids: DepthLevel[]; asks: DepthLevel[] } {

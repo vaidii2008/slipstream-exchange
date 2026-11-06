@@ -178,3 +178,17 @@ describe("OrderBook.depth", () => {
     expect(() => new OrderBook().depth(0)).toThrow(RangeError);
   });
 });
+
+describe("OrderBook.quantityAt", () => {
+  it("sums one level and reports zero where there is none", () => {
+    const book = new OrderBook();
+    book.rest(order("a", "sell", 101n, 2n));
+    book.rest(order("b", "sell", 101n, 3n));
+    book.rest(order("c", "buy", 99n, 1n));
+
+    expect(book.quantityAt("sell", 101n)).toBe(5n);
+    expect(book.quantityAt("buy", 99n)).toBe(1n);
+    expect(book.quantityAt("sell", 100n)).toBe(0n);
+    expect(book.quantityAt("buy", 101n)).toBe(0n);
+  });
+});

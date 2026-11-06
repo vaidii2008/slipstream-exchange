@@ -75,6 +75,26 @@ export type EngineEvent = EventBody & { market: string; sequence: number };
 
 const opposite = (side: Side): Side => (side === "buy" ? "sell" : "buy");
 
+// The price levels a command's events changed on the book, in the order the events touched
+// them. A trade takes from the maker's level, a rest adds to one, and a requested cancel
+// removes from one. A cancelled incoming order never rested, so it changes nothing.
+export function levelsTouched(events: EventBody[]): { side: Side; price: bigint }[] {
+  const touched = new Map<string, { side: Side; price: bigint }>();
+  const touch = (side: Side, price: bigint) => {
+    touched.set(`${side}:${price}`, { side, price });
+  };
+  for (const event of events) {
+    if (event.type === "trade") {
+      touch(opposite(event.takerSide), event.price);
+    } else if (event.type === "rested") {
+      touch(event.side, event.price);
+    } else if (event.type === "cancelled" && event.reason === "requested" && event.price !== null) {
+      touch(event.side, event.price);
+    }
+  }
+  return [...touched.values()];
+}
+
 // One engine per market. Every call runs to completion before the next, so the book has
 // exactly one writer and needs no locks.
 export class Engine {
@@ -206,6 +226,10 @@ export class Engine {
   // The book aggregated by price level, with the sequence number it is current as of.
   depth(limit: number): { sequence: number; bids: DepthLevel[]; asks: DepthLevel[] } {
     return { sequence: this.#sequence, ...this.#book.depth(limit) };
+  }
+
+  quantityAt(side: Side, price: bigint): bigint {
+    return this.#book.quantityAt(side, price);
   }
 
   // The best resting price on one side, undefined when that side is empty.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RestingOrder, Side } from "./book.ts";
 import {
   Engine,
+  levelsTouched,
   type EngineEvent,
   type EventBody,
   type LimitOrder,
@@ -472,5 +473,31 @@ describe("event sequence numbers", () => {
 
     expect(events).toEqual([expect.objectContaining({ market: "ETH-USD", sequence: 1 })]);
     expect(btc.sequence).toBe(2);
+  });
+});
+
+describe("levelsTouched", () => {
+  it("lists each maker level a sweep took from and the level the remainder rested at", () => {
+    const engine = new Engine("TEST");
+    engine.submit(limit("a", "sell", 100n, 1n));
+    engine.submit(limit("b", "sell", 100n, 1n));
+    engine.submit(limit("c", "sell", 101n, 1n));
+
+    const events = engine.submit(limit("bid", "buy", 101n, 4n));
+
+    expect(levelsTouched(events)).toEqual([
+      { side: "sell", price: 100n },
+      { side: "sell", price: 101n },
+      { side: "buy", price: 101n },
+    ]);
+  });
+
+  it("counts a requested cancel but not an incoming order that never rested", () => {
+    const engine = new Engine("TEST");
+    engine.submit(limit("bid", "buy", 99n, 1n));
+
+    expect(levelsTouched(engine.cancel("bid"))).toEqual([{ side: "buy", price: 99n }]);
+    expect(levelsTouched(engine.submit(market("m", "sell", 1n)))).toEqual([]);
+    expect(levelsTouched(engine.cancel("missing"))).toEqual([]);
   });
 });

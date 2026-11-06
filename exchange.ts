@@ -2,7 +2,8 @@
 // market's engine, then settled (settlement.ts) before the next command starts. A market
 // halts if a settlement fails and refuses commands past its cap.
 
-import { Engine, type EngineEvent } from "./engine.ts";
+import type { Side } from "./book.ts";
+import { Engine, type EngineEvent, levelsTouched } from "./engine.ts";
 import type { Database } from "./ledger.ts";
 import {
   DuplicateOrderError,
@@ -85,6 +86,22 @@ export class MarketBusyError extends Error {
 
 export type HaltListener = (market: string, error: unknown) => void;
 
+// What one settled command did, for market data. Sequences are the command's first and last
+// event numbers: the next update in the market starts at `sequence + 1`, so a consumer that
+// sees anything else missed one.
+export type MarketUpdate = {
+  market: Market;
+  firstSequence: number;
+  sequence: number;
+  events: EngineEvent[];
+  // Each price level the command changed, with the total now resting there (0: gone).
+  levels: { side: Side; price: bigint; quantity: bigint }[];
+};
+
+// Called inside the market's queue, in sequence order, after the settlement has committed.
+// It must not throw or wait: the next command starts when it returns.
+export type UpdateListener = (update: MarketUpdate) => void;
+
 export type ExchangeOptions = {
   // Per market: commands admitted and not yet settled, counting from before an order's
   // reservation, so a refused order has reserved nothing.
@@ -108,6 +125,7 @@ export class Exchange {
   readonly #db: Database;
   readonly #markets = new Map<string, RunningMarket>();
   readonly #haltListeners: HaltListener[] = [];
+  readonly #updateListeners = new Set<UpdateListener>();
   readonly #maxPending: number;
 
   constructor(
@@ -121,6 +139,12 @@ export class Exchange {
   // Called once per halt with the settlement's error. The server logs it at fatal.
   onHalt(listener: HaltListener): void {
     this.#haltListeners.push(listener);
+  }
+
+  // Returns the function that stops the listener.
+  onUpdate(listener: UpdateListener): () => void {
+    this.#updateListeners.add(listener);
+    return () => this.#updateListeners.delete(listener);
   }
 
   isHalted(symbol: string): boolean {
@@ -192,7 +216,8 @@ export class Exchange {
     });
   }
 
-  // The public view of a market's book. A market nobody has traded yet has an empty one.
+  // The public view of a market's book. A market nobody has traded yet has an empty one. Read
+  // outside the queue, so it may include a command whose settlement has not committed yet.
   depth(symbol: string, limit: number) {
     return this.#market(symbol).engine.depth(limit);
   }
@@ -237,8 +262,33 @@ export class Exchange {
         }
         throw new MarketHaltedError(market.symbol, { cause: error });
       }
+      this.#announce(running.engine, market, events);
       return events;
     });
+  }
+
+  // Every command emits at least one event (a cancel of a missing order emits a rejection),
+  // so every sequence number reaches the listeners unless a settlement failed.
+  #announce(engine: Engine, market: Market, events: EngineEvent[]): void {
+    const first = events[0];
+    const last = events.at(-1);
+    if (first === undefined || last === undefined || this.#updateListeners.size === 0) {
+      return;
+    }
+    const update: MarketUpdate = {
+      market,
+      firstSequence: first.sequence,
+      sequence: last.sequence,
+      events,
+      levels: levelsTouched(events).map(({ side, price }) => ({
+        side,
+        price,
+        quantity: engine.quantityAt(side, price),
+      })),
+    };
+    for (const listener of this.#updateListeners) {
+      listener(update);
+    }
   }
 
   #market(symbol: string): RunningMarket {

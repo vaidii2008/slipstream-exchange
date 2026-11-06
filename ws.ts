@@ -2,17 +2,29 @@
 // unsubscribe) and the server answers each one and then streams what the client subscribed
 // to. Every client message is validated with zod; a bad one gets an error message and the
 // connection stays open.
+//
+// The book channel is a snapshot followed by deltas. The snapshot carries the sequence it is
+// current as of; each delta carries the first and last sequence of the command it describes.
+// A client drops any delta whose `sequence` is at or below what it already has, and treats a
+// `firstSequence` other than its last sequence + 1 as a gap: it has missed something, and
+// subscribes again to get a fresh snapshot.
+//
+// Public channels never carry a user id or an order id. Engine events have both, so every
+// message is built field by field here rather than passed through.
 
 import websocket from "@fastify/websocket";
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
-import { SerialQueue } from "./exchange.ts";
+import type { Side } from "./book.ts";
+import { type Exchange, type MarketUpdate, SerialQueue } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
-import { loadMarket } from "./orders.ts";
+import { formatAmount } from "./money.ts";
+import { loadMarket, type Market } from "./orders.ts";
 
 export type WebSocketDependencies = {
   db: Database;
+  exchange: Exchange;
 };
 
 // A client message larger than this closes the connection: commands are tiny.
@@ -28,9 +40,58 @@ const clientMessage = z.discriminatedUnion("op", [
 ]);
 type ClientMessage = z.infer<typeof clientMessage>;
 
+type Level = { price: string; quantity: string };
+
 export type ServerMessage =
   | { type: "subscribed" | "unsubscribed"; channel: string; market: string }
-  | { type: "error"; error: string; message: string };
+  | { type: "error"; error: string; message: string }
+  | { type: "book"; market: string; sequence: number; bids: Level[]; asks: Level[] }
+  | {
+      type: "book_update";
+      market: string;
+      firstSequence: number;
+      sequence: number;
+      // The new total at each level the command changed; "0" removes the level.
+      changes: (Level & { side: Side })[];
+    };
+
+// Every level, best first. The book is in memory and bounded by what users rest, so a full
+// snapshot keeps deltas simple: a client never has to fetch a level it was not sent.
+const WHOLE_BOOK = Number.MAX_SAFE_INTEGER;
+
+function bookSnapshot(exchange: Exchange, market: Market): ServerMessage {
+  const { sequence, bids, asks } = exchange.depth(market.symbol, WHOLE_BOOK);
+  const level = ({ price, quantity }: { price: bigint; quantity: bigint }) => ({
+    price: formatAmount(price, market.quoteScale),
+    quantity: formatAmount(quantity, market.baseScale),
+  });
+  return {
+    type: "book",
+    market: market.symbol,
+    sequence,
+    bids: bids.map(level),
+    asks: asks.map(level),
+  };
+}
+
+export function bookUpdate({
+  market,
+  firstSequence,
+  sequence,
+  levels,
+}: MarketUpdate): ServerMessage {
+  return {
+    type: "book_update",
+    market: market.symbol,
+    firstSequence,
+    sequence,
+    changes: levels.map(({ side, price, quantity }) => ({
+      side,
+      price: formatAmount(price, market.quoteScale),
+      quantity: formatAmount(quantity, market.baseScale),
+    })),
+  };
+}
 
 const topicOf = (channel: string, market: string) => `${channel}:${market}`;
 
@@ -73,6 +134,18 @@ export class MarketDataHub {
     connection.topics.delete(topic);
   }
 
+  publish(topic: string, message: ServerMessage): void {
+    const connections = this.#byTopic.get(topic);
+    if (connections === undefined) {
+      return;
+    }
+    // Serialised once, however many subscribers there are.
+    const text = JSON.stringify(message);
+    for (const connection of connections) {
+      connection.socket.send(text);
+    }
+  }
+
   disconnect(connection: Connection): void {
     for (const topic of [...connection.topics]) {
       this.unsubscribe(connection, topic);
@@ -104,8 +177,19 @@ function parse(data: RawData): ClientMessage | ServerMessage {
   return parsed.data;
 }
 
-export function registerWebSocketRoutes(app: FastifyInstance, { db }: WebSocketDependencies) {
+export function registerWebSocketRoutes(
+  app: FastifyInstance,
+  { db, exchange }: WebSocketDependencies,
+) {
   const hub = new MarketDataHub();
+
+  const stopListening = exchange.onUpdate((update) => {
+    hub.publish(topicOf("book", update.market.symbol), bookUpdate(update));
+  });
+  app.addHook("onClose", (_instance, done) => {
+    stopListening();
+    done();
+  });
 
   async function handle(connection: Connection, data: RawData): Promise<void> {
     const message = parse(data);
@@ -114,23 +198,29 @@ export function registerWebSocketRoutes(app: FastifyInstance, { db }: WebSocketD
       return;
     }
 
-    const { channel, market } = message;
-    if ((await loadMarket(db, market)) === undefined) {
+    const { channel } = message;
+    const market = await loadMarket(db, message.market);
+    if (market === undefined) {
       connection.send({
         type: "error",
         error: "unknown_market",
-        message: `${market} is not a listed market`,
+        message: `${message.market} is not a listed market`,
       });
       return;
     }
 
-    const topic = topicOf(channel, market);
+    const topic = topicOf(channel, market.symbol);
     if (message.op === "subscribe") {
       hub.subscribe(connection, topic);
-      connection.send({ type: "subscribed", channel, market });
+      connection.send({ type: "subscribed", channel, market: market.symbol });
+      // Taken after subscribing and in the same tick, so no delta can fall between the two.
+      // Subscribing again while subscribed re-sends it: that is how a client resyncs.
+      if (channel === "book") {
+        connection.send(bookSnapshot(exchange, market));
+      }
     } else {
       hub.unsubscribe(connection, topic);
-      connection.send({ type: "unsubscribed", channel, market });
+      connection.send({ type: "unsubscribed", channel, market: market.symbol });
     }
   }
 
