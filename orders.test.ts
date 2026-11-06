@@ -1,10 +1,17 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, describe, expect, it } from "vitest";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market, OrderError, recordLimitOrder, SerialQueue } from "./orders.ts";
-import { orders, users } from "./schema.ts";
+import {
+  Exchange,
+  loadMarket,
+  type Market,
+  OrderError,
+  recordLimitOrder,
+  SerialQueue,
+} from "./orders.ts";
+import { orders, trades, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
 const { db, uniqueEmail } = useTestServer();
@@ -50,13 +57,15 @@ async function ordersOf(userId: string) {
 }
 
 let btcUsd: Market;
+let ethUsd: Market;
 
 beforeAll(async () => {
-  const market = await loadMarket(db, "BTC-USD");
-  if (market === undefined) {
-    throw new Error("BTC-USD is not seeded");
+  const [btc, eth] = await Promise.all([loadMarket(db, "BTC-USD"), loadMarket(db, "ETH-USD")]);
+  if (btc === undefined || eth === undefined) {
+    throw new Error("BTC-USD and ETH-USD must be seeded");
   }
-  btcUsd = market;
+  btcUsd = btc;
+  ethUsd = eth;
 });
 
 async function expectOrderError(promise: Promise<unknown>, code: string): Promise<void> {
@@ -242,5 +251,218 @@ describe("SerialQueue", () => {
     await expect(failing).rejects.toThrow("settlement failed");
     await expect(throwing).rejects.toThrow("threw before returning a promise");
     await expect(next).resolves.toBe("still ran");
+  });
+});
+
+describe("Exchange.placeLimitOrder", () => {
+  // A fresh exchange per test, so every test starts from empty books.
+  async function funded(holdings: Record<string, string>): Promise<string> {
+    const userId = await createUser();
+    for (const [asset, amount] of Object.entries(holdings)) {
+      await deposit(db, userId, asset, units(amount));
+    }
+    return userId;
+  }
+
+  const limit = (userId: string, side: "buy" | "sell", price: string, quantity: string) => ({
+    userId,
+    side,
+    price: units(price),
+    quantity: units(quantity),
+  });
+
+  async function orderRow(id: string) {
+    const [row] = await db
+      .select({
+        status: orders.status,
+        filledQuantity: orders.filledQuantity,
+        engineSequence: orders.engineSequence,
+      })
+      .from(orders)
+      .where(eq(orders.id, id));
+    return row;
+  }
+
+  it("rests an order that crosses nothing and keeps its reservation", async () => {
+    const exchange = new Exchange(db);
+    const buyer = await funded({ USD: "30000" });
+
+    const placed = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
+
+    expect(placed).toEqual({ id: placed.id, status: "open", filledQuantity: 0n, fills: [] });
+    await expect(orderRow(placed.id)).resolves.toEqual({
+      status: "open",
+      filledQuantity: "0.000000000000000000",
+      engineSequence: 1,
+    });
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: 0n,
+      reserved: units("30000"),
+    });
+  });
+
+  it("fills at the maker's price, settles both sides and refunds the buyer's improvement", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "30050" });
+
+    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "60000", "0.5"));
+    const buy = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60100", "0.5"));
+
+    expect(buy).toEqual({
+      id: buy.id,
+      status: "filled",
+      filledQuantity: units("0.5"),
+      fills: [{ price: units("60000"), quantity: units("0.5") }],
+    });
+    // The buyer reserved 0.5 × 60,100 = 30,050 and paid 0.5 × 60,000 = 30,000.
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: units("50"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(buyer, "BTC")).resolves.toEqual({
+      available: units("0.5"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(seller, "BTC")).resolves.toEqual({
+      available: units("0.5"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(seller, "USD")).resolves.toEqual({
+      available: units("30000"),
+      reserved: 0n,
+    });
+    await expect(orderRow(sell.id)).resolves.toMatchObject({ status: "filled" });
+    await expect(orderRow(buy.id)).resolves.toMatchObject({ status: "filled" });
+
+    const recorded = await db
+      .select({
+        makerOrderId: trades.makerOrderId,
+        takerOrderId: trades.takerOrderId,
+        price: trades.price,
+        quantity: trades.quantity,
+      })
+      .from(trades)
+      .where(eq(trades.takerOrderId, buy.id));
+    expect(recorded).toEqual([
+      {
+        makerOrderId: sell.id,
+        takerOrderId: buy.id,
+        price: "60000.000000000000000000",
+        quantity: "0.500000000000000000",
+      },
+    ]);
+  });
+
+  it("fills part of an order and rests the rest, still reserved at its own limit", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded({ BTC: "0.2" });
+    const buyer = await funded({ USD: "30000" });
+
+    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "60000", "0.2"));
+    const buy = await exchange.placeLimitOrder(btcUsd, limit(buyer, "buy", "60000", "0.5"));
+
+    expect(buy).toMatchObject({ status: "open", filledQuantity: units("0.2") });
+    await expect(orderRow(buy.id)).resolves.toEqual({
+      status: "open",
+      filledQuantity: "0.200000000000000000",
+      engineSequence: 3,
+    });
+    await expect(orderRow(sell.id)).resolves.toMatchObject({ status: "filled" });
+    // 0.3 left at 60,000 is 18,000 still reserved; 12,000 went to the seller.
+    await expect(balanceOf(buyer, "USD")).resolves.toEqual({
+      available: 0n,
+      reserved: units("18000"),
+    });
+    await expect(balanceOf(seller, "USD")).resolves.toEqual({
+      available: units("12000"),
+      reserved: 0n,
+    });
+  });
+
+  it("sweeps several makers best price first and pays each at their own price", async () => {
+    const exchange = new Exchange(db);
+    const high = await funded({ USD: "600" });
+    const low = await funded({ USD: "599" });
+    const seller = await funded({ BTC: "0.02" });
+
+    await exchange.placeLimitOrder(btcUsd, limit(low, "buy", "59900", "0.01"));
+    await exchange.placeLimitOrder(btcUsd, limit(high, "buy", "60000", "0.01"));
+    const sell = await exchange.placeLimitOrder(btcUsd, limit(seller, "sell", "59900", "0.02"));
+
+    expect(sell.fills).toEqual([
+      { price: units("60000"), quantity: units("0.01") },
+      { price: units("59900"), quantity: units("0.01") },
+    ]);
+    await expect(balanceOf(seller, "USD")).resolves.toEqual({
+      available: units("1199"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(high, "USD")).resolves.toEqual({ available: 0n, reserved: 0n });
+    await expect(balanceOf(low, "BTC")).resolves.toEqual({
+      available: units("0.01"),
+      reserved: 0n,
+    });
+  });
+
+  it("cancels an order that would trade with its owner and releases its reservation", async () => {
+    const exchange = new Exchange(db);
+    const user = await funded({ BTC: "1", USD: "30000" });
+
+    await exchange.placeLimitOrder(btcUsd, limit(user, "sell", "60000", "0.5"));
+    const buy = await exchange.placeLimitOrder(btcUsd, limit(user, "buy", "60000", "0.5"));
+
+    expect(buy).toEqual({ id: buy.id, status: "cancelled", filledQuantity: 0n, fills: [] });
+    await expect(orderRow(buy.id)).resolves.toMatchObject({ status: "cancelled" });
+    await expect(balanceOf(user, "USD")).resolves.toEqual({
+      available: units("30000"),
+      reserved: 0n,
+    });
+    await expect(balanceOf(user, "BTC")).resolves.toEqual({
+      available: units("0.5"),
+      reserved: units("0.5"),
+    });
+  });
+
+  // Each round, one taker sweeps both buyers' bids in BTC-USD while another sweeps them in
+  // ETH-USD in the opposite order, so the two settlements debit the same two USD reserved
+  // accounts in opposite fill order at the same time.
+  it("settles two markets in parallel that debit the same accounts without deadlocking", async () => {
+    const exchange = new Exchange(db);
+    const first = await funded({ USD: "100000" });
+    const second = await funded({ USD: "100000" });
+    const btcSeller = await funded({ BTC: "1" });
+    const ethSeller = await funded({ ETH: "1" });
+
+    for (let round = 0; round < 15; round++) {
+      await Promise.all([
+        exchange.placeLimitOrder(btcUsd, limit(first, "buy", "60010", "0.01")),
+        exchange.placeLimitOrder(btcUsd, limit(second, "buy", "60000", "0.01")),
+        exchange.placeLimitOrder(ethUsd, limit(second, "buy", "3010", "0.01")),
+        exchange.placeLimitOrder(ethUsd, limit(first, "buy", "3000", "0.01")),
+      ]);
+      const [btc, eth] = await Promise.all([
+        exchange.placeLimitOrder(btcUsd, limit(btcSeller, "sell", "60000", "0.02")),
+        exchange.placeLimitOrder(ethUsd, limit(ethSeller, "sell", "3000", "0.02")),
+      ]);
+      expect([btc.status, eth.status]).toEqual(["filled", "filled"]);
+    }
+
+    await expect(balanceOf(first, "USD")).resolves.toMatchObject({ reserved: 0n });
+    await expect(balanceOf(second, "USD")).resolves.toMatchObject({ reserved: 0n });
+  });
+
+  it("leaves every asset's ledger summing to zero", async () => {
+    const totals = await db.execute<{ asset: string; total: string }>(sql`
+      select a.asset, sum(e.amount)::text as total
+      from ledger_entries e join ledger_accounts a on a.id = e.account_id
+      group by a.asset`);
+
+    for (const row of totals.rows) {
+      expect({ asset: row.asset, total: Number(row.total) }).toEqual({
+        asset: row.asset,
+        total: 0,
+      });
+    }
   });
 });
