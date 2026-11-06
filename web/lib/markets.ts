@@ -60,3 +60,10 @@ export function subtract(a: string, b: string): string {
   const scale = Math.max(scaleOf(a), scaleOf(b));
   return fromUnits(toUnits(a, scale) - toUnits(b, scale), scale);
 }
+
+// -1, 0 or 1, as a is less than, equal to or greater than b, at whichever scale is finer.
+export function compareAmounts(a: string, b: string): -1 | 0 | 1 {
+  const scale = Math.max(scaleOf(a), scaleOf(b));
+  const difference = toUnits(a, scale) - toUnits(b, scale);
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}

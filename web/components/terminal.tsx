@@ -2,14 +2,17 @@
 
 import { useState } from "react";
 import { Balances } from "@/components/balances";
+import { OpenOrders } from "@/components/open-orders";
 import { OrderBook } from "@/components/order-book";
 import { OrderForm } from "@/components/order-form";
 import { TradesFeed } from "@/components/trades-feed";
 import { useMarkets } from "@/lib/markets";
+import { useSession } from "@/lib/session";
 
 export function Terminal() {
   const markets = useMarkets();
   const [selected, setSelected] = useState<string | undefined>();
+  const status = useSession((state) => state.status);
 
   if (markets.isPending) {
     return <p className="p-4 text-sm text-muted-foreground">Loading markets…</p>;
@@ -49,6 +52,14 @@ export function Terminal() {
           <OrderForm market={market} />
         </div>
       </div>
+      {status === "signed_in" ? (
+        <section aria-label="Open orders" className="border-t">
+          <header className="px-3 py-2">
+            <h2 className="text-sm font-medium">Open orders</h2>
+          </header>
+          <OpenOrders markets={markets.data} />
+        </section>
+      ) : null}
     </div>
   );
 }

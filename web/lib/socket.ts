@@ -17,7 +17,7 @@
 import { useEffect } from "react";
 import { create } from "zustand";
 import type { Channel, ClientMessage, ServerMessage } from "@slipstream/protocol";
-import { useBalances } from "./account";
+import { useBalances, useOrderUpdates } from "./account";
 import { useBooks } from "./book";
 import { useTrades } from "./trades";
 import { API_URL, currentAccessToken, refreshAccessToken, useSession } from "./session";
@@ -91,6 +91,7 @@ export class MarketSocket {
       // The server keeps a connection's user until it closes, so signing out starts a new one.
       if (state.status === "signed_out" && previous.status === "signed_in") {
         useBalances.getState().clear();
+        useOrderUpdates.getState().clear();
         this.#reconnectNow();
       }
     });
@@ -228,6 +229,9 @@ export class MarketSocket {
     }
     if (message.type === "balances") {
       useBalances.getState().receive(message);
+    }
+    if (message.type === "order") {
+      useOrderUpdates.getState().receive(message);
     }
     // A refreshed token is accepted again on the same connection; subscribe only the first time.
     if (message.type === "authenticated" && !this.#authenticated) {

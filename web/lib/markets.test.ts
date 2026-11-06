@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decimalsOf, display, subtract } from "./markets";
+import { compareAmounts, decimalsOf, display, subtract } from "./markets";
 
 describe("market amounts", () => {
   it.each([
@@ -22,5 +22,11 @@ describe("market amounts", () => {
     expect(subtract("0.30000000", "0.10000000")).toBe("0.20000000");
     expect(subtract("65000.01000000", "64999.99000000")).toBe("0.02000000");
     expect(subtract("1.5", "2.25")).toBe("-0.75");
+  });
+
+  it("compares amounts as integers, across scales", () => {
+    expect(compareAmounts("0.30000000", "0.3")).toBe(0);
+    expect(compareAmounts("0.0001", "0.00010001")).toBe(-1);
+    expect(compareAmounts("10.00", "9.99999999")).toBe(1);
   });
 });
