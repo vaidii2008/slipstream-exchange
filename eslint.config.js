@@ -4,7 +4,8 @@ import prettier from "eslint-config-prettier";
 
 export default tseslint.config(
   {
-    ignores: ["node_modules/**", "dist/**"],
+    // web/ has its own ESLint config, from Next.js.
+    ignores: ["node_modules/**", "dist/**", "web/**"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

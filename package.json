@@ -15,7 +15,7 @@
     "format:check": "prettier --check .",
     "start": "node --env-file-if-exists=.env main.ts",
     "test": "vitest run",
-    "check": "npm run format:check && npm run typecheck && npm run lint && npm test",
+    "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run check --prefix web",
     "bench": "node engine.bench.ts"
   },
   "devDependencies": {
