@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { OrderBook } from "@/components/order-book";
+import { OrderForm } from "@/components/order-form";
 import { TradesFeed } from "@/components/trades-feed";
 import { useMarkets } from "@/lib/markets";
 
@@ -42,6 +43,7 @@ export function Terminal() {
         <div className="border-r">
           <TradesFeed market={market} />
         </div>
+        <OrderForm market={market} />
       </div>
     </div>
   );
