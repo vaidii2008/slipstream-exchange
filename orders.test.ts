@@ -1,8 +1,9 @@
 import { eq } from "drizzle-orm";
+import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, describe, expect, it } from "vitest";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market, OrderError, recordLimitOrder } from "./orders.ts";
+import { loadMarket, type Market, OrderError, recordLimitOrder, SerialQueue } from "./orders.ts";
 import { orders, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
@@ -198,5 +199,48 @@ describe("recordLimitOrder", () => {
       available: 0n,
       reserved: units("1"),
     });
+  });
+});
+
+describe("SerialQueue", () => {
+  it("runs one task at a time, in the order they were added, even when earlier ones are slower", async () => {
+    const queue = new SerialQueue();
+    const log: string[] = [];
+    let running = 0;
+    let mostAtOnce = 0;
+
+    const task = (name: string, ms: number) => async () => {
+      running++;
+      mostAtOnce = Math.max(mostAtOnce, running);
+      log.push(`start ${name}`);
+      await delay(ms);
+      log.push(`end ${name}`);
+      running--;
+      return name;
+    };
+
+    const results = await Promise.all([
+      queue.run(task("a", 30)),
+      queue.run(task("b", 1)),
+      queue.run(task("c", 10)),
+    ]);
+
+    expect(results).toEqual(["a", "b", "c"]);
+    expect(mostAtOnce).toBe(1);
+    expect(log).toEqual(["start a", "end a", "start b", "end b", "start c", "end c"]);
+  });
+
+  it("rejects only the failing task's caller and carries on with the next", async () => {
+    const queue = new SerialQueue();
+
+    const failing = queue.run(() => Promise.reject(new Error("settlement failed")));
+    const throwing = queue.run(() => {
+      throw new Error("threw before returning a promise");
+    });
+    const next = queue.run(() => Promise.resolve("still ran"));
+
+    await expect(failing).rejects.toThrow("settlement failed");
+    await expect(throwing).rejects.toThrow("threw before returning a promise");
+    await expect(next).resolves.toBe("still ran");
   });
 });

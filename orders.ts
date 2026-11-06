@@ -8,6 +8,25 @@ import { type Database, LedgerError, reserve } from "./ledger.ts";
 import { formatAmount, fromNumeric, notional } from "./money.ts";
 import { assets, markets, orders } from "./schema.ts";
 
+// Runs async tasks one at a time, in the order they were added. Each market gets one, so its
+// engine command and the settlement that follows have exactly one writer: the next command
+// starts only once the previous one's settlement has committed or failed. Without it, two
+// settlements could commit in the opposite order to the engine events they record.
+export class SerialQueue {
+  #tail: Promise<void> = Promise.resolve();
+
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.#tail.then(task);
+    // The next task waits for this one either way. A failure belongs to this task's caller,
+    // who gets `result`; it must not stop the tasks queued behind it.
+    this.#tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+}
+
 // A market with every amount already in minor units: prices and the tick at the quote
 // asset's scale, quantities, the step and the minimum at the base asset's.
 export type Market = {
