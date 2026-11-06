@@ -1,6 +1,8 @@
 import { createClient } from "redis";
 import { afterAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import { Exchange } from "./exchange.ts";
+import { release } from "./ledger.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
@@ -633,5 +635,114 @@ describe("POST /orders rate limit", () => {
     const second = await postOrder(authorization, cheapBuy, withoutRedis);
 
     expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
+  });
+});
+
+describe("a market whose settlement fails", () => {
+  const exchange = new Exchange(db);
+  const halts: string[] = [];
+  const causes: unknown[] = [];
+  exchange.onHalt((market, error) => {
+    halts.push(market);
+    causes.push(error);
+  });
+  const app = buildServer({ pool, redis, db, tokens, exchange });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  async function userIdOf(authorization: string): Promise<string> {
+    const me = await app.inject({ method: "GET", url: "/me", headers: { authorization } });
+    return me.json<{ id: string }>().id;
+  }
+
+  async function balances(authorization: string) {
+    const response = await app.inject({
+      method: "GET",
+      url: "/balances",
+      headers: { authorization },
+    });
+    const rows = response.json<{
+      balances: { asset: string; available: string; reserved: string }[];
+    }>().balances;
+    return Object.fromEntries(rows.map((row) => [row.asset, [row.available, row.reserved]]));
+  }
+
+  const order = (market: string, side: string, price: string, quantity: string) => ({
+    market,
+    side,
+    type: "limit",
+    price,
+    quantity,
+  });
+
+  it("halts that market, keeps the ledger balanced and leaves the other market trading", async () => {
+    const seller = await signedInUser(app);
+    const buyer = await signedInUser(app);
+    await fund(seller, "BTC", "1", app);
+    await fund(buyer, "USD", "100000", app);
+    await fund(buyer, "ETH", "1", app);
+    const ask = await postOrder(seller, order("BTC-USD", "sell", "60000", "0.1"), app);
+    expect(ask.statusCode).toBe(201);
+
+    // Behind the exchange's back, hand the seller's reserved BTC back to them. The engine still
+    // holds the ask, so the next fill's ledger posting will find nothing to debit.
+    await release(db, await userIdOf(seller), "BTC", 10_000_000n);
+
+    const failed = await postOrder(buyer, order("BTC-USD", "buy", "60000", "0.1"), app);
+
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json<unknown>()).toMatchObject({ error: "market_halted" });
+    expect(halts).toEqual(["BTC-USD"]);
+    expect(causes).toEqual([expect.objectContaining({ code: "insufficient_funds" })]);
+    expect(exchange.isHalted("BTC-USD")).toBe(true);
+
+    // Nothing of the failed settlement was written: the buy is pending with its 6,000 still
+    // reserved, no trade exists, and every asset's entries still sum to zero.
+    const pending = await app.inject({
+      method: "GET",
+      url: "/orders?status=open",
+      headers: { authorization: buyer },
+    });
+    expect(pending.json<{ orders: unknown[] }>().orders).toEqual([
+      expect.objectContaining({ status: "pending", filledQuantity: "0.00000000" }),
+    ]);
+    await expect(balances(buyer)).resolves.toMatchObject({
+      USD: ["94000.00000000", "6000.00000000"],
+    });
+    const fills = await app.inject({
+      method: "GET",
+      url: "/fills",
+      headers: { authorization: buyer },
+    });
+    expect(fills.json<unknown>()).toEqual({ fills: [] });
+    const totals = await db.execute<{ asset: string; total: string }>(sql`
+      select a.asset, sum(e.amount)::text as total
+      from ledger_entries e join ledger_accounts a on a.id = e.account_id
+      group by a.asset`);
+    for (const row of totals.rows) {
+      expect(Number(row.total)).toBe(0);
+    }
+
+    // The halted market refuses the next order before reserving anything, and cancels too.
+    const refused = await postOrder(buyer, order("BTC-USD", "buy", "50000", "0.1"), app);
+    expect(refused.statusCode).toBe(503);
+    expect(refused.json<unknown>()).toMatchObject({ error: "market_halted" });
+    await expect(balances(buyer)).resolves.toMatchObject({
+      USD: ["94000.00000000", "6000.00000000"],
+    });
+    const cancel = await app.inject({
+      method: "DELETE",
+      url: `/orders/${ask.json<{ id: string }>().id}`,
+      headers: { authorization: seller },
+    });
+    expect(cancel.statusCode).toBe(503);
+
+    // The other market never stopped.
+    const eth = await postOrder(buyer, order("ETH-USD", "sell", "3000", "0.5"), app);
+    expect(eth.statusCode).toBe(201);
+    expect(exchange.isHalted("ETH-USD")).toBe(false);
+    expect(halts).toEqual(["BTC-USD"]);
   });
 });

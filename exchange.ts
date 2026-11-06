@@ -242,22 +242,51 @@ function summarize(orderId: string, events: EngineEvent[]): PlacedOrder {
   };
 }
 
+// Fail-stop. A settlement that fails has already happened in the engine: the book has
+// matched, rested or removed orders, and the engine cannot undo that. Matching anything more
+// against a book Postgres disagrees with would only spread the damage, so the market stops
+// and stays stopped until the process restarts. Other markets keep trading.
+export class MarketHaltedError extends Error {
+  readonly market: string;
+
+  constructor(market: string, options?: ErrorOptions) {
+    super(`market ${market} is halted after a failed settlement`, options);
+    this.name = "MarketHaltedError";
+    this.market = market;
+  }
+}
+
+export type HaltListener = (market: string, error: unknown) => void;
+
+type RunningMarket = { engine: Engine; queue: SerialQueue; halted: boolean };
+
 // One engine and one queue per market, created the first time the market is traded. The
 // books live in this process's memory: an order still open when the process stops stays
 // open and reserved in Postgres but is gone from the book, until Session 10's recovery
 // replays the event log.
 export class Exchange {
   readonly #db: Database;
-  readonly #markets = new Map<string, { engine: Engine; queue: SerialQueue }>();
+  readonly #markets = new Map<string, RunningMarket>();
+  readonly #haltListeners: HaltListener[] = [];
 
   constructor(db: Database) {
     this.#db = db;
   }
 
+  // Called once per halt with the settlement's error. The server logs it at fatal.
+  onHalt(listener: HaltListener): void {
+    this.#haltListeners.push(listener);
+  }
+
+  isHalted(symbol: string): boolean {
+    return this.#markets.get(symbol)?.halted ?? false;
+  }
+
   // Throws DuplicateOrderError, without touching the book or the ledger, when the request
-  // repeats a client order id the user has already placed.
+  // repeats a client order id the user has already placed, and MarketHaltedError when the
+  // market is halted.
   async placeOrder(market: Market, request: OrderRequest): Promise<PlacedOrder> {
-    const { engine, queue } = this.#market(market.symbol);
+    const running = this.#market(market.symbol);
     // Checked first so a retry gets its original order back even if the book or the balance
     // has changed since. recordOrder catches the retry that races the original.
     if (request.clientOrderId !== undefined) {
@@ -270,6 +299,10 @@ export class Exchange {
         throw new DuplicateOrderError(existing);
       }
     }
+    // Before anything is reserved, so a refused order costs the user nothing.
+    if (running.halted) {
+      throw new MarketHaltedError(market.symbol);
+    }
     // Read from the book as it is now, outside the queue. Commands queued ahead may move the
     // book before this order runs; the protection price still bounds what it can spend.
     const accepted =
@@ -280,30 +313,32 @@ export class Exchange {
             protectionPrice: protectionPrice(
               market,
               request.side,
-              engine.bestPrice(request.side === "buy" ? "sell" : "buy"),
+              running.engine.bestPrice(request.side === "buy" ? "sell" : "buy"),
             ),
           };
     const { id } = await recordOrder(this.#db, market, accepted);
 
-    return queue.run(async () => {
-      const { clientOrderId: _clientOrderId, ...order } = accepted;
-      const events = engine.submit({ ...order, id });
-      await settle(this.#db, market, events, worstPrice(accepted));
-      return summarize(id, events);
-    });
+    const { clientOrderId: _clientOrderId, ...order } = accepted;
+    const events = await this.#execute(
+      running,
+      market,
+      (engine) => engine.submit({ ...order, id }),
+      worstPrice(accepted),
+    );
+    return summarize(id, events);
   }
 
   // Takes a resting order off the book and releases what its unfilled quantity had reserved.
   // Queued behind every command already waiting, so an order still pending is matched first
   // and the cancel then finds it resting, filled or gone. Ownership is the caller's check.
   async cancelOrder(market: Market, orderId: string): Promise<"cancelled" | "not_open"> {
-    const { engine, queue } = this.#market(market.symbol);
+    const running = this.#market(market.symbol);
+    if (running.halted) {
+      throw new MarketHaltedError(market.symbol);
+    }
 
-    return queue.run(async () => {
-      const events = engine.cancel(orderId);
-      await settle(this.#db, market, events, null);
-      return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
-    });
+    const events = await this.#execute(running, market, (engine) => engine.cancel(orderId), null);
+    return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
   }
 
   // The public view of a market's book. A market nobody has traded yet has an empty one.
@@ -311,10 +346,39 @@ export class Exchange {
     return this.#market(symbol).engine.depth(limit);
   }
 
-  #market(symbol: string): { engine: Engine; queue: SerialQueue } {
+  // Runs one engine command and its settlement as one task in the market's queue, halting the
+  // market if the settlement fails. A command that throws inside the engine is not a reason to
+  // halt: the engine checks its input before changing the book.
+  #execute(
+    running: RunningMarket,
+    market: Market,
+    command: (engine: Engine) => EngineEvent[],
+    takerLimit: bigint | null,
+  ): Promise<EngineEvent[]> {
+    return running.queue.run(async () => {
+      // Commands queued before the halt are refused too. An order among them stays pending
+      // and reserved, like the one whose settlement failed, until Session 10's recovery.
+      if (running.halted) {
+        throw new MarketHaltedError(market.symbol);
+      }
+      const events = command(running.engine);
+      try {
+        await settle(this.#db, market, events, takerLimit);
+      } catch (error) {
+        running.halted = true;
+        for (const listener of this.#haltListeners) {
+          listener(market.symbol, error);
+        }
+        throw new MarketHaltedError(market.symbol, { cause: error });
+      }
+      return events;
+    });
+  }
+
+  #market(symbol: string): RunningMarket {
     let market = this.#markets.get(symbol);
     if (market === undefined) {
-      market = { engine: new Engine(symbol), queue: new SerialQueue() };
+      market = { engine: new Engine(symbol), queue: new SerialQueue(), halted: false };
       this.#markets.set(symbol, market);
     }
     return market;

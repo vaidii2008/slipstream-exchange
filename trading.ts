@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Side } from "./book.ts";
-import type { Exchange } from "./exchange.ts";
+import { type Exchange, MarketHaltedError } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
 import { findOrder, listFills, listOrders, type OrderRow, takerFills } from "./history.ts";
@@ -86,6 +86,13 @@ function orderJson(row: OrderRow, market: Market) {
     clientOrderId: row.clientOrderId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+function haltedJson(error: MarketHaltedError) {
+  return {
+    error: "market_halted",
+    message: `${error.market} is halted and accepts no orders or cancels until it restarts`,
   };
 }
 
@@ -216,6 +223,9 @@ export function registerTradingRoutes(
           quantity: quantity.units,
         });
       }
+      if (error instanceof MarketHaltedError) {
+        return reply.code(503).send(haltedJson(error));
+      }
       if (!(error instanceof OrderError)) {
         throw error;
       }
@@ -259,7 +269,15 @@ export function registerTradingRoutes(
     }
     const market = marketOf(await loadMarkets(db), order.market);
 
-    const outcome = await exchange.cancelOrder(market, order.id);
+    let outcome;
+    try {
+      outcome = await exchange.cancelOrder(market, order.id);
+    } catch (error) {
+      if (error instanceof MarketHaltedError) {
+        return reply.code(503).send(haltedJson(error));
+      }
+      throw error;
+    }
     // Read back after the queue has run the cancel, so the status and filled quantity are
     // what settlement wrote, including any fill that landed just before.
     const current = await findOrder(db, userId, order.id);

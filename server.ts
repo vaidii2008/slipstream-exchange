@@ -103,6 +103,10 @@ export function buildServer(
     });
   });
 
+  exchange.onHalt((market, error) => {
+    app.log.fatal({ err: error, market }, "market halted: settlement failed after matching");
+  });
+
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
   registerWalletRoutes(app, { db, tokens });
