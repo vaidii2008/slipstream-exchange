@@ -253,3 +253,88 @@ meant to catch it.
   would be half of recovery, since the book would still be empty. The constraint comes back
   in Session 10 with the event log.
 - **Where:** `trades` in `schema.ts`; migrations `0006` and `0007`.
+
+## Order lifecycle
+
+### A market order gets a protection price 5% beyond the best opposite price
+
+- **Decision:** on arrival, a market order is bounded at the best opposite price moved 5%
+  against the taker, rounded onto the tick grid. A buy reserves quantity × that price, and the
+  engine stops matching at it and cancels the rest.
+- **Alternative:** reserve the user's whole available balance, or ask the client for a
+  maximum spend.
+- **Why:** a market buy has no price, so without a bound there is nothing to reserve and a
+  thin book could fill it at any price. The bound makes the reservation exact and protects the
+  user from sweeping a book far past where it stood. The cost is that the part of an order
+  beyond 5% is cancelled, not filled.
+- **Where:** `protectionPrice` in `orders.ts`; `MarketOrder.protectionPrice` in `engine.ts`.
+
+### Idempotency: insert the order before reserving, and let the unique index decide
+
+- **Decision:** `recordOrder` inserts the order row first, with `ON CONFLICT DO NOTHING` on
+  (user, client order id), and reserves only if the insert went in. A repeat gets the original
+  order back with 200; the same key on a different order gets 409.
+- **Alternative:** reserve first and insert after, or check for the key and then insert.
+- **Why:** a second insert with the same key waits on the index until the first commits, then
+  conflicts, so repeats are serialised by Postgres. Reserving first, a repeat could fail for
+  insufficient funds that the original had just taken. Six parallel identical sells against a
+  balance that funds one: one order, five duplicates, one reservation.
+- **Where:** `recordOrder` in `orders.ts`; `replyToRepeat` in `trading.ts`.
+
+### Public market data is aggregated inside the book
+
+- **Decision:** `OrderBook.depth` sums each price level to a price and a total quantity, and
+  the routes build every response field by field. No user id or order id leaves the API on a
+  public route.
+- **Alternative:** take `snapshot()` (which carries `userId` and order ids) and strip fields
+  in the route.
+- **Why:** stripping is a filter that a later field can slip past. Aggregating where the data
+  lives means the per-order data never reaches the route. The tests check that the response
+  body contains none of the users' or orders' ids.
+- **Where:** `depth` in `book.ts`; `market.ts`.
+
+### A fixed-window rate limit on Redis that fails open
+
+- **Decision:** `INCR` and `PEXPIRE NX` in one `MULTI`, on a key holding the user and the
+  window number; 20 orders per user per second by default. If Redis is unreachable the order
+  goes ahead and the error is logged.
+- **Alternative:** a sliding window or token bucket; failing closed.
+- **Why:** it is one round trip and easy to reason about. Its weakness is written down as a
+  test: a full allowance at the end of one window and another at the start of the next is
+  2 × limit within 2 ms. It fails open because the limiter guards against runaway clients, not
+  correctness, and the queue cap bounds load either way.
+- **Where:** `ratelimit.ts`; `underOrderLimit` in `trading.ts`.
+
+### Fail-stop: a failed settlement halts its market
+
+- **Decision:** if a settlement throws, the market is marked halted, logged at fatal, and
+  every later command for it gets 503 `market_halted` until restart. Other markets trade on.
+- **Alternative:** keep trading, or try to undo the engine's change.
+- **Why:** the engine has already matched and cannot roll back, so its book and Postgres now
+  disagree. Matching more orders against that book would build trades on a state the ledger
+  never recorded. Stopping one market is cheaper than repairing a ledger. Session 10's replay
+  is what brings it back.
+- **Where:** `#execute` and `MarketHaltedError` in `exchange.ts`.
+
+### The queue cap counts from admission, not from enqueue
+
+- **Decision:** each market admits at most 10,000 commands that have not finished. A command
+  counts from before its reservation until it settles, fails or is refused. Past the cap: 503
+  `market_busy` with `Retry-After: 1`.
+- **Alternative:** cap the `SerialQueue` itself.
+- **Why:** the order is reserved in Postgres before it is enqueued. A queue that refused it
+  then would leave a reservation with no command to settle it. Counting from admission means a
+  refused order has reserved nothing.
+- **Where:** `#admitted` and `MarketBusyError` in `exchange.ts`.
+
+### Interview note: Session 5, the order lifecycle
+
+The problem was keeping money correct when a client retries, two requests race, a settlement
+throws after the in-memory engine has already matched, or a burst outruns Postgres. Each case
+got one rule: idempotency keys serialised by a unique index, a protection price that bounds
+what a market order reserves, fail-stop on a failed settlement, and a per-market admission cap.
+The trade-off is availability for correctness: a market whose settlement fails stops until
+restart, and a busy one turns clients away with 503 rather than queueing without bound. Five
+identical requests at once give one 201, four 200s and one reservation. A settlement forced to
+fail leaves the ledger summing to zero and the buy pending and reserved with no trade written,
+while BTC-USD refuses the next order and ETH-USD still accepts one.
