@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Balances } from "@/components/balances";
+import { CandleChart } from "@/components/candle-chart";
 import { Fills, OrderHistory } from "@/components/history";
 import { OpenOrders } from "@/components/open-orders";
 import { OrderBook } from "@/components/order-book";
@@ -77,6 +78,7 @@ export function Terminal() {
           </button>
         ))}
       </nav>
+      <CandleChart market={market} />
       <div className="grid flex-1 grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_minmax(16rem,22rem)_1fr]">
         <div className="border-r">
           <OrderBook market={market} />

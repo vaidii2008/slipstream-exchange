@@ -19,6 +19,7 @@ import { create } from "zustand";
 import type { Channel, ClientMessage, ServerMessage } from "@slipstream/protocol";
 import { useBalances, useOrderUpdates } from "./account";
 import { useBooks } from "./book";
+import { useCandles } from "./candles";
 import { useTrades } from "./trades";
 import { API_URL, currentAccessToken, refreshAccessToken, useSession } from "./session";
 
@@ -226,6 +227,9 @@ export class MarketSocket {
     }
     if (message.type === "trade") {
       useTrades.getState().receive(message);
+    }
+    if (message.type === "candle") {
+      useCandles.getState().receive(message);
     }
     if (message.type === "balances") {
       useBalances.getState().receive(message);
