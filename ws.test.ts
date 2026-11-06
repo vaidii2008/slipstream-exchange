@@ -6,8 +6,9 @@ import { parseAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
-import { useTestServer } from "./testing.ts";
-import { decode } from "./ws.ts";
+import { TEST_SECRET, useTestServer } from "./testing.ts";
+import { createAccessTokens } from "./tokens.ts";
+import { decode, TOKEN_EXPIRED_CLOSE_CODE } from "./ws.ts";
 
 const { app, pool, redis, db, tokens, uniqueEmail } = useTestServer();
 
@@ -128,6 +129,12 @@ describe("the /ws subscribe protocol", () => {
     ["an unknown op", { op: "trade", channel: "book", market: "BTC-USD" }, "op: "],
     ["an unknown channel", { op: "subscribe", channel: "candles", market: "BTC-USD" }, "channel"],
     ["an extra field", { op: "subscribe", channel: "book", market: "BTC-USD", depth: 5 }, ""],
+    ["a book with no market", { op: "subscribe", channel: "book" }, "market"],
+    [
+      "an account with a market",
+      { op: "subscribe", channel: "account", market: "BTC-USD" },
+      "market",
+    ],
   ])("answers %s with invalid_message and stays open", async (_label, message, detail) => {
     const client = await connect();
 
@@ -310,5 +317,95 @@ describe("the trades channel", () => {
       expect(sent).not.toContain(id);
     }
     client.close();
+  });
+});
+
+describe("the account channel", () => {
+  const { exchange, server } = freshServer();
+
+  async function signedIn(userId: string) {
+    const client = await connect(server);
+    client.send({ op: "auth", token: await tokens.issue(userId) });
+    await expect(client.next()).resolves.toMatchObject({ type: "authenticated" });
+    client.send({ op: "subscribe", channel: "account" });
+    await expect(client.next()).resolves.toEqual({ type: "subscribed", channel: "account" });
+    return client;
+  }
+
+  it("refuses to subscribe before authenticating, and refuses a bad token", async () => {
+    const client = await connect(server);
+
+    client.send({ op: "subscribe", channel: "account" });
+    await expect(client.next()).resolves.toMatchObject({ error: "unauthenticated" });
+    client.send({ op: "auth", token: "not-a-jwt" });
+    await expect(client.next()).resolves.toMatchObject({ error: "invalid_token" });
+    client.close();
+  });
+
+  it("sends the owner's order events and versioned balances, and nothing to anyone else", async () => {
+    const market = await btcUsd();
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "10000" });
+    const sellerSocket = await signedIn(seller);
+    const opening = (await sellerSocket.next()) as { type: string; version: number };
+    expect(opening).toMatchObject({ type: "balances" });
+    const bystander = await signedIn(buyer);
+    await bystander.next();
+    bystander.send({ op: "unsubscribe", channel: "account" });
+    await bystander.next();
+
+    const ask = await exchange.placeOrder(market, {
+      ...limit(seller, "sell", "60000", "0.1"),
+      clientOrderId: "ask-1",
+    });
+    await expect(sellerSocket.next()).resolves.toEqual({
+      type: "order",
+      market: "BTC-USD",
+      id: ask.id,
+      clientOrderId: "ask-1",
+      status: "open",
+      filledQuantity: "0.00000000",
+      sequence: 1,
+    });
+    const reserved = (await sellerSocket.next()) as { version: number; balances: unknown[] };
+    expect(reserved.version).toBeGreaterThan(opening.version);
+    expect(reserved.balances).toContainEqual({
+      asset: "BTC",
+      available: "0.90000000",
+      reserved: "0.10000000",
+    });
+
+    // The fill reaches the maker too.
+    await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1"));
+    await expect(sellerSocket.next()).resolves.toMatchObject({
+      type: "order",
+      id: ask.id,
+      status: "filled",
+      filledQuantity: "0.10000000",
+      sequence: 2,
+    });
+    await expect(sellerSocket.next()).resolves.toMatchObject({ type: "balances" });
+
+    // The buyer unsubscribed: the next thing it receives is the reply to this.
+    bystander.send({ op: "subscribe", channel: "trades", market: "ETH-USD" });
+    await expect(bystander.next()).resolves.toMatchObject({ type: "subscribed" });
+    sellerSocket.close();
+    bystander.close();
+  });
+
+  it("closes the connection when its access token expires", async () => {
+    const userId = await funded({});
+    const shortLived = createAccessTokens(TEST_SECRET, { ttlSeconds: 1 });
+    const client = await connect(server);
+    const closed = new Promise<number>((resolve) => {
+      client.socket.on("close", (code) => {
+        resolve(code);
+      });
+    });
+
+    client.send({ op: "auth", token: await shortLived.issue(userId) });
+    await expect(client.next()).resolves.toMatchObject({ type: "authenticated" });
+
+    await expect(closed).resolves.toBe(TOKEN_EXPIRED_CLOSE_CODE);
   });
 });

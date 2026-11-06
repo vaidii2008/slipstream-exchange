@@ -114,7 +114,7 @@ export function buildServer(
   registerWalletRoutes(app, { db, tokens });
   registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
   registerMarketDataRoutes(app, { db, exchange });
-  registerWebSocketRoutes(app, { db, exchange });
+  registerWebSocketRoutes(app, { db, exchange, tokens });
 
   return app;
 }

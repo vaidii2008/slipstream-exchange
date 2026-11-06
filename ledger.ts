@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, sum } from "drizzle-orm";
+import { and, eq, inArray, isNull, max, sum } from "drizzle-orm";
 import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import { formatAmount, fromNumeric } from "./money.ts";
@@ -270,12 +270,23 @@ export type Balance = {
 // Every listed asset, zero where the user has no entries. Summed from the entries on every
 // read; there is no stored balance that could drift from them.
 export async function balancesOf(db: Database, userId: string): Promise<Balance[]> {
+  return (await accountState(db, userId)).balances;
+}
+
+// Balances with a version: the highest ledger entry id they include, 0 before any. Entry ids
+// only grow, so of two reads the one with the higher version saw at least everything the
+// other did. Both come from one statement, so they always describe the same moment.
+export async function accountState(
+  db: Database,
+  userId: string,
+): Promise<{ version: number; balances: Balance[] }> {
   const rows = await db
     .select({
       asset: assets.code,
       scale: assets.scale,
       bucket: ledgerAccounts.bucket,
       total: sum(ledgerEntries.amount),
+      lastEntry: max(ledgerEntries.id),
     })
     .from(assets)
     .leftJoin(
@@ -286,6 +297,7 @@ export async function balancesOf(db: Database, userId: string): Promise<Balance[
     .groupBy(assets.code, assets.scale, ledgerAccounts.bucket)
     .orderBy(assets.code);
 
+  let version = 0;
   const balances = new Map<string, Balance>();
   for (const row of rows) {
     const balance = balances.get(row.asset) ?? {
@@ -297,7 +309,10 @@ export async function balancesOf(db: Database, userId: string): Promise<Balance[
     if (row.bucket !== null && row.total !== null) {
       balance[row.bucket] = fromNumeric(row.total, row.scale);
     }
+    if (row.lastEntry !== null && row.lastEntry > version) {
+      version = row.lastEntry;
+    }
     balances.set(row.asset, balance);
   }
-  return [...balances.values()];
+  return { version, balances: [...balances.values()] };
 }

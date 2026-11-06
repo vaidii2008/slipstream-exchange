@@ -18,33 +18,64 @@ import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
 import type { Side } from "./book.ts";
 import { type Exchange, type MarketUpdate, SerialQueue } from "./exchange.ts";
-import type { Database } from "./ledger.ts";
+import { accountState, type Database } from "./ledger.ts";
 import { formatAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
+import type { AccessTokens } from "./tokens.ts";
 
 export type WebSocketDependencies = {
   db: Database;
   exchange: Exchange;
+  tokens: AccessTokens;
 };
 
 // A client message larger than this closes the connection: commands are tiny.
 const MAX_CLIENT_MESSAGE_BYTES = 4096;
 
-const marketChannel = {
-  channel: z.enum(["book", "trades"]),
-  market: z.string().min(1).max(32),
+// book and trades are per market and public; account is the authenticated user's own.
+const channelFields = {
+  channel: z.enum(["book", "trades", "account"]),
+  market: z.string().min(1).max(32).optional(),
+};
+const marketMatchesChannel = (message: { channel: string; market?: string | undefined }) =>
+  (message.channel === "account") === (message.market === undefined);
+const MARKET_RULE = {
+  message: "market is required for book and trades, and not allowed for account",
+  path: ["market"],
 };
 const clientMessage = z.discriminatedUnion("op", [
-  z.strictObject({ op: z.literal("subscribe"), ...marketChannel }),
-  z.strictObject({ op: z.literal("unsubscribe"), ...marketChannel }),
+  z.strictObject({ op: z.literal("auth"), token: z.string().min(1).max(4096) }),
+  z
+    .strictObject({ op: z.literal("subscribe"), ...channelFields })
+    .refine(marketMatchesChannel, MARKET_RULE),
+  z
+    .strictObject({ op: z.literal("unsubscribe"), ...channelFields })
+    .refine(marketMatchesChannel, MARKET_RULE),
 ]);
 type ClientMessage = z.infer<typeof clientMessage>;
 
 type Level = { price: string; quantity: string };
 
 export type ServerMessage =
-  | { type: "subscribed" | "unsubscribed"; channel: string; market: string }
+  | { type: "subscribed" | "unsubscribed"; channel: string; market?: string }
+  | { type: "authenticated"; expiresAt: string }
   | { type: "error"; error: string; message: string }
+  | {
+      type: "order";
+      market: string;
+      id: string;
+      clientOrderId: string | null;
+      status: string;
+      filledQuantity: string;
+      sequence: number;
+    }
+  | {
+      // The whole balance sheet. Keep the one with the highest version: two markets can
+      // settle for the same user at once, and their balance reads can arrive out of order.
+      type: "balances";
+      version: number;
+      balances: { asset: string; available: string; reserved: string }[];
+    }
   | { type: "book"; market: string; sequence: number; bids: Level[]; asks: Level[] }
   | {
       type: "book_update";
@@ -130,6 +161,9 @@ class Connection {
   readonly socket: WebSocket;
   readonly topics = new Set<string>();
   readonly inbox = new SerialQueue();
+  userId: string | undefined;
+  // Closes the connection when its access token expires.
+  expiry: NodeJS.Timeout | undefined;
 
   constructor(socket: WebSocket) {
     this.socket = socket;
@@ -161,6 +195,10 @@ export class MarketDataHub {
       this.#byTopic.delete(topic);
     }
     connection.topics.delete(topic);
+  }
+
+  has(topic: string): boolean {
+    return this.#byTopic.has(topic);
   }
 
   publish(topic: string, message: ServerMessage): void {
@@ -206,16 +244,68 @@ function parse(data: RawData): ClientMessage | ServerMessage {
   return parsed.data;
 }
 
+// A token's user stays authenticated until the token expires; the connection is then closed
+// with this code, and the client reconnects with a fresh token.
+export const TOKEN_EXPIRED_CLOSE_CODE = 4001;
+
+async function balancesMessage(db: Database, userId: string): Promise<ServerMessage> {
+  const { version, balances } = await accountState(db, userId);
+  return {
+    type: "balances",
+    version,
+    balances: balances.map((balance) => ({
+      asset: balance.asset,
+      available: formatAmount(balance.available, balance.scale),
+      reserved: formatAmount(balance.reserved, balance.scale),
+    })),
+  };
+}
+
 export function registerWebSocketRoutes(
   app: FastifyInstance,
-  { db, exchange }: WebSocketDependencies,
+  { db, exchange, tokens }: WebSocketDependencies,
 ) {
   const hub = new MarketDataHub();
 
+  // Read after the settlement committed, so it includes it. Off the market's queue: the
+  // listener must not wait, and only users with a connection pay for the read.
+  function sendBalances(userId: string): void {
+    balancesMessage(db, userId).then(
+      (message) => {
+        hub.publish(topicOf("account", userId), message);
+      },
+      (error: unknown) => {
+        app.log.error({ err: error, userId }, "balances for the account channel failed");
+      },
+    );
+  }
+
   const stopListening = exchange.onUpdate((update) => {
-    hub.publish(topicOf("book", update.market.symbol), bookUpdate(update));
+    const { market } = update;
+    hub.publish(topicOf("book", market.symbol), bookUpdate(update));
     for (const trade of tradeMessages(update)) {
-      hub.publish(topicOf("trades", update.market.symbol), trade);
+      hub.publish(topicOf("trades", market.symbol), trade);
+    }
+
+    const owners = new Set<string>();
+    for (const order of update.orders) {
+      const topic = topicOf("account", order.userId);
+      if (!hub.has(topic)) {
+        continue;
+      }
+      hub.publish(topic, {
+        type: "order",
+        market: market.symbol,
+        id: order.id,
+        clientOrderId: order.clientOrderId,
+        status: order.status,
+        filledQuantity: formatAmount(order.filledQuantity, market.baseScale),
+        sequence: order.sequence,
+      });
+      owners.add(order.userId);
+    }
+    for (const userId of owners) {
+      sendBalances(userId);
     }
   });
   app.addHook("onClose", (_instance, done) => {
@@ -223,26 +313,78 @@ export function registerWebSocketRoutes(
     done();
   });
 
+  async function authenticate(connection: Connection, token: string): Promise<void> {
+    const verification = await tokens.verify(token);
+    if (!verification.ok) {
+      const error = verification.reason === "expired" ? "token_expired" : "invalid_token";
+      connection.send({ type: "error", error, message: "authenticate with a valid access token" });
+      return;
+    }
+    // One user per connection: switching would leave the old user's account subscription.
+    if (connection.userId !== undefined && connection.userId !== verification.userId) {
+      connection.send({
+        type: "error",
+        error: "already_authenticated",
+        message: "this connection belongs to another user; open a new one",
+      });
+      return;
+    }
+    connection.userId = verification.userId;
+    clearTimeout(connection.expiry);
+    connection.expiry = setTimeout(
+      () => {
+        connection.socket.close(TOKEN_EXPIRED_CLOSE_CODE, "access token expired");
+      },
+      Math.max(0, verification.expiresAt.getTime() - Date.now()),
+    );
+    connection.send({ type: "authenticated", expiresAt: verification.expiresAt.toISOString() });
+  }
+
   async function handle(connection: Connection, data: RawData): Promise<void> {
     const message = parse(data);
     if ("type" in message) {
       connection.send(message);
       return;
     }
+    if (message.op === "auth") {
+      await authenticate(connection, message.token);
+      return;
+    }
 
-    const { channel } = message;
-    const market = await loadMarket(db, message.market);
+    const { op, channel } = message;
+    if (channel === "account") {
+      if (connection.userId === undefined) {
+        connection.send({
+          type: "error",
+          error: "unauthenticated",
+          message: "send an auth message before subscribing to account",
+        });
+        return;
+      }
+      const topic = topicOf("account", connection.userId);
+      if (op === "subscribe") {
+        hub.subscribe(connection, topic);
+        connection.send({ type: "subscribed", channel });
+        connection.send(await balancesMessage(db, connection.userId));
+      } else {
+        hub.unsubscribe(connection, topic);
+        connection.send({ type: "unsubscribed", channel });
+      }
+      return;
+    }
+
+    const market = await loadMarket(db, message.market ?? "");
     if (market === undefined) {
       connection.send({
         type: "error",
         error: "unknown_market",
-        message: `${message.market} is not a listed market`,
+        message: `${message.market ?? ""} is not a listed market`,
       });
       return;
     }
 
     const topic = topicOf(channel, market.symbol);
-    if (message.op === "subscribe") {
+    if (op === "subscribe") {
       hub.subscribe(connection, topic);
       connection.send({ type: "subscribed", channel, market: market.symbol });
       // Taken after subscribing and in the same tick, so no delta can fall between the two.
@@ -267,6 +409,7 @@ export function registerWebSocketRoutes(
         });
     });
     socket.on("close", () => {
+      clearTimeout(connection.expiry);
       hub.disconnect(connection);
     });
   }

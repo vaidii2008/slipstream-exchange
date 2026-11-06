@@ -14,7 +14,7 @@ import {
   recordOrder,
   worstPrice,
 } from "./orders.ts";
-import { settle, type Trade } from "./settlement.ts";
+import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
 // engine command and the settlement that follows have exactly one writer: the next command
@@ -98,6 +98,8 @@ export type MarketUpdate = {
   settledAt: Date;
   // Each price level the command changed, with the total now resting there (0: gone).
   levels: { side: Side; price: bigint; quantity: bigint }[];
+  // Each order the command changed, as settlement left it. Private to each order's owner.
+  orders: SettledOrder[];
 };
 
 // Called inside the market's queue, in sequence order, after the settlement has committed.
@@ -255,8 +257,9 @@ export class Exchange {
         throw new MarketHaltedError(market.symbol);
       }
       const events = command(running.engine);
+      let settled;
       try {
-        await settle(this.#db, market, events, takerLimit);
+        settled = await settle(this.#db, market, events, takerLimit);
       } catch (error) {
         running.halted = true;
         for (const listener of this.#haltListeners) {
@@ -264,14 +267,14 @@ export class Exchange {
         }
         throw new MarketHaltedError(market.symbol, { cause: error });
       }
-      this.#announce(running.engine, market, events);
+      this.#announce(running.engine, market, events, settled);
       return events;
     });
   }
 
   // Every command emits at least one event (a cancel of a missing order emits a rejection),
   // so every sequence number reaches the listeners unless a settlement failed.
-  #announce(engine: Engine, market: Market, events: EngineEvent[]): void {
+  #announce(engine: Engine, market: Market, events: EngineEvent[], orders: SettledOrder[]): void {
     const first = events[0];
     const last = events.at(-1);
     if (first === undefined || last === undefined || this.#updateListeners.size === 0) {
@@ -288,6 +291,7 @@ export class Exchange {
         price,
         quantity: engine.quantityAt(side, price),
       })),
+      orders,
     };
     for (const listener of this.#updateListeners) {
       listener(update);

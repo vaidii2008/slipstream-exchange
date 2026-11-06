@@ -12,7 +12,7 @@ import {
   type Posting,
   postTransaction,
 } from "./ledger.ts";
-import { formatAmount, notional } from "./money.ts";
+import { formatAmount, fromNumeric, notional } from "./money.ts";
 import { type Market, reservationFor } from "./orders.ts";
 import { orders, trades } from "./schema.ts";
 
@@ -88,12 +88,26 @@ function cancelledReservation(
   return reservationFor(market, event.side, price, event.quantity);
 }
 
-async function applyFill(
-  tx: Database,
-  orderId: string,
-  quantity: string,
-  sequence: number,
-): Promise<void> {
+// An order as settlement left it, for the owner's private stream.
+export type SettledOrder = {
+  id: string;
+  userId: string;
+  clientOrderId: string | null;
+  status: "pending" | "open" | "filled" | "cancelled";
+  // At the market's base scale.
+  filledQuantity: bigint;
+  sequence: number;
+};
+
+const settledColumns = {
+  id: orders.id,
+  userId: orders.userId,
+  clientOrderId: orders.clientOrderId,
+  status: orders.status,
+  filledQuantity: orders.filledQuantity,
+};
+
+async function applyFill(tx: Database, orderId: string, quantity: string, sequence: number) {
   // Every column on the right-hand side reads the row as it was before this update.
   const updated = await tx
     .update(orders)
@@ -105,10 +119,12 @@ async function applyFill(
       updatedAt: sql`now()`,
     })
     .where(eq(orders.id, orderId))
-    .returning({ id: orders.id });
-  if (updated.length !== 1) {
+    .returning(settledColumns);
+  const [row] = updated;
+  if (row === undefined || updated.length !== 1) {
     throw new Error(`filled order ${orderId} has no row`);
   }
+  return row;
 }
 
 async function setStatus(
@@ -116,28 +132,31 @@ async function setStatus(
   orderId: string,
   status: "open" | "cancelled",
   sequence: number,
-): Promise<void> {
+) {
   const updated = await tx
     .update(orders)
     .set({ status, engineSequence: sequence, updatedAt: sql`now()` })
     .where(eq(orders.id, orderId))
-    .returning({ id: orders.id });
-  if (updated.length !== 1) {
+    .returning(settledColumns);
+  const [row] = updated;
+  if (row === undefined || updated.length !== 1) {
     throw new Error(`${status} order ${orderId} has no row`);
   }
+  return row;
 }
 
 // Writes everything one engine command did, in one transaction: a trade row and a ledger
 // transaction per fill, each order's filled quantity and status, and the release of whatever
 // a cancelled remainder had reserved. `takerLimit` is the incoming order's worst price: its
 // limit, or a market order's protection price. Null for a cancel, which has no incoming order.
+// Returns each order the command touched as it now stands, in the order first touched.
 export async function settle(
   db: Database,
   market: Market,
   events: EngineEvent[],
   takerLimit: bigint | null,
-): Promise<void> {
-  await db.transaction(async (tx) => {
+): Promise<SettledOrder[]> {
+  return db.transaction(async (tx) => {
     const accounts = new Accounts(tx);
     const ledgerWork: { kind: "trade" | "release"; postings: Posting[] }[] = [];
 
@@ -170,6 +189,15 @@ export async function settle(
       await postTransaction(tx, work.kind, work.postings);
     }
 
+    const settled = new Map<string, SettledOrder>();
+    const record = (row: Awaited<ReturnType<typeof applyFill>>, sequence: number) => {
+      settled.set(row.id, {
+        ...row,
+        filledQuantity: fromNumeric(row.filledQuantity, market.baseScale),
+        sequence,
+      });
+    };
+
     for (const event of events) {
       if (event.type === "trade") {
         const quantity = formatAmount(event.quantity, market.baseScale);
@@ -181,13 +209,14 @@ export async function settle(
           quantity,
           engineSequence: event.sequence,
         });
-        await applyFill(tx, event.makerOrderId, quantity, event.sequence);
-        await applyFill(tx, event.takerOrderId, quantity, event.sequence);
+        record(await applyFill(tx, event.makerOrderId, quantity, event.sequence), event.sequence);
+        record(await applyFill(tx, event.takerOrderId, quantity, event.sequence), event.sequence);
       } else if (event.type === "rested") {
-        await setStatus(tx, event.orderId, "open", event.sequence);
+        record(await setStatus(tx, event.orderId, "open", event.sequence), event.sequence);
       } else if (event.type === "cancelled") {
-        await setStatus(tx, event.orderId, "cancelled", event.sequence);
+        record(await setStatus(tx, event.orderId, "cancelled", event.sequence), event.sequence);
       }
     }
+    return [...settled.values()];
   });
 }
