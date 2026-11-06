@@ -133,3 +133,80 @@ export const ledgerEntries = pgTable(
     check("ledger_entries_amount_nonzero", sql`${table.amount} <> 0`),
   ],
 );
+
+export const orderSide = pgEnum("order_side", ["buy", "sell"]);
+export const orderType = pgEnum("order_type", ["limit", "market"]);
+// pending: funds reserved and the row written, but the engine has not seen it yet.
+// open: resting on the book, possibly partly filled. filled and cancelled are final; a
+// cancelled order may still have filled part of its quantity first.
+export const orderStatus = pgEnum("order_status", ["pending", "open", "filled", "cancelled"]);
+
+export const orders = pgTable(
+  "orders",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    // No cascade, like the ledger: a user's orders are the history behind their balances.
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    market: text("market")
+      .notNull()
+      .references(() => markets.symbol),
+    side: orderSide("side").notNull(),
+    type: orderType("type").notNull(),
+    // Null exactly when the order is a market order.
+    price: money("price"),
+    quantity: money("quantity").notNull(),
+    filledQuantity: money("filled_quantity").notNull().default("0"),
+    status: orderStatus("status").notNull().default("pending"),
+    // The client's own id for the order, and the idempotency key from Session 5.
+    clientOrderId: text("client_order_id"),
+    // The sequence number of the last engine event applied to this row. Null while pending.
+    engineSequence: bigint("engine_sequence", { mode: "number" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("orders_user_client_order_id").on(table.userId, table.clientOrderId),
+    check(
+      "orders_price_matches_type",
+      sql`(${table.type} = 'limit') = (${table.price} is not null)`,
+    ),
+    check("orders_price_positive", sql`${table.price} > 0`),
+    check("orders_quantity_positive", sql`${table.quantity} > 0`),
+    check(
+      "orders_filled_within_quantity",
+      sql`${table.filledQuantity} >= 0 and ${table.filledQuantity} <= ${table.quantity}`,
+    ),
+  ],
+);
+
+export const trades = pgTable(
+  "trades",
+  {
+    id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    market: text("market")
+      .notNull()
+      .references(() => markets.symbol),
+    makerOrderId: uuid("maker_order_id")
+      .notNull()
+      .references(() => orders.id),
+    takerOrderId: uuid("taker_order_id")
+      .notNull()
+      .references(() => orders.id),
+    // Always the maker's price.
+    price: money("price").notNull(),
+    quantity: money("quantity").notNull(),
+    engineSequence: bigint("engine_sequence", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // One engine event is one trade, so settling the same event twice fails instead of
+    // paying both sides twice.
+    unique("trades_market_engine_sequence").on(table.market, table.engineSequence),
+    index("trades_maker_order_id_idx").on(table.makerOrderId),
+    index("trades_taker_order_id_idx").on(table.takerOrderId),
+    check("trades_price_positive", sql`${table.price} > 0`),
+    check("trades_quantity_positive", sql`${table.quantity} > 0`),
+  ],
+);

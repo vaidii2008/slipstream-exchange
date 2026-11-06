@@ -43,6 +43,13 @@
       "when": 1793936701064,
       "tag": "0005_raise_usd_scale_and_add_quantity_step",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793936780857,
+      "tag": "0006_create_orders_and_trades",
+      "breakpoints": true
     }
   ]
 }
