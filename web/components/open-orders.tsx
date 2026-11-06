@@ -4,7 +4,7 @@ import { useMutation } from "@tanstack/react-query";
 import { memo } from "react";
 import { Button } from "@/components/ui/button";
 import { decimalsOf, display, type MarketInfo } from "@/lib/markets";
-import { cancelOrder, type OrderRecord, useOpenOrders } from "@/lib/orders";
+import { cancelOrder, type OrderRecord, useOpenOrders } from "@/lib/history";
 import { ApiError } from "@/lib/session";
 import { useSubscription } from "@/lib/socket";
 
