@@ -1,7 +1,13 @@
 import { and, eq, inArray, isNull, sum } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
+import type { PgDatabase } from "drizzle-orm/pg-core";
 import { formatAmount, fromNumeric } from "./money.ts";
 import { assets, ledgerAccounts, ledgerEntries, ledgerTransactions } from "./schema.ts";
+
+// The pool-backed database or a transaction already open on it. Every ledger function takes
+// either, so a caller can reserve funds and write its own rows in one commit. Inside an open
+// transaction, postTransaction's own transaction becomes a savepoint.
+export type Database = PgDatabase<NodePgQueryResultHKT>;
 
 export type Bucket = (typeof ledgerAccounts.bucket.enumValues)[number];
 export type TransactionKind = (typeof ledgerTransactions.kind.enumValues)[number];
@@ -28,7 +34,7 @@ export class LedgerError extends Error {
 // Accounts are created the first time they are needed, so a new user has no rows until money
 // moves. `owner` null is the asset's system account.
 export async function openAccount(
-  db: NodePgDatabase,
+  db: Database,
   owner: string | null,
   asset: string,
   bucket: Bucket,
@@ -74,7 +80,7 @@ export async function openAccount(
 // Writes one transaction and all its entries, or nothing. The asset of each posting comes
 // from the database, not the caller, so a caller cannot balance BTC against USD by mislabelling.
 export async function postTransaction(
-  db: NodePgDatabase,
+  db: Database,
   kind: TransactionKind,
   postings: Posting[],
 ): Promise<number> {
@@ -184,7 +190,7 @@ export async function postTransaction(
 // Simulated: money arrives from the asset's system account, which goes negative by exactly
 // what has been deposited in total.
 export async function deposit(
-  db: NodePgDatabase,
+  db: Database,
   userId: string,
   asset: string,
   amount: bigint,
@@ -204,7 +210,7 @@ export async function deposit(
 // Moves funds from available to reserved, for an open order. Fails with insufficient_funds
 // rather than overdraw.
 export function reserve(
-  db: NodePgDatabase,
+  db: Database,
   userId: string,
   asset: string,
   amount: bigint,
@@ -214,7 +220,7 @@ export function reserve(
 
 // Moves funds from reserved back to available, for a cancelled or finished order.
 export function release(
-  db: NodePgDatabase,
+  db: Database,
   userId: string,
   asset: string,
   amount: bigint,
@@ -223,7 +229,7 @@ export function release(
 }
 
 async function moveBetweenBuckets(
-  db: NodePgDatabase,
+  db: Database,
   kind: TransactionKind,
   userId: string,
   asset: string,
@@ -252,7 +258,7 @@ export type Balance = {
 
 // Every listed asset, zero where the user has no entries. Summed from the entries on every
 // read; there is no stored balance that could drift from them.
-export async function balancesOf(db: NodePgDatabase, userId: string): Promise<Balance[]> {
+export async function balancesOf(db: Database, userId: string): Promise<Balance[]> {
   const rows = await db
     .select({
       asset: assets.code,

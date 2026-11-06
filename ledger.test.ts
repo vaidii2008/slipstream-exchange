@@ -294,6 +294,41 @@ describe("reserve and release", () => {
   });
 });
 
+describe("inside a caller's transaction", () => {
+  async function btcReserved(userId: string) {
+    const balances = await balancesOf(db, userId);
+    return balances.find((balance) => balance.asset === "BTC")?.reserved;
+  }
+
+  it("commits a reservation together with the caller's transaction", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+
+    await db.transaction(async (tx) => {
+      await reserve(tx, userId, "BTC", 40n);
+      // Visible inside the transaction before it commits.
+      const inside = await balancesOf(tx, userId);
+      expect(inside.find((balance) => balance.asset === "BTC")?.reserved).toBe(40n);
+    });
+
+    await expect(btcReserved(userId)).resolves.toBe(40n);
+  });
+
+  it("undoes a reservation when the caller's transaction fails after it", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+
+    await expect(
+      db.transaction(async (tx) => {
+        await reserve(tx, userId, "BTC", 40n);
+        throw new Error("the caller's next write failed");
+      }),
+    ).rejects.toThrow("the caller's next write failed");
+
+    await expect(btcReserved(userId)).resolves.toBe(0n);
+  });
+});
+
 describe("concurrent reservations", () => {
   it("lets exactly 10 of 50 parallel reservations of 10 through against a balance of 100", async () => {
     const userId = await createUser();
