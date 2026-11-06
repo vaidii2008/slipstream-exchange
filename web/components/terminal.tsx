@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Balances } from "@/components/balances";
 import { OrderBook } from "@/components/order-book";
 import { OrderForm } from "@/components/order-form";
 import { TradesFeed } from "@/components/trades-feed";
@@ -43,7 +44,10 @@ export function Terminal() {
         <div className="border-r">
           <TradesFeed market={market} />
         </div>
-        <OrderForm market={market} />
+        <div>
+          <Balances />
+          <OrderForm market={market} />
+        </div>
       </div>
     </div>
   );

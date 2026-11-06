@@ -21,6 +21,7 @@ vi.mock("./session", async () => {
 const { MarketSocket, TOKEN_EXPIRED_CLOSE_CODE } = await import("./socket");
 const { useBooks } = await import("./book");
 const { useTrades } = await import("./trades");
+const { useBalances } = await import("./account");
 const { useSession } = await import("./session");
 
 class FakeSocket {
@@ -61,6 +62,7 @@ beforeEach(() => {
   session.refresh.mockReset();
   useBooks.setState({ books: {} });
   useTrades.setState({ live: {} });
+  useBalances.setState({ sheet: undefined });
   socket = new MarketSocket({
     url: "ws://test/ws",
     createSocket: () => {
@@ -259,6 +261,23 @@ describe("market socket", () => {
     expect(session.refresh).toHaveBeenCalledTimes(1);
     expect(sockets).toHaveLength(2);
     expect(latest().sent).toEqual([{ op: "auth", token: "new" }]);
+  });
+
+  it("keeps the user's balances from the account channel and forgets them on sign out", async () => {
+    useSession.setState({ status: "signed_in" });
+    session.current.mockResolvedValue("token-1");
+    socket.start();
+    latest().open();
+    await vi.runAllTimersAsync();
+
+    const balances = [{ asset: "USD", available: "90.00000000", reserved: "10.00000000" }];
+    latest().receive({ type: "balances", version: 4, balances });
+
+    expect(useBalances.getState().sheet).toEqual({ version: 4, balances });
+
+    useSession.setState({ status: "signed_out" });
+
+    expect(useBalances.getState().sheet).toBeUndefined();
   });
 
   it("opens a new connection on sign out, so the server forgets the user", async () => {
