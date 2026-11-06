@@ -547,7 +547,7 @@ sharing it.
 
 ## Day 6 — Money and the ledger
 
-**Commits landed (13)**
+**Commits landed (12)**
 
 - `refactor(test): move the auth route tests from server.test.ts to auth.test.ts`
 - `refactor(test): share the Postgres test setup`
@@ -949,7 +949,7 @@ to it, it should split by route.
 
 ## Day 10 — Real-time market data
 
-**Commits landed (13)**
+**Commits landed (12)**
 
 - `refactor(redis): move the Redis client factory out of main.ts`
 - `fix(api): fail the order rate limit open within 100 ms when Redis is down or slow`
@@ -1065,3 +1065,102 @@ to it, the account channel is the piece to split out.
 - `feat(web): show a live order book that updates rows without re-rendering the book`
 - `feat(web): show the recent trades feed`
 - `feat(web): add an order entry form for limit and market orders`
+
+## Day 11 — Trading terminal, part 1
+
+**Commits landed (12)**
+
+- `feat(api): allow the web origin to call the API with credentials`
+- `chore(web): create the Next.js app with Tailwind and shadcn/ui`
+- `feat(web): register and log in with silent token refresh`
+- `refactor(ws): move the WebSocket protocol types into protocol.ts`
+- `feat(web): connect to the socket with reconnect, resubscribe and gap recovery`
+- `feat(api): list markets with their tick size, quantity step and minimum`
+- `feat(web): show a live order book that updates rows without re-rendering the book`
+- `feat(api): include each trade's engine sequence in recent trades`
+- `feat(web): show the recent trades feed`
+- `feat(web): add an order entry form for limit and market orders`
+- `docs: record the trading terminal decisions`
+- `docs: record day 11 in PROGRESS.md`
+
+**What now works**
+
+- `web/`: Next.js 16.4 (App Router, Turbopack), Tailwind 4 and shadcn/ui (base-nova), on
+  port 3001. `npm run dev --prefix web` starts it.
+- The API allows exactly one browser origin, `WEB_ORIGIN` (default `http://localhost:3001`),
+  with credentials. The terminal calls it directly; a Next.js proxy under `/api` would never
+  receive the `Path=/session` refresh cookie.
+- Register, log in and log out. The access token is held in memory only. On load the app
+  trades the refresh cookie for a new one; a 401 refreshes once and retries. Concurrent
+  refreshes share one request, and tabs take turns under a Web Lock, so the rotating refresh
+  token is never sent twice. A failed logout leaves the tab signed in and says so.
+- One WebSocket per tab with reference-counted subscriptions. Every connection authenticates
+  when signed in and resubscribes to everything wanted. Drops retry with backoff and jitter,
+  500 ms doubling to 10 s; close code 4001 refreshes the token and reconnects at once; signing
+  out opens a fresh connection.
+- Live order book: snapshot then deltas, duplicates dropped, a skipped sequence marks the book
+  unsynced and resubscribes for a snapshot. A lost connection dims the book until the next
+  snapshot. Prices are sorted and subtracted as BigInt and shown at the tick's precision.
+- Render isolation, checked in a browser with temporary render counters: changing the size at
+  one level rendered that row only, not the book component.
+- Recent trades: 50 from REST, then the trades channel, merged by engine sequence. After a
+  reconnect the history is fetched again.
+- Order form: buy or sell, limit or market. Off-grid prices and quantities are caught before a
+  request, with the API's wording; API errors land on the same fields. A draft keeps its client
+  order id across a failed submit, so a retry cannot place a second order.
+- API: `GET /markets` lists each market's tick, step and minimum; recent trades now include the
+  engine sequence.
+- End-to-end check in headless Chromium: log in through the form, reload and come back signed
+  in from the cookie, have an off-grid price rejected without a request, and see a limit buy
+  rest on the live book.
+- `npm run check` ends with web's typecheck, lint and production build. CI installs `web/`'s
+  dependencies.
+- 343 tests in 25 files, up from 303 in 20. The web tests run under the root Vitest.
+
+**What is stubbed**
+
+- No balances, open orders or cancel in the terminal yet (Day 12). The account channel is
+  supported by the socket but nothing subscribes to it.
+- The socket has no heartbeat of its own. A silently dead connection is noticed when the
+  browser's TCP connection fails; the server side already terminates it within 30 s.
+- Trades are merged by sequence, and sequences restart with the API (until Session 10), so
+  after a restart an old trade and a new one in the same 50 could share a number.
+- The book shows the best 12 levels per side and has no depth bars.
+- Verified in Chromium only. Safari's handling of a `Secure` cookie on `http://localhost` is
+  unchecked.
+- `NEXT_PUBLIC_API_URL` defaults to `http://localhost:3000`; there is no `web/.env.example`,
+  since Next's generated `.gitignore` ignores `.env*`.
+- `npm audit` in `web/` reports moderate findings in `deepmerge` and `minimatch` from the
+  generated dependencies.
+- Carried over: no separate test database, drizzle-kit's dev-only audit findings, the manual
+  `vaidhyam@example.com` row, and the CI workflow has still not run on GitHub. The browser
+  checks added `seed-*@example.com` and `web-*@example.com` users and resting BTC-USD orders
+  to the dev database.
+
+**Decisions and deviations from the plan**
+
+- Added: the CORS commit first, `GET /markets` before the book, and the trade sequence in
+  recent trades before the feed.
+- `ws.ts` did not grow (432 lines), so the account channel was not split out.
+- `web/AGENTS.md`, which `next dev` writes when it detects a coding agent, is kept out of git
+  through `.git/info/exclude`.
+- The web TypeScript target is ES2022, for BigInt literals.
+- `engine.property.test.ts` once exceeded its 5 s timeout during a full run while the dev
+  servers and a headless browser were running; it takes about 0.9 s alone, and the full gate
+  passed twice after they were stopped.
+
+**Repo shape**
+
+- `web/`: the terminal, for its own `package.json`. Inside it, `lib/` holds everything that is
+  not React: `session.ts`, `socket.ts`, `book.ts`, `trades.ts`, `markets.ts`, `orders.ts`.
+  `components/` holds the client components and shadcn's `ui/`.
+- `protocol.ts`: the WebSocket message types, out of `feed.ts`, for the terminal as a second
+  consumer. Types only, imported by `web/` through a type-only path alias.
+
+**Next: Day 12 — Trading terminal, part 2 and candles**
+
+- `feat(market): aggregate trades into one-minute OHLCV candles`
+- `feat(api): serve candles and stream live candle updates`
+- `feat(web): draw a candlestick chart with lightweight-charts`
+- `feat(web): show available and reserved balances`
+- `feat(web): show open orders with cancel, order history and fills`
