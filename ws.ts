@@ -38,15 +38,15 @@ export type WebSocketDependencies = {
 // A client message larger than this closes the connection: commands are tiny.
 const MAX_CLIENT_MESSAGE_BYTES = 4096;
 
-// book and trades are per market and public; account is the authenticated user's own.
+// book, trades and candles are per market and public; account is the authenticated user's own.
 const channelFields = {
-  channel: z.enum(["book", "trades", "account"]),
+  channel: z.enum(["book", "trades", "candles", "account"]),
   market: z.string().min(1).max(32).optional(),
 };
 const marketMatchesChannel = (message: { channel: string; market?: string | undefined }) =>
   (message.channel === "account") === (message.market === undefined);
 const MARKET_RULE = {
-  message: "market is required for book and trades, and not allowed for account",
+  message: "market is required for book, trades and candles, and not allowed for account",
   path: ["market"],
 };
 // Annotated with the shared type, so the schema and what the terminal sends cannot drift.
@@ -257,13 +257,18 @@ export function registerWebSocketRoutes(
   // Messages on the feed come only from publishUpdate in this codebase, so they are parsed,
   // not validated.
   function onMarketMessage(text: string): void {
-    const { book, trades } = JSON.parse(text) as MarketFeedMessage;
+    const { book, trades, candles } = JSON.parse(text) as MarketFeedMessage;
     if (book.type === "book_update") {
       hub.publish(topicOf("book", book.market), book);
     }
     for (const trade of trades) {
       if (trade.type === "trade") {
         hub.publish(topicOf("trades", trade.market), trade);
+      }
+    }
+    for (const candle of candles) {
+      if (candle.type === "candle") {
+        hub.publish(topicOf("candles", candle.market), candle);
       }
     }
   }
@@ -387,6 +392,8 @@ export function registerWebSocketRoutes(
       connection.send({ type: "subscribed", channel, market: market.symbol });
       // Taken after subscribing and in the same tick, so no delta can fall between the two.
       // Subscribing again while subscribed re-sends it: that is how a client resyncs.
+      // Candles have no snapshot here: history comes from REST, and each candle sent is
+      // whole, so the client keeps whichever copy of a minute has more trades.
       if (channel === "book") {
         connection.send(bookSnapshot(exchange, market));
       }

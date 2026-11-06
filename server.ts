@@ -5,10 +5,12 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import Fastify, { type FastifyError } from "fastify";
 import { registerAuthRoutes, type AuthDependencies } from "./auth.ts";
+import { LiveCandles } from "./candles.ts";
 import { DEFAULT_WEB_ORIGIN, type LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
 import { feedChannels, publishUpdate } from "./feed.ts";
 import { registerMarketDataRoutes } from "./market.ts";
+import { loadMarkets } from "./orders.ts";
 import type { RateLimit } from "./ratelimit.ts";
 import type { RedisClient } from "./redis.ts";
 import { registerSessionRoutes } from "./sessions.ts";
@@ -141,8 +143,13 @@ export function buildServer(
   registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
   registerMarketDataRoutes(app, { db, exchange });
   const channels = feedChannels(marketDataPrefix);
+  const candles = new LiveCandles();
+  // onReady runs before the server accepts a request, so before any trade can settle.
+  app.addHook("onReady", async () => {
+    await candles.load(db, [...(await loadMarkets(db)).values()]);
+  });
   const stopPublishing = exchange.onUpdate((update) => {
-    publishUpdate(redis, channels, update, app.log);
+    publishUpdate(redis, channels, candles, update, app.log);
   });
   app.addHook("onClose", (_instance, done) => {
     stopPublishing();

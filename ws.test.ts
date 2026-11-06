@@ -139,7 +139,7 @@ describe("the /ws subscribe protocol", () => {
   it.each([
     ["not JSON", "{subscribe", "not valid JSON"],
     ["an unknown op", { op: "trade", channel: "book", market: "BTC-USD" }, "op: "],
-    ["an unknown channel", { op: "subscribe", channel: "candles", market: "BTC-USD" }, "channel"],
+    ["an unknown channel", { op: "subscribe", channel: "depth", market: "BTC-USD" }, "channel"],
     ["an extra field", { op: "subscribe", channel: "book", market: "BTC-USD", depth: 5 }, ""],
     ["a book with no market", { op: "subscribe", channel: "book" }, "market"],
     [
@@ -327,6 +327,66 @@ describe("the trades channel", () => {
     const sent = JSON.stringify(trades);
     for (const id of [buyer, seller, sell.id, ...bids.map((bid) => bid.id)]) {
       expect(sent).not.toContain(id);
+    }
+    client.close();
+  });
+});
+
+describe("the candles channel", () => {
+  const { exchange, server } = freshServer();
+
+  it("sends the whole candle in progress once per command that trades", async () => {
+    const market = await btcUsd();
+    const buyer = await funded({ USD: "100000" });
+    const seller = await funded({ BTC: "1" });
+    const client = await connect(server);
+    client.send({ op: "subscribe", channel: "candles", market: "BTC-USD" });
+    await expect(client.next()).resolves.toEqual({
+      type: "subscribed",
+      channel: "candles",
+      market: "BTC-USD",
+    });
+
+    // Resting orders trade nothing, so they send no candle.
+    await exchange.placeOrder(market, limit(buyer, "buy", "60100", "0.1"));
+    await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1"));
+    // One sell sweeps both bids: two trades, one candle.
+    await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.15"));
+    const first = (await client.next()) as Record<string, unknown>;
+    await exchange.placeOrder(market, limit(seller, "sell", "61000", "0.2"));
+    await exchange.placeOrder(market, limit(buyer, "buy", "61000", "0.2"));
+    const second = (await client.next()) as Record<string, unknown>;
+
+    // The server carried on the latest candle in Postgres at boot, and other test files
+    // trade BTC-USD too, so the candle may hold trades before ours. What ours must do to it:
+    expect(first).toMatchObject({
+      type: "candle",
+      market: "BTC-USD",
+      start: expect.stringMatching(/:00\.000Z$/) as unknown,
+      close: "60000.00000000",
+    });
+    expect(Number(first.high)).toBeGreaterThanOrEqual(60100);
+    expect(Number(first.low)).toBeLessThanOrEqual(60000);
+    expect(first.trades).toBeGreaterThanOrEqual(2);
+    if (second.start === first.start) {
+      expect(second).toMatchObject({
+        open: first.open,
+        high: "61000.00000000",
+        low: first.low,
+        close: "61000.00000000",
+        trades: (first.trades as number) + 1,
+      });
+      expect(Number(second.volume)).toBeCloseTo(Number(first.volume) + 0.2, 8);
+    } else {
+      // The minute turned between the two commands.
+      expect(second).toMatchObject({
+        open: "61000.00000000",
+        high: "61000.00000000",
+        low: "61000.00000000",
+        close: "61000.00000000",
+        volume: "0.20000000",
+        trades: 1,
+      });
     }
     client.close();
   });

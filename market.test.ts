@@ -1,5 +1,7 @@
+import { inArray } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
 import { Exchange } from "./exchange.ts";
+import { trades } from "./schema.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
@@ -150,8 +152,47 @@ describe("GET /markets/:symbol/trades", () => {
   });
 });
 
+describe("GET /markets/:symbol/candles", () => {
+  it("lists one-minute candles oldest first, at each asset's scale", async () => {
+    const seller = await trader({ ETH: "1" });
+    const buyer = await trader({ USD: "10000" });
+    const takerIds: string[] = [];
+    await place(seller.authorization, "ETH-USD", "sell", "3000", "0.1");
+    takerIds.push(await place(buyer.authorization, "ETH-USD", "buy", "3000", "0.1"));
+    await place(seller.authorization, "ETH-USD", "sell", "3010.5", "0.25");
+    takerIds.push(await place(buyer.authorization, "ETH-USD", "buy", "3010.5", "0.25"));
+    // Both trades moved into one minute of 2002, where no other test trades.
+    await db
+      .update(trades)
+      .set({ createdAt: new Date("2002-01-01T00:00:30Z") })
+      .where(inArray(trades.takerOrderId, takerIds));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/markets/ETH-USD/candles?limit=1&before=2002-01-01T00:01:00Z",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<unknown>()).toEqual({
+      market: "ETH-USD",
+      interval: "1m",
+      candles: [
+        {
+          start: "2002-01-01T00:00:00.000Z",
+          open: "3000.00000000",
+          high: "3010.50000000",
+          low: "3000.00000000",
+          close: "3010.50000000",
+          volume: "0.35000000",
+          trades: 2,
+        },
+      ],
+    });
+  });
+});
+
 describe("market data requests", () => {
-  it.each(["/markets/DOGE-USD/book", "/markets/DOGE-USD/trades"])(
+  it.each(["/markets/DOGE-USD/book", "/markets/DOGE-USD/trades", "/markets/DOGE-USD/candles"])(
     "answers 404 for %s",
     async (url) => {
       const response = await app.inject({ method: "GET", url });
@@ -166,6 +207,8 @@ describe("market data requests", () => {
     "/markets/BTC-USD/book?depth=201",
     "/markets/BTC-USD/trades?limit=abc",
     "/markets/BTC-USD/trades?userId=1",
+    "/markets/BTC-USD/candles?limit=1441",
+    "/markets/BTC-USD/candles?before=yesterday",
   ])("rejects %s with 400", async (url) => {
     const response = await app.inject({ method: "GET", url });
 

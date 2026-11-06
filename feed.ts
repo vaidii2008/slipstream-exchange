@@ -8,6 +8,7 @@
 // subscribers the gap, and they resync from a fresh snapshot.
 
 import type { FastifyBaseLogger } from "fastify";
+import { formatCandle, type LiveCandles } from "./candles.ts";
 import type { MarketUpdate } from "./exchange.ts";
 import { formatAmount } from "./money.ts";
 import type { Market } from "./orders.ts";
@@ -66,8 +67,30 @@ export function orderMessage(market: Market, order: SettledOrder): ServerMessage
   };
 }
 
-// What travels on a market's channel: everything one command did, public only.
-export type MarketFeedMessage = { book: ServerMessage; trades: ServerMessage[] };
+// The candle in progress after this command, or nothing if the command did not trade.
+export function candleMessages(candles: LiveCandles, update: MarketUpdate): ServerMessage[] {
+  const { market, events, settledAt } = update;
+  const candle = candles.add(
+    market.symbol,
+    events.flatMap((event) =>
+      event.type === "trade"
+        ? [{ price: event.price, quantity: event.quantity, time: settledAt }]
+        : [],
+    ),
+  );
+  return candle === undefined
+    ? []
+    : [{ type: "candle", market: market.symbol, ...formatCandle(market, candle) }];
+}
+
+// What travels on a market's channel: everything one command did, public only. Candles
+// travel as whole candles, not trades to fold, so a process that missed a message is wrong
+// only until the next one.
+export type MarketFeedMessage = {
+  book: ServerMessage;
+  trades: ServerMessage[];
+  candles: ServerMessage[];
+};
 
 // Channel names under one prefix, so separate deployments (or test servers) sharing a Redis
 // never hear each other.
@@ -84,6 +107,7 @@ export type FeedChannels = ReturnType<typeof feedChannels>;
 export function publishUpdate(
   redis: RedisClient,
   channels: FeedChannels,
+  candles: LiveCandles,
   update: MarketUpdate,
   log: FastifyBaseLogger,
 ): void {
@@ -93,7 +117,11 @@ export function publishUpdate(
     });
   };
   const { market } = update;
-  const message: MarketFeedMessage = { book: bookUpdate(update), trades: tradeMessages(update) };
+  const message: MarketFeedMessage = {
+    book: bookUpdate(update),
+    trades: tradeMessages(update),
+    candles: candleMessages(candles, update),
+  };
   send(channels.market(market.symbol), message);
   for (const order of update.orders) {
     send(channels.user(order.userId), orderMessage(market, order));

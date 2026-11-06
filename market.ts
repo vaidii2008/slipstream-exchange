@@ -8,6 +8,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { invalidRequest } from "./auth.ts";
 import type { DepthLevel } from "./book.ts";
+import { formatCandle, loadCandles } from "./candles.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric } from "./money.ts";
@@ -24,6 +25,16 @@ const bookQuery = z.strictObject({
 });
 const tradesQuery = z.strictObject({
   limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+// 1,440 is one day of one-minute candles.
+const candlesQuery = z.strictObject({
+  limit: z.coerce.number().int().min(1).max(1440).default(500),
+  // Paging back: the start of the oldest candle the client already has.
+  before: z.iso
+    .datetime({ offset: true })
+    .transform((value) => new Date(value))
+    .optional(),
 });
 
 const takerOrders = alias(orders, "taker");
@@ -116,6 +127,25 @@ export function registerMarketDataRoutes(
     return reply.code(200).send({
       market: market.symbol,
       trades: await recentTrades(db, market, query.data.limit),
+    });
+  });
+
+  // Oldest first, one per minute that had a trade; a minute with none has no candle.
+  app.get<ByMarket>("/markets/:symbol/candles", async (request, reply) => {
+    const market = await loadMarket(db, request.params.symbol);
+    if (market === undefined) {
+      return reply.code(404).send({ error: "not_found" });
+    }
+    const query = candlesQuery.safeParse(request.query);
+    if (!query.success) {
+      return reply.code(400).send(invalidRequest(query.error));
+    }
+
+    const candles = await loadCandles(db, market, query.data);
+    return reply.code(200).send({
+      market: market.symbol,
+      interval: "1m",
+      candles: candles.map((candle) => formatCandle(market, candle)),
     });
   });
 }

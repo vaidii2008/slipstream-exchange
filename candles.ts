@@ -6,7 +6,7 @@
 
 import { and, count, desc, eq, lt, max, min, sql, sum } from "drizzle-orm";
 import type { Database } from "./ledger.ts";
-import { fromNumeric } from "./money.ts";
+import { formatAmount, fromNumeric } from "./money.ts";
 import type { Market } from "./orders.ts";
 import { trades } from "./schema.ts";
 
@@ -102,4 +102,52 @@ export async function loadCandles(
       trades: row.trades,
     };
   });
+}
+
+// The same fields over REST and on the candles channel: prices at the quote asset's scale,
+// volume at the base asset's.
+export function formatCandle(market: Market, candle: Candle) {
+  const price = (units: bigint) => formatAmount(units, market.quoteScale);
+  return {
+    start: candle.start.toISOString(),
+    open: price(candle.open),
+    high: price(candle.high),
+    low: price(candle.low),
+    close: price(candle.close),
+    volume: formatAmount(candle.volume, market.baseScale),
+    trades: candle.trades,
+  };
+}
+
+// The candle in progress for each market, kept by the process that settles the market's
+// trades. It sees every trade in settlement order, so, like the engine, it has one writer.
+export class LiveCandles {
+  readonly #latest = new Map<string, Candle>();
+
+  // Run at boot, before any trade settles. A restart in the middle of a minute then carries
+  // on that minute's candle instead of starting it again from the next trade.
+  async load(db: Database, markets: Market[]): Promise<void> {
+    for (const market of markets) {
+      const [latest] = await loadCandles(db, market, { limit: 1 });
+      if (latest !== undefined) {
+        this.#latest.set(market.symbol, latest);
+      }
+    }
+  }
+
+  // The candle a command's trades ended in, or undefined if it traded nothing. A command's
+  // trades share one settlement time, so they never span two minutes.
+  add(symbol: string, trades: CandleTrade[]): Candle | undefined {
+    if (trades.length === 0) {
+      return undefined;
+    }
+    let candle = this.#latest.get(symbol);
+    for (const trade of trades) {
+      candle = addTrade(candle, trade);
+    }
+    if (candle !== undefined) {
+      this.#latest.set(symbol, candle);
+    }
+    return candle;
+  }
 }

@@ -5,9 +5,9 @@
 
 export type Side = "buy" | "sell";
 
-export type Channel = "book" | "trades" | "account";
+export type Channel = "book" | "trades" | "candles" | "account";
 
-// book and trades name a market; account never does, since it is the authenticated user's
+// book, trades and candles name a market; account never does, since it is the authenticated user's
 // own. ws.ts validates that rule; the type keeps the wire shape the schema produces.
 export type ClientMessage =
   | { op: "auth"; token: string }
@@ -52,4 +52,17 @@ export type ServerMessage =
       quantity: string;
       takerSide: Side;
       time: string;
-    };
+    }
+  | ({ type: "candle"; market: string } & Candle);
+
+// One minute of trades. A client may see the same minute twice, from REST and from the
+// candles channel: keep the copy with more trades, since a candle only ever gains them.
+export type Candle = {
+  start: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+  trades: number;
+};
