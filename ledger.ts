@@ -77,6 +77,30 @@ export async function openAccount(
   return raced.id;
 }
 
+// Locks accounts that are about to be debited, until the enclosing transaction ends. Locks
+// are always taken in ascending id order, whatever order the caller lists them in, so two
+// transactions debiting the same accounts queue instead of deadlocking. A caller about to
+// post several transactions in one commit locks the union first: posting them one by one
+// would take each one's locks in turn, and two such callers could take them in opposite
+// orders. Locking an account this transaction already holds returns at once.
+//
+// NO KEY UPDATE, not UPDATE: inserting an entry makes Postgres take FOR KEY SHARE on the
+// account it references, for the foreign-key check, and FOR UPDATE blocks that. A reserve
+// (locks available, inserts into reserved) and a release (the reverse) would each wait on
+// the other's row. NO KEY UPDATE still conflicts with itself, so two debits of one account
+// still queue.
+export async function lockAccounts(db: Database, accountIds: number[]): Promise<void> {
+  if (accountIds.length === 0) {
+    return;
+  }
+  await db
+    .select({ id: ledgerAccounts.id })
+    .from(ledgerAccounts)
+    .where(inArray(ledgerAccounts.id, accountIds))
+    .orderBy(ledgerAccounts.id)
+    .for("no key update");
+}
+
 // Writes one transaction and all its entries, or nothing. The asset of each posting comes
 // from the database, not the caller, so a caller cannot balance BTC against USD by mislabelling.
 export async function postTransaction(
@@ -131,20 +155,7 @@ export async function postTransaction(
       .map(([id]) => id);
 
     if (debited.length > 0) {
-      // Locks are always taken in ascending id order, whatever order the postings came in, so
-      // two transactions debiting the same accounts queue instead of deadlocking.
-      //
-      // NO KEY UPDATE, not UPDATE: inserting an entry makes Postgres take FOR KEY SHARE on the
-      // account it references, for the foreign-key check, and FOR UPDATE blocks that. A reserve
-      // (locks available, inserts into reserved) and a release (the reverse) would each wait on
-      // the other's row. NO KEY UPDATE still conflicts with itself, so two debits of one
-      // account still queue.
-      await tx
-        .select({ id: ledgerAccounts.id })
-        .from(ledgerAccounts)
-        .where(inArray(ledgerAccounts.id, debited))
-        .orderBy(ledgerAccounts.id)
-        .for("no key update");
+      await lockAccounts(tx, debited);
 
       // A new statement after the lock, so under READ COMMITTED it sees every entry committed
       // by whoever held the lock before us.
