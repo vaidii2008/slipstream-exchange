@@ -109,6 +109,20 @@ Each entry: the decision, the alternative, why, and where it lives.
 - **Where:** `ledgerAccounts` and `ledgerEntries` in `schema.ts`; `deleteTradingHistory` in
   `testing.ts`.
 
+### USD at scale 8, and every market has a quantity step
+
+- **Decision:** USD is counted to 8 decimals. Each market has a `quantity_step` (BTC-USD 0.0001,
+  ETH-USD 0.001) next to its tick. A price must be a whole number of ticks, a quantity a whole
+  number of steps.
+- **Alternative:** keep USD at 2 decimals and round each fill's notional with a rule such as
+  banker's rounding, or charge the rounding to one side.
+- **Why:** at 2 decimals, one step at one tick is worth 0.000001 USD, so most fills would need
+  rounding, and every rounding rule moves value between users. At scale 8 that fill is 100
+  minor units, and every fill is a whole multiple of it. `notional()` throws instead of
+  rounding, so an order off the grid fails loudly. A test checks tick × step against every
+  seeded market.
+- **Where:** migration `0005`; `notional` in `money.ts`; `markets.test.ts`.
+
 ## Matching engine
 
 ### Price levels in a sorted array, best price last
@@ -175,3 +189,67 @@ accounted for, that no user trades with themselves, and that replaying the same 
 identical events. Four bugs injected by hand (trading past the limit, no self-trade check, a
 market remainder dropped, sells resting without matching) each failed exactly the property
 meant to catch it.
+
+## Orders and settlement
+
+### Reserve and record first, then match and settle in a second transaction
+
+- **Decision:** placing an order is two Postgres transactions. The first reserves what the
+  order could spend and inserts it as `pending`. Then, in the market's queue, the engine
+  matches it and a second transaction writes everything the engine did: trades, ledger
+  postings and order statuses.
+- **Alternative:** one transaction around reserve, match and settle; or match first and
+  reserve after.
+- **Why:** the engine is in memory and cannot roll back, so it must only see orders that are
+  already funded. Matching first could produce a trade that one side cannot pay for. One big
+  transaction would hold row locks while waiting for the queue. The cost is a window where a
+  crash leaves an order `pending` and reserved; Session 10's recovery handles that.
+- **Where:** `recordLimitOrder` in `orders.ts`; `Exchange.placeLimitOrder` and `settle` in
+  `exchange.ts`.
+
+### One serial queue per market covers the engine and its settlement
+
+- **Decision:** a market's queue task is "submit to the engine, then commit the settlement",
+  and the next task starts only after that commit (or failure).
+- **Alternative:** queue only the synchronous engine call and settle in the background.
+- **Why:** two settlements in flight at once could commit in the opposite order to the events
+  they record, for example a later fill's status update landing before the earlier one's.
+  The cost is that one market's throughput is bounded by settlement latency in Postgres, not
+  by the engine's 2 to 4 million commands per second. Session 11 measures how much.
+- **Where:** `SerialQueue` and `Exchange` in `exchange.ts`.
+
+### A settlement locks every account it debits up front, in id order
+
+- **Decision:** before posting any fill, `settle` collects every account the command debits
+  (sellers' base reserved, buyers' quote reserved, released remainders) and locks them all at
+  once with `lockAccounts`, sorted by id.
+- **Alternative:** let each fill's `postTransaction` lock its own accounts as it goes.
+- **Why:** markets settle in parallel. A BTC-USD sell filling two buyers in one order and an
+  ETH-USD sell filling the same buyers in the other order took the two USD reserved locks in
+  opposite orders. With the up-front lock removed, the test that sets this up deadlocked in 5
+  of 5 runs; with it, 0 of 5.
+- **Where:** `lockAccounts` in `ledger.ts`; `settle` in `exchange.ts`; the "without
+  deadlocking" test in `exchange.test.ts`.
+
+### A buyer's unused reservation is returned at each fill
+
+- **Decision:** a buy reserves at its own limit. When it fills at a lower maker price, the
+  fill's ledger transaction returns the difference to the buyer's available balance.
+- **Alternative:** leave the excess reserved until the order finishes or is cancelled.
+- **Why:** it keeps one rule true at every moment: an open buy has exactly remaining quantity
+  × limit reserved. That makes the reservation checkable from the order row alone, and the
+  user can spend the improvement straight away.
+- **Where:** `fillPostings` in `exchange.ts`.
+
+### Trades are not unique on (market, engine_sequence) yet
+
+- **Decision:** dropped the unique constraint in migration `0007`, one migration after adding
+  it.
+- **Alternative:** keep it and seed each engine's sequence from `max(engine_sequence)` at
+  startup.
+- **Why:** an engine numbers from 1 every time the process starts, so the first trade after a
+  restart collided with an old one. The tests caught it, because each test's fresh exchange
+  collided with the previous test's trades. Seeding the sequence from the trades table alone
+  would be half of recovery, since the book would still be empty. The constraint comes back
+  in Session 10 with the event log.
+- **Where:** `trades` in `schema.ts`; migrations `0006` and `0007`.
