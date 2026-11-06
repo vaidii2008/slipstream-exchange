@@ -123,7 +123,9 @@ describe("GET /markets/:symbol/trades", () => {
     const response = await app.inject({ method: "GET", url: "/markets/ETH-USD/trades?limit=200" });
 
     expect(response.statusCode).toBe(200);
-    const { trades } = response.json<{ trades: { id: number; price: string }[] }>();
+    const { trades } = response.json<{
+      trades: { id: number; sequence: number; price: string }[];
+    }>();
     // Other test files trade ETH-USD at the same time, so find ours by their unusual price
     // rather than assume they are the only ones.
     const ids = trades.map((trade) => trade.id);
@@ -132,6 +134,7 @@ describe("GET /markets/:symbol/trades", () => {
     expect(ours).toEqual([
       {
         id: expect.any(Number) as unknown,
+        sequence: expect.any(Number) as unknown,
         price: "3141.59000000",
         quantity: "0.10000000",
         takerSide: "buy",
@@ -139,6 +142,8 @@ describe("GET /markets/:symbol/trades", () => {
       },
       expect.objectContaining({ quantity: "0.20000000", takerSide: "buy" }),
     ]);
+    // Newer trades of one market carry higher engine sequences.
+    expect(ours[0]!.sequence).toBeGreaterThan(ours[1]!.sequence);
     for (const id of [seller.id, buyer.id, ...orderIds]) {
       expect(response.body).not.toContain(id);
     }

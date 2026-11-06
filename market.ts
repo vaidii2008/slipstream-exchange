@@ -34,6 +34,7 @@ async function recentTrades(db: Database, market: Market, limit: number) {
   const rows = await db
     .select({
       id: trades.id,
+      sequence: trades.engineSequence,
       price: trades.price,
       quantity: trades.quantity,
       takerSide: takerOrders.side,
@@ -46,6 +47,9 @@ async function recentTrades(db: Database, market: Market, limit: number) {
     .limit(limit);
   return rows.map((row) => ({
     id: row.id,
+    // The same number the trades channel carries, so a client joining the two can drop the
+    // trades it receives from both.
+    sequence: row.sequence,
     price: formatAmount(fromNumeric(row.price, market.quoteScale), market.quoteScale),
     quantity: formatAmount(fromNumeric(row.quantity, market.baseScale), market.baseScale),
     takerSide: row.takerSide,
