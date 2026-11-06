@@ -731,3 +731,118 @@ when trade settlement arrives.
 - `feat(orders): place a limit order with funds reserved first`
 - `feat(orders): persist trades and settle both sides in the ledger`
 - `test(orders): cover place, partial fill and full fill between two real users`
+
+## Day 8 — Engine numbers, placing orders
+
+**Commits landed (14)**
+
+- `perf(engine): add a benchmark reporting orders/sec and p50/p99 match latency`
+- `feat(db): raise USD scale to 8 and add a quantity step per market`
+- `feat(db): define orders and trades tables`
+- `refactor(ledger): accept an open transaction wherever a database is accepted`
+- `feat(orders): reserve funds and record a limit order`
+- `feat(orders): serialize each market's commands through one queue`
+- `refactor(ledger): expose the debit lock so a caller can lock several postings at once`
+- `fix(db): drop the unique trade sequence until engine sequences survive a restart`
+- `feat(orders): match placed orders and settle trades in the ledger`
+- `refactor(orders): move matching and settlement into exchange.ts`
+- `feat(api): accept limit orders on POST /orders`
+- `test(orders): cover place, partial fill and full fill between two real users`
+- `docs: record the order placement and settlement decisions in DECISIONS.md`
+- `docs: record day 8 in PROGRESS.md`
+
+**What now works**
+
+- `npm run bench` (`engine.bench.ts`) times 1,000,000 seeded commands against
+  the engine alone. A shadow engine generates them, so cancels hit live orders
+  and the book holds a steady size. On an Apple M4 with Node 24.21: mixed book
+  near 5,000 orders, about 4.4M commands/s, p50 0.17 µs, p99 0.58 µs; one
+  level near 10,000 orders, about 2.28M commands/s, cancels p99 1.54 to
+  1.71 µs.
+- USD is at scale 8 and markets have `quantity_step` (migration 0005). Every
+  seeded market passes the tick × step exactness test.
+- `orders` and `trades` tables (0006, then 0007 drops one constraint).
+- `recordLimitOrder` (`orders.ts`) checks the tick, step and minimum, then
+  reserves price × quantity of quote (buy) or the quantity of base (sell) and
+  inserts the order as `pending`, all in one transaction. 12 parallel sells of
+  0.25 against 1 BTC: exactly 4 recorded.
+- `Exchange` (`exchange.ts`): one engine and one `SerialQueue` per market. Each
+  order is matched and then settled in one transaction before the next command
+  starts. A settlement does the following:
+  - a trade row and a ledger transaction per fill;
+  - returns the buyer's unused reservation when the fill is below their limit;
+  - releases a self-trade-cancelled remainder;
+  - updates filled quantity, status and engine sequence on both orders.
+- `POST /orders` (`trading.ts`) places limit orders. 400 with the field for a
+  bad amount or an order off the grid, 422 `insufficient_funds`, 201 with
+  status, filled quantity and fills.
+- Two users trade BTC-USD over HTTP through a resting sell, a partial fill,
+  a completed fill with a resting remainder, and a fill at the resting bid's
+  price. Balances are checked after every step; 1 BTC and 100,000 USD in,
+  1 BTC and 100,000 USD out.
+- 214 tests in 16 files, up from 171.
+
+**What is stubbed**
+
+- Market orders are rejected by the API (`type` must be `limit`). Settling a
+  cancelled market order throws on purpose. Both arrive with Session 5's capped
+  reservation.
+- No cancel endpoint and no order listing yet (Session 5).
+- If a settlement transaction fails, the engine has already applied the
+  command, so the book and Postgres disagree. The order stays `pending` and
+  reserved. Nothing halts the market or repairs it yet (Session 5 commit 7,
+  then Session 10).
+- Books live in memory. After a restart the books are empty, open orders keep
+  their reservations, and sequences restart at 1. Session 10's recovery fixes
+  all three and brings back the unique trade sequence.
+- The per-market queue is unbounded. Session 5's rate limit is the first
+  brake; Session 11's load test shows whether it needs a depth limit.
+- `client_order_id` exists but the API does not accept it yet (Session 5's
+  idempotency keys).
+- Carried over: no test database separate from the dev one, `npm audit`
+  dev-only findings from drizzle-kit, the manual `vaidhyam@example.com` row, and
+  the CI workflow has still not run on GitHub.
+
+**Decisions and deviations from the plan**
+
+- No `perf(engine)` optimisation. The baseline showed no hotspot. Cancels on a
+  10,000-deep level cost about 1.3 µs because of the `indexOf` scan, against
+  milliseconds per settlement. The first benchmark version let one level grow
+  to 137,000 orders and showed 180 µs cancels; that was the generator's bug.
+- "Place a limit order with funds reserved first" became three commits:
+  reserve and record, then match and settle, then the HTTP route. A route that
+  matched without settling would have lost fills.
+- Two refactors had named pressure: the ledger had to accept a transaction
+  (reserve and insert must commit together), and the debit lock had to be
+  callable on its own (cross-market deadlock). Then `orders.ts` reached 407
+  lines with two reasons to change and split into `orders.ts` and
+  `exchange.ts`.
+- Not in the plan, flagged here: order statuses are `pending`, `open`,
+  `filled` and `cancelled`. There are check constraints on positive amounts,
+  filled ≤ quantity, and price present exactly on limit orders.
+- Added and then dropped `trades` unique on (market, engine_sequence). Engines
+  restart their numbering on every start, and the tests showed the collision.
+- Cross-market deadlock: with the up-front lock removed, the test deadlocked
+  in 5 of 5 runs; with it, 0 of 5.
+- Test cleanup is now `deleteTradingHistory`: trades, then orders, then the
+  ledger.
+
+**Repo shape**
+
+Still flat. New: `engine.bench.ts` (a script outside the test gate),
+`markets.test.ts` (seeded reference data), `orders.ts` (accepting an order),
+`exchange.ts` (running markets and settling, split from `orders.ts` at 407
+lines) and `trading.ts` (the order routes). `trading.ts` is separate because it
+needs both `orders.ts` and `exchange.ts`, and `exchange.ts` already imports
+`orders.ts`.
+
+**Next: Day 9 — Order lifecycle complete**
+
+- `feat(orders): place market orders with a capped reservation`
+- `feat(orders): cancel an order and release its remaining reservation`
+- `feat(orders): list open orders, order history and my trades`
+- `feat(api): serve public order book snapshots and recent trades`
+- `feat(orders): accept idempotency keys on order placement`
+- `feat(api): rate limit order placement per user with Redis`
+- `test(orders): show a failed settlement leaves the ledger balanced`
+- Interview note in `DECISIONS.md`
