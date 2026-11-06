@@ -222,6 +222,111 @@ describe("DELETE /orders/:id", () => {
   });
 });
 
+describe("GET /orders and GET /fills", () => {
+  const app = buildServer({
+    pool,
+    redis: { ping: () => Promise.resolve("PONG") },
+    db,
+    tokens,
+    exchange: new Exchange(db),
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  function get(authorization: string, url: string) {
+    return app.inject({ method: "GET", url, headers: { authorization } });
+  }
+
+  async function place(authorization: string, side: string, price: string, quantity: string) {
+    const response = await postOrder(
+      authorization,
+      { market: "BTC-USD", side, type: "limit", price, quantity },
+      app,
+    );
+    return response.json<{ id: string }>().id;
+  }
+
+  // Alice takes all of Bob's ask, rests a bid at 50,000 and cancels one at 40,000. No ask is
+  // left behind, so the next scenario's Alice trades with the next scenario's Bob.
+  async function scenario() {
+    const alice = await signedInUser(app);
+    const bob = await signedInUser(app);
+    await fund(alice, "USD", "10000", app);
+    await fund(bob, "BTC", "1", app);
+    const ask = await place(bob, "sell", "60000", "0.05");
+    const taken = await place(alice, "buy", "60000", "0.05");
+    const resting = await place(alice, "buy", "50000", "0.01");
+    const cancelled = await place(alice, "buy", "40000", "0.01");
+    await app.inject({
+      method: "DELETE",
+      url: `/orders/${cancelled}`,
+      headers: { authorization: alice },
+    });
+    return { alice, bob, ask, taken, resting, cancelled };
+  }
+
+  const ids = (response: { json: <T>() => T }) =>
+    response.json<{ orders: { id: string }[] }>().orders.map((order) => order.id);
+
+  it("lists open, closed and all orders, newest first", async () => {
+    const { alice, taken, resting, cancelled } = await scenario();
+
+    expect(ids(await get(alice, "/orders?status=open"))).toEqual([resting]);
+    expect(ids(await get(alice, "/orders?status=closed"))).toEqual([cancelled, taken]);
+    expect(ids(await get(alice, "/orders"))).toEqual([cancelled, resting, taken]);
+    expect(ids(await get(alice, "/orders?limit=1"))).toEqual([cancelled]);
+    expect(ids(await get(alice, "/orders?market=ETH-USD"))).toEqual([]);
+
+    const [open] = (await get(alice, "/orders?status=open")).json<{ orders: unknown[] }>().orders;
+    expect(open).toEqual({
+      id: resting,
+      market: "BTC-USD",
+      side: "buy",
+      type: "limit",
+      price: "50000.00000000",
+      quantity: "0.01000000",
+      filledQuantity: "0.00000000",
+      status: "open",
+      createdAt: expect.any(String) as unknown,
+      updatedAt: expect.any(String) as unknown,
+    });
+  });
+
+  it("lists each user's side of their trades as maker or taker", async () => {
+    const { alice, bob, ask, taken } = await scenario();
+
+    const fill = { market: "BTC-USD", price: "60000.00000000", quantity: "0.05000000" };
+    expect((await get(alice, "/fills")).json<unknown>()).toEqual({
+      fills: [
+        {
+          ...fill,
+          tradeId: expect.any(Number) as unknown,
+          orderId: taken,
+          side: "buy",
+          role: "taker",
+          createdAt: expect.any(String) as unknown,
+        },
+      ],
+    });
+    expect((await get(bob, "/fills")).json<unknown>()).toMatchObject({
+      fills: [{ ...fill, orderId: ask, side: "sell", role: "maker" }],
+    });
+  });
+
+  it.each(["/orders?status=pending", "/orders?limit=0", "/orders?limit=501", "/fills?sort=asc"])(
+    "rejects %s with 400",
+    async (url) => {
+      const authorization = await signedInUser(app);
+
+      const response = await get(authorization, url);
+
+      expect(response.statusCode).toBe(400);
+    },
+  );
+});
+
 describe("POST /orders with a market order", () => {
   const app = buildServer({
     pool,

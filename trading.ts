@@ -7,8 +7,8 @@ import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Exchange } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
-import { findOrder, type OrderRow } from "./history.ts";
-import { loadMarket, type Market, OrderError, type OrderErrorCode } from "./orders.ts";
+import { findOrder, listFills, listOrders, type OrderRow } from "./history.ts";
+import { loadMarket, loadMarkets, type Market, OrderError, type OrderErrorCode } from "./orders.ts";
 import type { AccessTokens } from "./tokens.ts";
 import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
 
@@ -43,9 +43,21 @@ const GRID_ERRORS: Record<
 
 const orderParams = z.object({ id: z.uuid() });
 
+// Lists are bounded so one request cannot pull a bot's entire history.
+const listing = {
+  market: z.string().min(1).max(32).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+};
+const ordersQuery = z.strictObject({
+  ...listing,
+  status: z.enum(["open", "closed", "all"]).default("all"),
+});
+const fillsQuery = z.strictObject(listing);
+
 // Postgres pads NUMERIC to 18 decimals; clients see the asset's own scale, as on placement.
+const rescale = (value: string, scale: number) => formatAmount(fromNumeric(value, scale), scale);
+
 function orderJson(row: OrderRow, market: Market) {
-  const rescale = (value: string, scale: number) => formatAmount(fromNumeric(value, scale), scale);
   return {
     id: row.id,
     market: row.market,
@@ -60,10 +72,10 @@ function orderJson(row: OrderRow, market: Market) {
   };
 }
 
-async function marketOf(db: Database, row: OrderRow): Promise<Market> {
-  const market = await loadMarket(db, row.market);
+function marketOf(markets: Map<string, Market>, symbol: string): Market {
+  const market = markets.get(symbol);
   if (market === undefined) {
-    throw new Error(`order ${row.id} is in market ${row.market}, which is not listed`);
+    throw new Error(`a row refers to market ${symbol}, which is not listed`);
   }
   return market;
 }
@@ -148,7 +160,7 @@ export function registerTradingRoutes(
     if (order === undefined) {
       return reply.code(404).send({ error: "not_found" });
     }
-    const market = await marketOf(db, order);
+    const market = marketOf(await loadMarkets(db), order.market);
 
     const outcome = await exchange.cancelOrder(market, order.id);
     // Read back after the queue has run the cancel, so the status and filled quantity are
@@ -163,5 +175,51 @@ export function registerTradingRoutes(
         .send({ error: "order_not_open", message: `order is ${current.status}` });
     }
     return reply.code(200).send(orderJson(current, market));
+  });
+
+  app.get("/orders", { onRequest: authenticate }, async (request, reply) => {
+    const userId = authenticatedUserId(request);
+
+    const parsed = ordersQuery.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.code(400).send(invalidRequest(parsed.error));
+    }
+
+    const [markets, rows] = await Promise.all([
+      loadMarkets(db),
+      listOrders(db, userId, parsed.data),
+    ]);
+    return reply.code(200).send({
+      orders: rows.map((row) => orderJson(row, marketOf(markets, row.market))),
+    });
+  });
+
+  app.get("/fills", { onRequest: authenticate }, async (request, reply) => {
+    const userId = authenticatedUserId(request);
+
+    const parsed = fillsQuery.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.code(400).send(invalidRequest(parsed.error));
+    }
+
+    const [markets, rows] = await Promise.all([
+      loadMarkets(db),
+      listFills(db, userId, parsed.data),
+    ]);
+    return reply.code(200).send({
+      fills: rows.map((row) => {
+        const market = marketOf(markets, row.market);
+        return {
+          tradeId: row.tradeId,
+          market: row.market,
+          orderId: row.orderId,
+          side: row.side,
+          role: row.role,
+          price: rescale(row.price, market.quoteScale),
+          quantity: rescale(row.quantity, market.baseScale),
+          createdAt: row.createdAt.toISOString(),
+        };
+      }),
+    });
   });
 }

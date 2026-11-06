@@ -24,8 +24,9 @@ export type Market = {
 const base = alias(assets, "base");
 const quote = alias(assets, "quote");
 
-export async function loadMarket(db: Database, symbol: string): Promise<Market | undefined> {
-  const [row] = await db
+// Every listed market, or the one named.
+async function queryMarkets(db: Database, symbol?: string): Promise<Market[]> {
+  const rows = await db
     .select({
       symbol: markets.symbol,
       baseAsset: markets.baseAsset,
@@ -39,17 +40,22 @@ export async function loadMarket(db: Database, symbol: string): Promise<Market |
     .from(markets)
     .innerJoin(base, eq(base.code, markets.baseAsset))
     .innerJoin(quote, eq(quote.code, markets.quoteAsset))
-    .where(eq(markets.symbol, symbol))
-    .limit(1);
-  if (row === undefined) {
-    return undefined;
-  }
-  return {
+    .where(symbol === undefined ? undefined : eq(markets.symbol, symbol));
+  return rows.map((row) => ({
     ...row,
     tickSize: fromNumeric(row.tickSize, row.quoteScale),
     quantityStep: fromNumeric(row.quantityStep, row.baseScale),
     minQuantity: fromNumeric(row.minQuantity, row.baseScale),
-  };
+  }));
+}
+
+export async function loadMarket(db: Database, symbol: string): Promise<Market | undefined> {
+  const [market] = await queryMarkets(db, symbol);
+  return market;
+}
+
+export async function loadMarkets(db: Database): Promise<Map<string, Market>> {
+  return new Map((await queryMarkets(db)).map((market) => [market.symbol, market]));
 }
 
 export type OrderErrorCode =
