@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
 import { hitFixedWindow } from "./ratelimit.ts";
-import { useTestServer } from "./testing.ts";
+import { createRedisClient, type RedisClient } from "./redis.ts";
+import { redisProxy, useTestServer } from "./testing.ts";
 
 const { redis } = useTestServer();
 
@@ -75,5 +77,50 @@ describe("hitFixedWindow", () => {
     const ttl = await redis.pTTL(counter ?? "");
     expect(ttl).toBeGreaterThan(0);
     expect(ttl).toBeLessThanOrEqual(1000);
+  });
+});
+
+// Both cases use the API's own client options, through a proxy only this test uses.
+describe("hitFixedWindow when Redis misbehaves", () => {
+  async function throughProxy() {
+    const proxy = await redisProxy();
+    const client = createRedisClient(proxy.url);
+    // The client reports every failed reconnect; the test asserts on outcomes instead.
+    client.on("error", () => undefined);
+    await client.connect();
+    return { proxy, client };
+  }
+
+  function stop(proxy: { cut: () => void }, client: RedisClient) {
+    proxy.cut();
+    client.destroy();
+  }
+
+  it("gives up within about 100 ms when Redis is slow to answer", async () => {
+    const { proxy, client } = await throughProxy();
+    try {
+      proxy.pause();
+
+      const started = performance.now();
+      await expect(hitFixedWindow(client, freshKey(), rule)).rejects.toThrow(/timed out/);
+      expect(performance.now() - started).toBeLessThan(300);
+    } finally {
+      stop(proxy, client);
+    }
+  });
+
+  it("fails at once when Redis drops after startup, instead of queueing the command", async () => {
+    const { proxy, client } = await throughProxy();
+    try {
+      proxy.cut();
+      await expect.poll(() => client.isReady).toBe(false);
+
+      const started = performance.now();
+      await expect(hitFixedWindow(client, freshKey(), rule)).rejects.not.toThrow(/timed out/);
+      // Well under the timeout: the client refused the command rather than holding it.
+      expect(performance.now() - started).toBeLessThan(50);
+    } finally {
+      stop(proxy, client);
+    }
   });
 });

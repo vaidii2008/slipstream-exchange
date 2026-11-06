@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { createServer, connect, type Socket } from "node:net";
 import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
@@ -111,4 +112,57 @@ export function useTestServer() {
   });
 
   return { pool, redis, db, tokens, exchange, app, uniqueEmail };
+}
+
+// A TCP proxy in front of the compose Redis. A test connects its own client through it and
+// can then make Redis slow (pause: replies are held back) or drop it after startup (cut: every
+// connection is closed and new ones are refused), while other test files keep using Redis.
+export async function redisProxy() {
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl === undefined) {
+    throw new Error("REDIS_URL is not set: these tests talk to a real redis");
+  }
+  const target = new URL(redisUrl);
+  const sockets = new Set<Socket>();
+  let paused = false;
+
+  const server = createServer((client) => {
+    const upstream = connect(Number(target.port), target.hostname);
+    for (const socket of [client, upstream]) {
+      sockets.add(socket);
+      socket.on("error", () => {
+        client.destroy();
+        upstream.destroy();
+      });
+      socket.on("close", () => {
+        sockets.delete(socket);
+        client.destroy();
+        upstream.destroy();
+      });
+    }
+    client.pipe(upstream);
+    upstream.on("data", (chunk: Buffer) => {
+      if (!paused) {
+        client.write(chunk);
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("proxy has no port");
+  }
+
+  return {
+    url: `redis://127.0.0.1:${address.port}`,
+    pause() {
+      paused = true;
+    },
+    cut() {
+      server.close();
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+    },
+  };
 }

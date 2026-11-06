@@ -11,6 +11,10 @@ import type { RedisClient } from "./redis.ts";
 
 export type RateLimit = { limit: number; windowMs: number };
 
+// A connected but slow Redis still answers eventually, so the offline queue setting does not
+// help; the caller gives up after this long and treats the limit as unavailable.
+export const RATE_LIMIT_TIMEOUT_MS = 100;
+
 export type RateLimitVerdict = { allowed: true } | { allowed: false; retryAfterMs: number };
 
 export async function hitFixedWindow(
@@ -24,7 +28,27 @@ export async function hitFixedWindow(
 
   // One round trip, applied together. The expiry only cleans up: the window number in the key
   // is what starts a fresh count. NX keeps later hits from pushing the expiry back.
-  const [count] = await redis.multi().incr(windowKey).pExpire(windowKey, windowMs, "NX").exec();
+  // disableOfflineQueue only covers single commands: node-redis 6 queues a MULTI while
+  // reconnecting regardless. Refusing here keeps an outage from piling up queued MULTIs that
+  // the timeout below would abandon but never remove.
+  if (!redis.isReady) {
+    throw new Error("rate limit unavailable: redis is not connected");
+  }
+  const reply = redis.multi().incr(windowKey).pExpire(windowKey, windowMs, "NX").exec();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`rate limit check timed out after ${RATE_LIMIT_TIMEOUT_MS} ms`));
+    }, RATE_LIMIT_TIMEOUT_MS);
+  });
+  let count;
+  try {
+    // A reply that arrives after the timeout is dropped. Promise.race has already attached a
+    // handler to it, so a late rejection is not unhandled.
+    [count] = await Promise.race([reply, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
   if (typeof count !== "number") {
     throw new Error(`INCR on ${windowKey} returned ${JSON.stringify(count)}`);
   }

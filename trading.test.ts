@@ -4,7 +4,8 @@ import { sql } from "drizzle-orm";
 import { Exchange } from "./exchange.ts";
 import { release } from "./ledger.ts";
 import { buildServer } from "./server.ts";
-import { useTestServer } from "./testing.ts";
+import { createRedisClient } from "./redis.ts";
+import { redisProxy, useTestServer } from "./testing.ts";
 
 const { pool, redis, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
 
@@ -635,6 +636,30 @@ describe("POST /orders rate limit", () => {
     const second = await postOrder(authorization, cheapBuy, withoutRedis);
 
     expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
+  });
+
+  it("does not hang an order when a connected Redis stops answering", async () => {
+    const proxy = await redisProxy();
+    const slowRedis = createRedisClient(proxy.url);
+    slowRedis.on("error", () => undefined);
+    await slowRedis.connect();
+    const slow = buildServer(
+      { pool, redis: slowRedis, db, tokens, exchange: new Exchange(db) },
+      { orderRateLimit: { limit: 1, windowMs: 60_000 } },
+    );
+    try {
+      const authorization = await signedInUser(slow);
+      await fund(authorization, "USD", "100", slow);
+      proxy.pause();
+
+      const response = await postOrder(authorization, cheapBuy, slow);
+
+      expect(response.statusCode).toBe(201);
+    } finally {
+      await slow.close();
+      proxy.cut();
+      slowRedis.destroy();
+    }
   });
 });
 
