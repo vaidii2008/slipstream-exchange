@@ -1,7 +1,12 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { CandlestickSeries, createChart, type ISeriesApi } from "lightweight-charts";
+import {
+  CandlestickSeries,
+  createChart,
+  type IChartApi,
+  type ISeriesApi,
+} from "lightweight-charts";
 import { useEffect, useMemo, useRef } from "react";
 import {
   type Candle,
@@ -59,6 +64,9 @@ export function CandleChart({ market }: { market: MarketInfo }) {
   const candles = useMemo(() => mergeCandles(history.data ?? [], live), [history.data, live]);
 
   const container = useRef<HTMLDivElement>(null);
+  const chartApi = useRef<IChartApi | null>(null);
+  // Fitted once per chart, so a later refetch or live bar never undoes the viewer's zoom.
+  const fitted = useRef(false);
   const series = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const shown = useRef<Candle[]>([]);
 
@@ -86,14 +94,18 @@ export function CandleChart({ market }: { market: MarketInfo }) {
       borderVisible: false,
       priceFormat: { type: "price", precision: decimalsOf(tickSize), minMove: Number(tickSize) },
     });
+    chartApi.current = chart;
     shown.current = [];
+    fitted.current = false;
     return () => {
       chart.remove();
+      chartApi.current = null;
       series.current = null;
       shown.current = [];
     };
   }, [symbol, tickSize]);
 
+  const historyLoaded = history.isSuccess;
   useEffect(() => {
     const target = series.current;
     if (target === null) {
@@ -106,7 +118,12 @@ export function CandleChart({ market }: { market: MarketInfo }) {
       target.update(chartBar(change.candle));
     }
     shown.current = candles;
-  }, [symbol, candles]);
+    // The default bar spacing leaves an hour of history bunched at the right edge.
+    if (!fitted.current && historyLoaded && candles.length > 0) {
+      chartApi.current?.timeScale().fitContent();
+      fitted.current = true;
+    }
+  }, [symbol, candles, historyLoaded]);
 
   return (
     <section aria-label={`${symbol} one-minute candles`} className="border-b text-sm">
