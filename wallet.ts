@@ -5,7 +5,7 @@ import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import { type FeedChannels, publishDeposit } from "./feed.ts";
 import { balancesOf, deposit } from "./ledger.ts";
-import { formatAmount, parseAmount, type ParseFailure } from "./money.ts";
+import { AMOUNT_MESSAGES, formatAmount, parseAmount } from "./money.ts";
 import { assets } from "./schema.ts";
 import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
@@ -22,14 +22,6 @@ const depositBody = z.object({
   asset: z.string().min(1).max(16),
   amount: z.string().max(64),
 });
-
-export const AMOUNT_MESSAGES: Record<ParseFailure | "not_positive", string> = {
-  malformed: "must be a plain decimal string such as 1.5",
-  negative: "must be positive",
-  not_positive: "must be positive",
-  too_many_decimals: "has more decimals than the asset allows",
-  too_large: "is too large",
-};
 
 export function fieldError(field: string, message: string) {
   return { error: "invalid_request", issues: [{ field, message }] };

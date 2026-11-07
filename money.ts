@@ -14,6 +14,15 @@ export type ParseFailure = "malformed" | "negative" | "too_many_decimals" | "too
 
 export type ParseResult = { ok: true; units: bigint } | { ok: false; reason: ParseFailure };
 
+// What a client is told for each failure, wherever the amount came from.
+export const AMOUNT_MESSAGES: Record<ParseFailure | "not_positive", string> = {
+  malformed: "must be a plain decimal string such as 1.5",
+  negative: "must be positive",
+  not_positive: "must be positive",
+  too_many_decimals: "has more decimals than the asset allows",
+  too_large: "is too large",
+};
+
 function assertScale(scale: number): void {
   if (!Number.isInteger(scale) || scale < 0 || scale > MAX_SCALE) {
     throw new RangeError(`scale must be an integer from 0 to ${MAX_SCALE}, got ${scale}`);

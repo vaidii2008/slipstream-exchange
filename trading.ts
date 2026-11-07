@@ -8,7 +8,7 @@ import type { Side } from "./book.ts";
 import { type Exchange, MarketBusyError, MarketHaltedError } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
 import { type Metrics, NO_MARKET, type OrderOutcome } from "./metrics.ts";
-import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
+import { AMOUNT_MESSAGES, formatAmount, fromNumeric, parseAmount } from "./money.ts";
 import { findOrder, listFills, listOrders, type OrderRow, takerFills } from "./history.ts";
 import {
   DuplicateOrderError,
@@ -21,7 +21,7 @@ import {
 import { hitFixedWindow, type RateLimit } from "./ratelimit.ts";
 import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
-import { AMOUNT_MESSAGES, fieldError } from "./wallet.ts";
+import { fieldError } from "./wallet.ts";
 
 export type TradingDependencies = {
   db: Database;
