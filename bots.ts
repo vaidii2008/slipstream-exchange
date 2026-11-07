@@ -560,7 +560,12 @@ export class Agent {
     if (this.#status === "stopped" || this.#status === "killed") {
       return;
     }
+    // Status and reason change together, before the cancels, so anyone who sees "killed"
+    // also sees why.
     this.#status = status;
+    if (status === "killed") {
+      this.killReason = reason;
+    }
     this.#guard.killed = true;
     clearTimeout(this.#timer);
     const { market, log } = this.#context;
@@ -569,7 +574,6 @@ export class Agent {
       await this.#api.cancel(order.id);
     }
     if (status === "killed") {
-      this.killReason = reason;
       log("agent_killed", { agent: this.name, reason, cancelled: open.length });
     } else {
       log("agent_stopped", { agent: this.name, ticks: this.ticks, cancelled: open.length });
