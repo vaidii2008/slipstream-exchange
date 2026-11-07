@@ -1564,3 +1564,78 @@ to it, the account channel is the piece to split out.
 - Proposal: a Postgres advisory lock per market while a process has it open, so a second
   process cannot write the same market.
 - Option: batch several queued commands per turn, to raise a market's ceiling.
+
+## Day 15b — Cached balances and one process per market
+
+**Commits landed (8)**
+
+- `test(recovery): give the kill test's waits a 60 s ceiling each`
+- `feat(ledger): cache each account's balance, updated with its entries under its lock`
+- `fix(test): take the kill test's account locks in id order`
+- `docs: record the cached balance's before and after on a 3.6M-entry ledger`
+- `feat(exchange): hold a per-market advisory lock while a process has the market open`
+- `docs: record the per-market advisory lock and the gap it leaves`
+- `test(load): pad the bench database with a long ledger history on demand`
+- `docs: record day 15b in PROGRESS.md`
+
+**What now works**
+
+- `ledger_accounts.balance` caches the sum of each account's entries. Migration `0012`
+  adds it and backfills it from the entries. `postTransaction` locks every account it
+  touches, debited or credited and the system account included, in id order with one
+  `FOR NO KEY UPDATE` that also returns the cached balances. It checks debits against them
+  and moves them with one `UPDATE`. Settlement locks the union of every account its postings
+  touch. Balance reads still sum the entries.
+- A test runs 8 users trading and cancelling in two markets at once, then finds no account
+  in the database whose cached balance differs from its entries. With releases skipping the
+  update, it finds 16. Forty opposite-direction trades between two users finish with no
+  deadlock; locking in posting order instead gave 29 deadlocks.
+- Measured on fresh copies of one bench database padded to 3,601,804 entries (about 2,000 per
+  user account), Apple M4, 7 Nov:
+  - Steady 200/s, both markets: placement p50 28.9 ms → 7.5 ms, p99 1.23 s → 57 ms, mean
+    turn 7.3 → 3.5 ms.
+  - Ramp to 600/s, two runs each: saturated 179–212/s → 269–300/s, peak 240–245/s →
+    325–360/s.
+  - The migration's backfill over those entries: 0.63–0.76 s including Node's start.
+- Each market's advisory lock is held on a dedicated connection, taken before replay. A
+  second process refuses the market (halted, logged at fatal with "open in another
+  process"). A dropped lock connection halts the market. Shutdown releases the locks after
+  in-flight requests finish. Checked with two real API processes on one database, and by a
+  test that terminates the lock's backend.
+- The kill test's waits poll with a 60 s ceiling each and name what they wait for.
+- `node load/benchdb.ts pad` rebuilds the padded history the numbers came from.
+- 438 tests in 34 files, up from 432.
+
+**What is stubbed**
+
+- Balance reads (`balancesOf`, `accountState`) still sum whole histories. They sit off the
+  order path and take no lock. The socket's balance version needs the entries.
+- A settlement already in flight when a market's lock drops still commits. The trades
+  unique key stops a second process settling the same command twice, but nothing stops the
+  first finishing.
+- Carried over: the browser click-through with the fleet running, drizzle-kit's dev-only audit
+  findings, the web dependencies' moderate audit findings, Safari unchecked.
+
+**Decisions and deviations from the plan**
+
+- Deposits now queue on their asset's system account row. Leaving it out of the lock would
+  leave the one cached balance that is not its entries' sum.
+- The first padding put each account's entries next to each other on disk, and the "before"
+  turn was 5.2 ms instead of Day 15's 39 to 58 ms per three-account sum. Padding was rebuilt
+  interleaved and all reported runs use it.
+- `3efde22` passed its gate, but the next gate run failed with a deadlock on the kill test's
+  own lock statement. It took rows by user id, not id. Fixed forward in `78639ae`.
+- One full gate run failed `fleet.test.ts` (the ETH maker had not traded after 3 ticks). It
+  passed 10 of 10 runs alone, and failed 1 of the 18 full suite runs today. Not tied
+  to this session's changes. Possibly the maker's first quote comes later now that deposits
+  queue on the system row.
+- `exchange.ts` is 510 lines. The lock could be its own module. Not split this session.
+
+**Repo shape**
+
+- No new files beyond migration `0012`.
+
+**Next: Day 16 — Ship it (Session 12)**
+
+- Dev database: apply `0012` with `npx drizzle-kit migrate`.
+- Option: batch several queued commands per turn, to raise a market's ceiling.
