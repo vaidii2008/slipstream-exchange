@@ -1715,3 +1715,44 @@ to it, the account channel is the piece to split out.
 **Next: Session 13 — An LLM agent trades through MCP (stretch)**
 
 - Dev database: `0013` is applied.
+
+## Day 16b — Demo funds and pushed deposits
+
+**Commits landed (4)**
+
+- `feat(ws): push fresh balances to the account channel when a deposit lands`
+- `feat(web): add an "Add demo funds" button to the balances panel`
+- `docs: point the README's quick start at the Add demo funds button`
+- `docs: record day 16b in PROGRESS.md`
+
+**What now works**
+
+- `POST /deposits` publishes a `deposited` notice on the user's Redis channel after the
+  deposit commits. The gateway re-reads balances on it, as for an order message, and does not
+  forward it, so the socket protocol is unchanged. A test sees a balances message with the new
+  amount and a higher version after a deposit; with the publish removed it gets nothing.
+- The balances panel has an "Add demo funds" button: 100,000 USD, 1 BTC and 10 ETH, deposited
+  one asset after another. The README's quick start uses it instead of `curl`.
+- The browser check now clicks the button and waits for all three balances to appear without
+  a reload. With the publish removed it times out there. Passed against the dev server and 3 of
+  3 runs against the rebuilt images, and 3 of 3 runs straight after an API restart, the case
+  that failed in Day 16.
+- 441 tests in 34 files, up from 440.
+
+**What is stubbed**
+
+- Carried over: the in-flight settlement gap when a market's lock drops, drizzle-kit's
+  dev-only audit findings, the web dependencies' moderate audit findings, Safari unchecked.
+  The demo GIF is next, recorded by hand.
+
+**Decisions and deviations from the plan**
+
+- The browser check (local only) now lets Chromium pick its debugging port and reads it from
+  the profile, so it can never attach to a browser an earlier run left behind. It waits for
+  Chromium to exit, escalating to SIGKILL, and kills it on SIGINT and SIGTERM. It waits for
+  React to take over the register form before submitting. No stale headless Chromium was
+  running at the start of the session.
+
+**Repo shape**
+
+- No new files.
