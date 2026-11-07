@@ -794,13 +794,14 @@ every reservation matching an open order.
 ### The cached balance, before and after, on a ledger of 3.6M entries
 
 - **Setup:** `slipstream_bench` with k6's 300 users registered and funded through the API, then
-  padded in SQL with 1,000 reserve and release pairs per user per asset: 3,601,804 entries,
-  about 2,000 on every user account, interleaved across accounts the way a real history is. The
-  first padding wrote each account's entries next to each other on disk, and a sum then read a
-  few pages. That understated the cost, so it was rebuilt. Interleaved, summing three accounts
-  took 60 ms cold. The padded database was kept as a template, and every run below started from
-  a fresh copy of it. The after runs first applied the new migration, whose backfill took
-  0.63–0.76 s including Node's start. Apple M4, Postgres and Redis in Docker Desktop, 7 Nov.
+  padded with `node load/benchdb.ts pad`: 1,000 reserve and release pairs per user per asset,
+  3,601,804 entries, about 2,000 on every user account, interleaved across accounts the way a
+  real history is. A first padding wrote each account's entries next to each other on disk, and
+  a sum then read a few pages. That understated the cost, so it was rebuilt. Interleaved,
+  summing three accounts took 60 ms cold. The padded database was kept as a template, and every
+  run below started from a fresh copy of it. The after runs first applied the new migration,
+  whose backfill took 0.63–0.76 s including Node's start. Apple M4, Postgres and Redis in Docker
+  Desktop, 7 Nov.
 - **Steady 200 orders/s across both markets for 3 minutes, one run each:**
 
   | Build  | Placement p50 | p95    | p99    | Mean turn | Mean queue wait | Dropped |
