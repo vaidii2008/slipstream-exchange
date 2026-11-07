@@ -200,6 +200,8 @@ export async function recordOrder(
         type: order.type,
         // The protection price is not the order's price: a market order has none.
         price: order.type === "limit" ? formatAmount(order.price, market.quoteScale) : null,
+        protectionPrice:
+          order.type === "market" ? formatAmount(order.protectionPrice, market.quoteScale) : null,
         quantity: formatAmount(quantity, market.baseScale),
         clientOrderId: order.clientOrderId ?? null,
       })

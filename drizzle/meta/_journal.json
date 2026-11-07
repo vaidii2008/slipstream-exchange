@@ -71,6 +71,13 @@
       "when": 1794020026056,
       "tag": "0009_create_engine_events",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794020162392,
+      "tag": "0010_record_protection_price",
+      "breakpoints": true
     }
   ]
 }

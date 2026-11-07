@@ -158,6 +158,10 @@ export const orders = pgTable(
     type: orderType("type").notNull(),
     // Null exactly when the order is a market order.
     price: money("price"),
+    // Set exactly when the order is a market order: the worst price it may trade at, fixed
+    // from the book on arrival. A market buy reserved quantity × this, so recovery needs it
+    // to release a market buy that never reached the engine.
+    protectionPrice: money("protection_price"),
     quantity: money("quantity").notNull(),
     filledQuantity: money("filled_quantity").notNull().default("0"),
     status: orderStatus("status").notNull().default("pending"),
@@ -175,6 +179,11 @@ export const orders = pgTable(
       sql`(${table.type} = 'limit') = (${table.price} is not null)`,
     ),
     check("orders_price_positive", sql`${table.price} > 0`),
+    check(
+      "orders_protection_price_matches_type",
+      sql`(${table.type} = 'market') = (${table.protectionPrice} is not null)`,
+    ),
+    check("orders_protection_price_positive", sql`${table.protectionPrice} > 0`),
     check("orders_quantity_positive", sql`${table.quantity} > 0`),
     check(
       "orders_filled_within_quantity",

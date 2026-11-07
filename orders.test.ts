@@ -47,6 +47,7 @@ async function ordersOf(userId: string) {
       side: orders.side,
       type: orders.type,
       price: orders.price,
+      protectionPrice: orders.protectionPrice,
       quantity: orders.quantity,
       filledQuantity: orders.filledQuantity,
       status: orders.status,
@@ -133,6 +134,7 @@ describe("recordOrder", () => {
         side: "buy",
         type: "limit",
         price: "2000.500000000000000000",
+        protectionPrice: null,
         quantity: "0.250000000000000000",
         filledQuantity: "0.000000000000000000",
         status: "pending",
@@ -185,7 +187,7 @@ describe("recordOrder", () => {
     await expect(ordersOf(userId)).resolves.toEqual([]);
   });
 
-  it("reserves quantity × protection price for a market buy and records it without a price", async () => {
+  it("reserves quantity × protection price for a market buy and records that price", async () => {
     const userId = await createUser();
     await deposit(db, userId, "USD", units("10000"));
 
@@ -202,7 +204,12 @@ describe("recordOrder", () => {
       reserved: units("6300"),
     });
     await expect(ordersOf(userId)).resolves.toEqual([
-      expect.objectContaining({ type: "market", price: null, status: "pending" }),
+      expect.objectContaining({
+        type: "market",
+        price: null,
+        protectionPrice: "63000.000000000000000000",
+        status: "pending",
+      }),
     ]);
   });
 
