@@ -4,7 +4,14 @@
 
 import type { Side } from "./book.ts";
 import { Engine, type EngineEvent, levelsTouched } from "./engine.ts";
-import { appendCommand, applyCommand, type Command, takerLimitOf } from "./events.ts";
+import {
+  appendCommand,
+  applyCommand,
+  type Command,
+  readLog,
+  replay,
+  takerLimitOf,
+} from "./events.ts";
 import type { Database } from "./ledger.ts";
 import {
   DuplicateOrderError,
@@ -122,13 +129,13 @@ type RunningMarket = {
   pending: number;
 };
 
-// One engine and one queue per market, created the first time the market is traded. The
-// books live in this process's memory: an order still open when the process stops stays
-// open and reserved in Postgres but is gone from the book, until Session 10's recovery
-// replays the event log.
+// One engine and one queue per market. The books live in this process's memory and are
+// rebuilt from the event log when a market opens: on its first command, or at boot for every
+// listed market (see open).
 export class Exchange {
   readonly #db: Database;
   readonly #markets = new Map<string, RunningMarket>();
+  readonly #opening = new Map<string, Promise<RunningMarket>>();
   readonly #haltListeners: HaltListener[] = [];
   readonly #updateListeners = new Set<UpdateListener>();
   readonly #maxPending: number;
@@ -160,7 +167,7 @@ export class Exchange {
   // repeats a client order id the user has already placed, MarketHaltedError when the market
   // is halted and MarketBusyError when it has too many commands waiting.
   async placeOrder(market: Market, request: OrderRequest): Promise<PlacedOrder> {
-    const running = this.#market(market.symbol);
+    const running = await this.#open(market);
     // Checked first so a retry gets its original order back even if the book or the balance
     // has changed since. recordOrder catches the retry that races the original.
     if (request.clientOrderId !== undefined) {
@@ -208,7 +215,7 @@ export class Exchange {
   // Queued behind every command already waiting, so an order still pending is matched first
   // and the cancel then finds it resting, filled or gone. Ownership is the caller's check.
   async cancelOrder(market: Market, orderId: string): Promise<"cancelled" | "not_open"> {
-    const running = this.#market(market.symbol);
+    const running = await this.#open(market);
     if (running.halted) {
       throw new MarketHaltedError(market.symbol);
     }
@@ -219,10 +226,52 @@ export class Exchange {
     });
   }
 
-  // The public view of a market's book. A market nobody has traded yet has an empty one. Read
-  // outside the queue, so it may include a command whose settlement has not committed yet.
+  // The public view of a market's book. A market that has not opened yet shows an empty book
+  // at sequence 0; the server opens every listed market before it listens. Read outside the
+  // queue, so it may include a command whose settlement has not committed yet.
   depth(symbol: string, limit: number) {
-    return this.#market(symbol).engine.depth(limit);
+    return (this.#markets.get(symbol)?.engine ?? new Engine(symbol)).depth(limit);
+  }
+
+  // Opens every market before the process takes traffic, so the first order in each does not
+  // wait for its replay and the book served from the start is the rebuilt one.
+  async open(markets: Market[]): Promise<{ market: string; sequence: number; halted: boolean }[]> {
+    return Promise.all(
+      markets.map(async (market) => {
+        const running = await this.#open(market);
+        return { market: market.symbol, sequence: running.engine.sequence, halted: running.halted };
+      }),
+    );
+  }
+
+  // Once per market: the first caller starts the replay and every caller awaits the same one.
+  // placeOrder awaits it before recording anything, so no order is reserved in a market until
+  // its book is rebuilt.
+  #open(market: Market): Promise<RunningMarket> {
+    let opening = this.#opening.get(market.symbol);
+    if (opening === undefined) {
+      opening = this.#replay(market);
+      this.#opening.set(market.symbol, opening);
+    }
+    return opening;
+  }
+
+  // A log that cannot be read or replayed halts the market rather than open it with a book
+  // that is not its history. Other markets open as normal.
+  async #replay(market: Market): Promise<RunningMarket> {
+    const running: RunningMarket = {
+      engine: new Engine(market.symbol),
+      queue: new SerialQueue(),
+      halted: false,
+      pending: 0,
+    };
+    try {
+      replay(running.engine, await readLog(this.#db, market.symbol));
+    } catch (error) {
+      this.#halt(running, market.symbol, error);
+    }
+    this.#markets.set(market.symbol, running);
+    return running;
   }
 
   // Counts a command from admission until it has settled, failed or been refused. The check
@@ -313,14 +362,5 @@ export class Exchange {
     for (const listener of this.#updateListeners) {
       listener(update);
     }
-  }
-
-  #market(symbol: string): RunningMarket {
-    let market = this.#markets.get(symbol);
-    if (market === undefined) {
-      market = { engine: new Engine(symbol), queue: new SerialQueue(), halted: false, pending: 0 };
-      this.#markets.set(symbol, market);
-    }
-    return market;
   }
 }

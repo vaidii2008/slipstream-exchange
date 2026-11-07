@@ -121,3 +121,17 @@ export async function readLog(db: Database, market: string): Promise<LoggedComma
     command: decode(row.commandType, row.payload),
   }));
 }
+
+// Applies a market's logged commands, oldest first, to an engine that has seen none of them,
+// and returns each command's events. The engine is deterministic, so this rebuilds the book,
+// FIFO order included, and leaves the engine numbering from where the log ends. Throws when
+// a command's number is not the one the engine would give it next: a gap or a reordering
+// means the log is not one engine's history, and a book built from it would be wrong.
+export function replay(engine: Engine, log: LoggedCommand[]): EngineEvent[][] {
+  return log.map(({ sequence, command }) => {
+    if (sequence !== engine.sequence + 1) {
+      throw new Error(`event log has command ${sequence} where ${engine.sequence + 1} was next`);
+    }
+    return applyCommand(engine, command);
+  });
+}

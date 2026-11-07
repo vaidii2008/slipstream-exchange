@@ -107,7 +107,8 @@ describe("the event log", () => {
     const halts: string[] = [];
     exchange.onHalt((symbol) => halts.push(symbol));
     const buyer = await funded({ USD: "10000" });
-    // Another writer already holds sequence 1 in this market.
+    // Once this exchange has opened the empty market, another writer takes sequence 1.
+    await exchange.open([market]);
     await db.insert(engineEvents).values({
       market: market.symbol,
       sequence: 1,
@@ -130,6 +131,87 @@ describe("the event log", () => {
     expect((await balancesOf(db, buyer)).find((b) => b.asset === "USD")).toMatchObject({
       reserved: units("6000"),
     });
+  });
+});
+
+describe("rebuilding books from the log", () => {
+  it("gives a new exchange the same book, FIFO order and next sequence", async () => {
+    const market = await testMarket("BTC-USD");
+    const before = new Exchange(db);
+    const first = await funded({ BTC: "1" });
+    const second = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "100000" });
+    // Two asks at 60,000, ahead's first in the queue, and one at 60,100. A bid takes 0.05 of
+    // ahead's; a bid rests and is cancelled; a market buy of 0.3 takes the 0.15 left of ahead's
+    // and 0.15 of behind's, leaving 0.05 of behind's; a bid rests.
+    const ahead = await before.placeOrder(market, limit(first, "sell", "60000", "0.2"));
+    const behind = await before.placeOrder(market, limit(second, "sell", "60000", "0.2"));
+    await before.placeOrder(market, limit(second, "sell", "60100", "0.3"));
+    await before.placeOrder(market, limit(buyer, "buy", "60000", "0.05"));
+    const cancelled = await before.placeOrder(market, limit(buyer, "buy", "59000", "0.1"));
+    await before.cancelOrder(market, cancelled.id);
+    await before.placeOrder(market, {
+      type: "market",
+      userId: buyer,
+      side: "buy",
+      quantity: units("0.3"),
+    });
+    await before.placeOrder(market, limit(buyer, "buy", "59500", "0.1"));
+    const book = before.depth(market.symbol, 50);
+
+    // A process that starts with nothing but the database.
+    const after = new Exchange(db);
+    await expect(after.open([market])).resolves.toEqual([
+      { market: market.symbol, sequence: book.sequence, halted: false },
+    ]);
+
+    expect(after.depth(market.symbol, 50)).toEqual(book);
+    // The rebuilt queue still has behind's 0.05 first at 60,000, so a buy of 0.05 fills it
+    // there, at the sequence after the last logged one.
+    const taker = await after.placeOrder(market, limit(buyer, "buy", "60100", "0.05"));
+    expect(taker).toMatchObject({ status: "filled", fills: [{ price: units("60000") }] });
+    const [aheadRow, behindRow] = await Promise.all(
+      [ahead.id, behind.id].map(async (id) => {
+        const [row] = await db
+          .select({ status: orders.status, sequence: orders.engineSequence })
+          .from(orders)
+          .where(eq(orders.id, id));
+        return row;
+      }),
+    );
+    expect(aheadRow?.status).toBe("filled");
+    expect(behindRow).toEqual({ status: "filled", sequence: book.sequence + 1 });
+  });
+
+  it("halts a market whose log has a gap and opens the others", async () => {
+    const broken = await testMarket("BTC-USD");
+    const fine = await testMarket("ETH-USD");
+    for (const sequence of [1, 3]) {
+      await db.insert(engineEvents).values({
+        market: broken.symbol,
+        sequence,
+        commandType: "cancel",
+        payload: { orderId: `missing-${sequence}` },
+      });
+    }
+    const exchange = new Exchange(db);
+    const halts: unknown[] = [];
+    exchange.onHalt((_symbol, error) => halts.push(error));
+
+    await expect(exchange.open([broken, fine])).resolves.toEqual([
+      { market: broken.symbol, sequence: 1, halted: true },
+      { market: fine.symbol, sequence: 0, halted: false },
+    ]);
+    expect(halts).toEqual([
+      expect.objectContaining({ message: "event log has command 3 where 2 was next" }),
+    ]);
+    const seller = await funded({ BTC: "1", ETH: "1" });
+    await expect(
+      exchange.placeOrder(broken, limit(seller, "sell", "60000", "0.1")),
+    ).rejects.toBeInstanceOf(MarketHaltedError);
+    await expect(
+      exchange.placeOrder(fine, limit(seller, "sell", "3000", "0.1")),
+    ).resolves.toMatchObject({ status: "open" });
   });
 });
 

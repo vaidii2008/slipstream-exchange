@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { parseConfig } from "./config.ts";
 import { Exchange } from "./exchange.ts";
+import { loadMarkets } from "./orders.ts";
 import { createRedisClient } from "./redis.ts";
 import { buildServer } from "./server.ts";
 import { createAccessTokens } from "./tokens.ts";
@@ -65,10 +66,11 @@ try {
   // Same options; a connection in subscribe mode can run nothing else.
   const subscriber = redis.duplicate();
   const db = drizzle({ client: pool });
+  const exchange = new Exchange(db);
 
   // Built before the connections are verified so every startup line goes through pino.
   app = buildServer(
-    { pool, redis, subscriber, db, tokens, exchange: new Exchange(db) },
+    { pool, redis, subscriber, db, tokens, exchange },
     {
       logLevel: config.LOG_LEVEL,
       orderRateLimit: { limit: config.ORDER_RATE_LIMIT, windowMs: 1000 },
@@ -105,6 +107,11 @@ try {
   await verifyRedis(redis);
   await verifyRedis(subscriber);
   log.info("redis connections verified");
+
+  // Before listening, so no order arrives at a book that is still being rebuilt. A market
+  // whose log does not replay is halted and logged at fatal; the others open.
+  const opened = await exchange.open([...(await loadMarkets(db)).values()]);
+  log.info({ markets: opened }, "books rebuilt from the event log");
 
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
 } catch (error) {
