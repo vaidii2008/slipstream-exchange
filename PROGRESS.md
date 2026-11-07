@@ -1483,3 +1483,84 @@ to it, the account channel is the piece to split out.
 - `chore(ops): add Prometheus to compose scraping /metrics`
 - `test(load): add k6 scripts for order placement and socket subscribers`
 - `docs: record match latency percentiles and sustained throughput from a real run`
+
+## Day 15 — Measure it
+
+**Commits landed (12)**
+
+- `feat(metrics): serve Prometheus metrics for orders, trades and socket connections`
+- `feat(metrics): time each command's match and its turn in the market queue`
+- `feat(api): log how long rebuilding the books took at boot`
+- `chore(ops): add Prometheus to compose scraping /metrics`
+- `refactor(test): let the database setup create and migrate any database`
+- `test(load): add k6 scripts for order placement and socket subscribers`
+- `fix(metrics): extend the queue histograms' buckets to 10 s`
+- `test(load): ramp in ten even steps up to a configurable peak`
+- `perf(recovery): check the rebuilt book against Postgres with a set, not a nested scan`
+- `docs: record match latency percentiles, sustained throughput and boot replay time`
+- `docs: add the Session 11 interview note on measurement`
+- `docs: record day 15 in PROGRESS.md`
+
+**What now works**
+
+- `GET /metrics` serves `slipstream_orders_total{market,outcome}`,
+  `slipstream_trades_total{market}`, `slipstream_websocket_connections`, and per-market
+  histograms of each command's queue wait, its turn (log append, match, settlement) and the
+  match alone, plus Node's process metrics. Orders refused before their market is known count
+  under `market="none"`. No label is ever a user or order id.
+- Prometheus 3.5 runs in compose on 127.0.0.1:9090 and scrapes the API every 5 s.
+- Boot logs how many commands each market replayed and how long the rebuild took.
+- `load/orders.js` (k6, open model, ramp or steady), `load/sockets.js` (subscribers measuring
+  trade delay and book gaps) and `load/benchdb.ts create|drop` for `slipstream_bench`.
+- Numbers, all on this MacBook (Apple M4) with Postgres and Redis in Docker Desktop, 7 Nov:
+  - Engine-only: 4,305,856 commands/s, p50 0.21 µs, p99 0.54 µs.
+  - End to end, one market saturates near 264 commands/s; its mean turn of 3.8 ms predicts 263. Both markets together reach about 330/s.
+  - Steady 200/s across both markets: placement p50 12.8 ms, p95 150 ms, p99 711 ms; match
+    p50 4.1 µs.
+  - 100/s with 200 subscribers: no gap in 1,791,445 book deltas; trade delay p50 18 ms, p99
+    69 ms (clocks disagree by at least 12 ms).
+  - Boot: 118,271 commands rebuilt in 310 to 320 ms; 1,011,453 in 2.9 to 3.6 s, healthy 3.3 to
+    4.1 s after launch, 1.5 to 1.6 GB peak RSS.
+  - 0 responses with 429 and 0 with 503 in every run, with 300 users.
+- The recovery check was quadratic in the book's size: 2.8 to 3.6 s per market at 1M
+  commands, now 0.2 to 0.4 s. A new test covers the branch it changed.
+- 432 tests in 34 files, up from 426 in 33.
+
+**What is stubbed**
+
+- `/metrics` is unauthenticated on the API's port. A deployment keeps it off the public
+  listener.
+- Market data fan-out runs on the engine's event loop. Past about 25,000 socket messages a
+  second it slows matching.
+- Boot still holds the whole log in memory: 1.5 GB at 1M commands.
+- Carried over: the browser click-through with the fleet running, drizzle-kit's dev-only audit
+  findings, the web dependencies' moderate audit findings, Safari unchecked.
+
+**Decisions and deviations from the plan**
+
+- Two commits beyond the plan's four came from the first run: the queue buckets topped out at
+  2.5 s while real waits were 8 s, and the first ramp jumped past the ceiling.
+- The recovery fix is a `perf:` commit found by the boot measurement, with before and after
+  numbers.
+- Diagnosis experiments on the bench database only: `synchronous_commit = off` for one ramp
+  (moved the peak from about 338 to 371/s, so fsync is not the limit), a CPU profile, and a
+  count of statements per order (16 resting, 43 crossing).
+- `f6d308c` was committed before its gate result was read; that run failed on the kill test's
+  10 s wait, run straight after a load test on the same Postgres. The same tree then passed
+  three gate runs in a row.
+
+**Repo shape**
+
+- `metrics.ts`. Pressure: the order route, the socket layer and the server record into one
+  registry, and the server serves it.
+- `load/`. Pressure: k6 scripts run in k6's runtime, not Node, and lint needs k6's globals for
+  them alone.
+- `prometheus.yml`. The Prometheus image reads its scrape config from a file.
+
+**Next: Day 16 — Ship it (Session 12), after three proposals**
+
+- Proposal: a cached balance per ledger account, updated with each entry under the existing
+  lock. Summing whole histories cut throughput from 250 to 123 commands/s over the 1M fill.
+- Proposal: a Postgres advisory lock per market while a process has it open, so a second
+  process cannot write the same market.
+- Option: batch several queued commands per turn, to raise a market's ceiling.
