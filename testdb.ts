@@ -22,14 +22,13 @@ export function testDatabaseUrl(): string {
   return url.toString();
 }
 
-// Vitest's global setup: runs once, before any test file opens a connection. Creates the test
-// database if it is missing, then applies every migration drizzle-kit generated.
-export async function setup(): Promise<void> {
-  const testUrl = testDatabaseUrl();
-  const name = new URL(testUrl).pathname.slice(1);
+// Creates the database `url` names if it is missing, then applies every migration
+// drizzle-kit generated. CREATE DATABASE runs from a connection to another database on the
+// same server, `adminUrl`.
+export async function createAndMigrate(adminUrl: string, url: string): Promise<void> {
+  const name = new URL(url).pathname.slice(1);
 
-  // CREATE DATABASE runs from a connection to another database on the same server.
-  const admin = new Client({ connectionString: process.env.DATABASE_URL });
+  const admin = new Client({ connectionString: adminUrl });
   try {
     await admin.connect();
   } catch (error) {
@@ -47,11 +46,21 @@ export async function setup(): Promise<void> {
     await admin.end();
   }
 
-  const client = new Client({ connectionString: testUrl });
+  const client = new Client({ connectionString: url });
   await client.connect();
   try {
     await migrate(drizzle({ client }), { migrationsFolder: "./drizzle" });
   } finally {
     await client.end();
   }
+}
+
+// Vitest's global setup: runs once, before any test file opens a connection.
+export async function setup(): Promise<void> {
+  const testUrl = testDatabaseUrl();
+  const adminUrl = process.env.DATABASE_URL;
+  if (adminUrl === undefined) {
+    throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
+  }
+  await createAndMigrate(adminUrl, testUrl);
 }
