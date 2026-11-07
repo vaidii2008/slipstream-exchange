@@ -6,12 +6,17 @@ import { uniqueMarketDataPrefix, useTestServer } from "./testing.ts";
 
 const { pool, redis, subscriber, db, tokens, uniqueEmail, testMarket } = useTestServer();
 
-// Its own server with a limit of 2 orders a second, so a third order in the same second is
-// refused, and its own metrics, so counts from other tests in the file stay out of these.
+// Its own server with a limit of 2 orders an hour, so a user's third order is refused, and
+// its own metrics, so counts from other tests in the file stay out of these. An hour, not a
+// second: the window is fixed, and under a loaded suite a user's first and third orders
+// sometimes fell either side of a one-second boundary, so the third was allowed.
 function freshServer() {
   const server = buildServer(
     { pool, redis, subscriber, db, tokens, exchange: new Exchange(db) },
-    { marketDataPrefix: uniqueMarketDataPrefix(), orderRateLimit: { limit: 2, windowMs: 1000 } },
+    {
+      marketDataPrefix: uniqueMarketDataPrefix(),
+      orderRateLimit: { limit: 2, windowMs: 3_600_000 },
+    },
   );
   afterAll(async () => {
     await server.close();
@@ -96,7 +101,7 @@ describe("GET /metrics", () => {
     expect((await order(buyer, "buy", "60000")).statusCode).toBe(201);
     // Off the 0.01 tick.
     expect((await order(buyer, "buy", "60000.001")).statusCode).toBe(400);
-    // The seller's third order this second.
+    // The seller's third order this window.
     expect((await order(seller, "sell", "60002")).statusCode).toBe(429);
 
     const text = await scrape(server);
