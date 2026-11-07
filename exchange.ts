@@ -2,7 +2,6 @@
 // market's engine, then settled (settlement.ts) before the next command starts. A market
 // halts if a settlement fails and refuses commands past its cap.
 
-import { Client } from "pg";
 import type { Side } from "./book.ts";
 import { Engine, type EngineEvent, levelsTouched } from "./engine.ts";
 import {
@@ -22,6 +21,7 @@ import {
   protectionPrice,
   recordOrder,
 } from "./orders.ts";
+import { acquireMarketLock, type MarketLock } from "./marketlock.ts";
 import { type Recovered, recover } from "./recovery.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 
@@ -93,29 +93,6 @@ export class MarketBusyError extends Error {
   }
 }
 
-// Another process holds the market's advisory lock, so it is that process's market to write.
-export class MarketLockedError extends Error {
-  readonly market: string;
-
-  constructor(market: string) {
-    super(`market ${market} is open in another process, which holds its advisory lock`);
-    this.name = "MarketLockedError";
-    this.market = market;
-  }
-}
-
-// The connection holding the market's advisory lock dropped, and the lock went with it.
-// Another process may now open the market, so this one stops writing it.
-export class MarketLockLostError extends Error {
-  readonly market: string;
-
-  constructor(market: string, options?: ErrorOptions) {
-    super(`market ${market} lost its advisory lock with the connection that held it`, options);
-    this.name = "MarketLockLostError";
-    this.market = market;
-  }
-}
-
 export type HaltListener = (market: string, error: unknown) => void;
 
 // How long one command took, in seconds, split where the time goes: waiting behind the
@@ -170,8 +147,8 @@ type RunningMarket = {
   recovered: Recovered;
   // Commands replayed from the log when it opened; zero for a market whose log did not read.
   replayed: number;
-  // The connection holding the market's advisory lock, while it holds it.
-  lock?: Client;
+  // The market's advisory lock, while this process holds it.
+  lock?: MarketLock;
 };
 
 export type OpenedMarket = {
@@ -346,46 +323,18 @@ export class Exchange {
     return running;
   }
 
-  // One writer per market across processes, not just within one: the market's sequence
-  // numbers, its book and its settlements all assume a single writer. Taken before the replay,
-  // so a second process never reads a log the first is still appending to. A session-level
-  // advisory lock lives exactly as long as its connection, which is why the connection is
-  // dedicated: a pooled one would carry the lock back into the pool. If the connection drops,
-  // Postgres has released the lock and another process may open the market, so this one halts
-  // it. Sets `running.lock` once the lock is held.
+  // Sets `running.lock` once the lock is held (marketlock.ts). A lock lost later halts the
+  // market: another process may already be writing it.
   async #lock(running: RunningMarket, symbol: string, url: string): Promise<void> {
-    const client = new Client({
-      connectionString: url,
-      connectionTimeoutMillis: 5000,
-      // Names the holder in pg_stat_activity, for whoever finds the market refusing to open.
-      application_name: `slipstream market lock ${symbol}`,
+    const lock = await acquireMarketLock(url, symbol, (error) => {
+      running.lock = undefined;
+      this.#halt(running, symbol, error);
     });
-    // A connection that fails while idle emits "error", and an unhandled one would crash the
-    // process. Both events can follow one drop; clearing `running.lock` makes the halt happen
-    // once, and close() clears it first so that ending the connection on purpose is not a loss.
-    const lost = (cause?: unknown) => {
-      if (running.lock === client) {
-        running.lock = undefined;
-        this.#halt(running, symbol, new MarketLockLostError(symbol, { cause }));
-      }
-    };
-    client.on("error", lost);
-    client.on("end", () => lost());
-    await client.connect();
-
-    const result = await client.query<{ locked: boolean }>(
-      "select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
-      [`slipstream:market:${symbol}`],
-    );
-    if (result.rows[0]?.locked !== true) {
-      await client.end();
-      throw new MarketLockedError(symbol);
-    }
     if (this.#closed) {
-      await client.end();
+      await lock.release();
       throw new Error(`exchange closed while ${symbol} was opening`);
     }
-    running.lock = client;
+    running.lock = lock;
   }
 
   // Releases every market's advisory lock by closing its connection. Called on shutdown,
@@ -400,7 +349,7 @@ export class Exchange {
         const lock = running.lock;
         if (lock !== undefined) {
           running.lock = undefined;
-          await lock.end();
+          await lock.release();
         }
       }),
     );

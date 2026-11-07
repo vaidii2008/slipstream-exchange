@@ -859,7 +859,7 @@ every reservation matching an open order.
   recovery, the unique (market, engine_sequence) on trades fails one of the two, which halts
   rather than pays twice. Closing the gap needs every settlement to check that it still holds
   the lock.
-- **Where:** `#lock` and `close` in `exchange.ts`; the "two exchanges on one database" tests in
+- **Where:** `acquireMarketLock` in `marketlock.ts`; `#lock` and `close` in `exchange.ts`; the "two exchanges on one database" tests in
   `exchange.test.ts`.
 
 ### Interview note: Session 11, measuring it

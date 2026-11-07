@@ -2,15 +2,9 @@ import { eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import {
-  Exchange,
-  MarketBusyError,
-  MarketHaltedError,
-  MarketLockedError,
-  MarketLockLostError,
-  SerialQueue,
-} from "./exchange.ts";
+import { Exchange, MarketBusyError, MarketHaltedError, SerialQueue } from "./exchange.ts";
 import { balancesOf, deposit, openAccount } from "./ledger.ts";
+import { MarketLockedError, MarketLockLostError } from "./marketlock.ts";
 import { parseAmount } from "./money.ts";
 import type { Market } from "./orders.ts";
 import { orders, trades, users } from "./schema.ts";
