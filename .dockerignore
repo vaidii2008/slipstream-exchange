@@ -1,0 +1,13 @@
+# An allowlist: the API image gets its runtime sources and migrations, nothing else.
+*
+!package.json
+!package-lock.json
+!*.ts
+!drizzle/
+*.test.ts
+*.bench.ts
+recovery.child.ts
+testing.ts
+testdb.ts
+drizzle.config.ts
+vitest.config.ts

@@ -1,0 +1,13 @@
+# An allowlist for the web image, whose build context is the repo root: what `next build`
+# reads, nothing else. protocol.ts is the message types the terminal shares with the API.
+*
+!protocol.ts
+!web/app/
+!web/components/
+!web/lib/
+!web/next.config.ts
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+**/*.test.ts
+**/*.test.tsx
