@@ -1316,7 +1316,7 @@ to it, the account channel is the piece to split out.
 
 ## Day 13 — Trading bots
 
-**Commits landed (10)**
+**Commits landed (9)**
 
 - `perf(market): read candle history from a bounded time window`
 - `feat(bots): add an agent runner with lifecycle and per-agent accounts`
@@ -1639,3 +1639,79 @@ to it, the account channel is the piece to split out.
 
 - Dev database: apply `0012` with `npx drizzle-kit migrate`.
 - Option: batch several queued commands per turn, to raise a market's ceiling.
+
+## Day 16 — Ship it
+
+**Commits landed (9)**
+
+- `perf(ledger): read balances from the cached column, versioned by an index lookup`
+- `fix(test): wait for each maker's first trade, with a ceiling, not a fixed 3 ticks`
+- `fix(test): give the metrics test's rate limit an hour's window, not a second's`
+- `refactor(exchange): move the per-market advisory lock into its own module`
+- `build: add multi-stage Dockerfiles for the API and the web app`
+- `build(compose): run the whole stack from the images under an app profile`
+- `docs: rewrite the README with architecture, how to run, benchmarks and a simulator disclaimer`
+- `docs: put five decisions worth defending at the top of DECISIONS.md`
+- `docs: record day 16 in PROGRESS.md`
+
+**What now works**
+
+- `GET /balances` and the account channel read `ledger_accounts.balance`, not a sum of
+  entries. The version, the user's latest entry id, comes from a new `(account_id, id)` index
+  (migration `0013`), which replaces the `account_id` one. On a bench database padded to 3.6M
+  entries, 12,000 of them the user's, warm, one query in `psql`: 7.0–7.5 ms summed → 0.07–0.21
+  ms. Without the new index, `max(id)` for a user with no recent entries walked the primary
+  key back through the table: 660–795 ms. With it: 0.8–1.7 ms.
+- The fleet test waits until every agent has ticked 3 times and each maker's base, resting
+  orders included, has moved off its funding, under a 20 s ceiling. 10 of 10 alone, and passed
+  in all 8 full-suite runs after the change.
+- `marketlock.ts` owns the lock's connection, the try-lock and the once-only loss report;
+  `exchange.ts` is down from 510 to 459 lines.
+- `docker compose --profile app up` runs migrate, the API, the bot fleet and the terminal from
+  two images (API 314 MB, web 293 MB). Checked from a fresh clone on fresh volumes with no
+  `.env`: all services healthy, 8 bots started, 70 trades 15 s after the fleet started, browser check
+  clean.
+- `migrate.ts` applies `./drizzle` with drizzle-orm's migrator, so the image needs no dev
+  dependencies.
+- README: quick start, the deposit commands, a Mermaid diagram, the results table, the three
+  before/after stories, known limits and the disclaimer.
+- 440 tests in 34 files, up from 438.
+
+**What is stubbed**
+
+- The terminal has no deposit form. The README gives the `curl` commands. A deposit is not
+  pushed over the socket either; a reload shows it.
+- The demo GIF: the shot list is in the session report, recording is mine.
+- Carried over: the in-flight settlement gap when a market's lock drops, the browser
+  click-through with the fleet running, drizzle-kit's dev-only audit findings, the web
+  dependencies' moderate audit findings, Safari unchecked.
+
+**Decisions and deviations from the plan**
+
+- Reading the version needed an index change (`0013`), which no plan item named. It adds no
+  column or constraint.
+- A second flaky test turned up while checking the fleet fix: `metrics.test.ts` expected a
+  429 and got a 201 in 1 of 8 full runs, the fixed one-second window rolling over mid-test.
+  Fixed with an hour's window.
+- The web image builds from the repo root, because the terminal type-checks against
+  `protocol.ts`. `web/Dockerfile.dockerignore` keeps its context to an allowlist.
+- `BOT_PASSWORD` in the app profile comes from `.env` when set. The app profile shares the dev
+  Postgres volume, and bot accounts registered by source runs have that password.
+- The browser check failed intermittently against the images. The cause was the check, not
+  the app. A failed run leaves its headless Chromium holding port 9333, so the next run
+  attached to that stale page. And against the production build, which prerenders the
+  register page, the check sometimes submits the form before React hydrates ("React form
+  unexpectedly submitted"). With no stale browsers, the dev server and the images both gave 0
+  problems. Briefly tried publishing the ports on `[::1]` too; reverted, as IPv4 fallback
+  already works and it could break hosts without IPv6.
+- `DECISIONS.md` keeps every entry, with a five-decision index on top.
+
+**Repo shape**
+
+- New: `marketlock.ts` (refactor, pressure named), `migrate.ts` (the image has no
+  drizzle-kit), `Dockerfile`, `.dockerignore`, `web/Dockerfile`, `web/Dockerfile.dockerignore`,
+  migration `0013`.
+
+**Next: Session 13 — An LLM agent trades through MCP (stretch)**
+
+- Dev database: `0013` is applied.
