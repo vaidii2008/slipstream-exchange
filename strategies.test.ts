@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AgentRunner, ApiClient, type Logger, type MarketInfo } from "./bots.ts";
+import { AgentRunner, ApiClient, type Logger, type RiskLimits, type MarketInfo } from "./bots.ts";
 import {
   type MakerOptions,
   makerQuotes,
@@ -13,6 +13,14 @@ import { useTestServer } from "./testing.ts";
 const { app, uniqueEmail } = useTestServer();
 const PASSWORD = "strategies-test-password";
 const quiet: Logger = () => {};
+// Limits no test here comes near, for tests about something else.
+const loose: RiskLimits = {
+  maxOrderQuantity: 10n ** 12n,
+  maxOpenOrders: 100,
+  maxPosition: 10n ** 12n,
+  maxLoss: 10n ** 15n,
+  maxFailedTicks: 1000,
+};
 let baseUrl: string;
 
 beforeAll(async () => {
@@ -150,6 +158,7 @@ describe("noiseTrader", () => {
       market: "ETH-USD",
       funding: { USD: "10000", ETH: "2" },
       intervalMs: 10,
+      limits: loose,
       strategy: noiseTrader({ ...noise, referencePrice: usd(3_000), limitShare: 0.3 }),
     });
     const api = new ApiClient(baseUrl, email, PASSWORD);
@@ -257,6 +266,7 @@ describe("marketMaker", () => {
       market: "BTC-USD",
       funding: { USD: "10000", BTC: "1" },
       intervalMs: 600_000,
+      limits: loose,
       strategy,
     });
     const api = new PricedClient(baseUrl, email, PASSWORD);

@@ -1,5 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AgentRunner, ApiClient, type AgentContext, type Logger, type Strategy } from "./bots.ts";
+import {
+  AgentRunner,
+  ApiClient,
+  type AgentContext,
+  type AgentSpec,
+  type Logger,
+  type RiskLimits,
+  type Strategy,
+} from "./bots.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail } = useTestServer();
@@ -16,6 +24,14 @@ beforeAll(async () => {
 });
 
 const quiet: Logger = () => {};
+// Limits no test here comes near, for tests about something else.
+const loose: RiskLimits = {
+  maxOrderQuantity: 10n ** 12n,
+  maxOpenOrders: 100,
+  maxPosition: 10n ** 12n,
+  maxLoss: 10n ** 15n,
+  maxFailedTicks: 1000,
+};
 
 // Resolves once `check` passes, polling every 10 ms, so a test waits for ticks to happen
 // rather than for a fixed time.
@@ -70,6 +86,7 @@ describe("AgentRunner", () => {
       market: "BTC-USD",
       funding: { USD: "1000", BTC: "0.5" },
       intervalMs: 20,
+      limits: loose,
       strategy,
     });
     await until(() => seen.length >= 3);
@@ -98,6 +115,7 @@ describe("AgentRunner", () => {
       market: "ETH-USD",
       funding: { USD: "500" },
       intervalMs: 1000,
+      limits: loose,
       strategy: { tick: async () => {} },
     };
     const first = runner();
@@ -121,6 +139,7 @@ describe("AgentRunner", () => {
       market: "BTC-USD",
       funding: { USD: "1000" },
       intervalMs: 20,
+      limits: loose,
       strategy,
     });
     await until(() => seen.length >= 1);
@@ -145,6 +164,7 @@ describe("AgentRunner", () => {
       market: "BTC-USD",
       funding: {},
       intervalMs: 10,
+      limits: loose,
       strategy: {
         tick() {
           calls += 1;
@@ -167,8 +187,190 @@ describe("AgentRunner", () => {
         market: "BTC-USD",
         funding: { ETH: "1" },
         intervalMs: 1000,
+        limits: loose,
         strategy: { tick: async () => {} },
       }),
     ).rejects.toThrow("funding ETH is not traded in BTC-USD");
+  });
+});
+
+describe("risk limits", () => {
+  const runners: AgentRunner[] = [];
+  afterAll(async () => {
+    await Promise.all(runners.map((runner) => runner.stopAll()));
+  });
+
+  // The last price comes from the trades table, which other test files write to at the same
+  // time, so equity here is measured at a price the test sets.
+  let price = 70_000_00000000n;
+  class PricedClient extends ApiClient {
+    override lastPrice(): Promise<bigint | undefined> {
+      return Promise.resolve(price);
+    }
+  }
+  const runner = () => {
+    const created = new AgentRunner({
+      baseUrl,
+      password: PASSWORD,
+      log: quiet,
+      client: (url, email, password) => new PricedClient(url, email, password),
+    });
+    runners.push(created);
+    return created;
+  };
+  const limits: RiskLimits = {
+    maxOrderQuantity: 1_000_000n,
+    maxOpenOrders: 2,
+    maxPosition: 1_500_000n,
+    maxLoss: 500_00000000n,
+    maxFailedTicks: 3,
+  };
+  const idle = { tick: () => Promise.resolve() };
+  // Funded with 10,000 USD and 0.1 BTC; ticks are driven by the test unless it says otherwise.
+  const start = (overrides: Partial<AgentSpec> = {}) =>
+    runner().start({
+      name: "risky",
+      email: uniqueEmail("bots-test"),
+      market: "BTC-USD",
+      funding: { USD: "10000", BTC: "0.1" },
+      intervalMs: 600_000,
+      strategy: idle,
+      limits,
+      ...overrides,
+    });
+  const bid = (quantity: bigint) => ({
+    type: "limit" as const,
+    side: "buy" as const,
+    price: 1_00000000n,
+    quantity,
+  });
+
+  it("refuses an order larger than maxOrderQuantity without sending it", async () => {
+    const agent = await start();
+    const { api, market } = agent.context;
+
+    await expect(api.place(market, bid(1_010_000n))).resolves.toEqual({
+      ok: false,
+      status: 0,
+      error: "risk_max_order_quantity",
+    });
+    expect(await api.openOrders(market)).toEqual([]);
+    await expect(api.place(market, bid(1_000_000n))).resolves.toMatchObject({ ok: true });
+    expect(agent.riskRefusals).toBe(1);
+  });
+
+  it("refuses a third resting order at maxOpenOrders 2", async () => {
+    const { context } = await start();
+    const { api, market } = context;
+
+    await api.place(market, bid(10_000n));
+    await api.place(market, bid(10_000n));
+
+    await expect(api.place(market, bid(10_000n))).resolves.toMatchObject({
+      error: "risk_max_open_orders",
+    });
+  });
+
+  it("counts resting orders as filled when checking maxPosition", async () => {
+    const { context } = await start({ limits: { ...limits, maxOpenOrders: 10 } });
+    const { api, market } = context;
+
+    // 0.01 BTC resting bid, then 0.006 more would make 0.016 BTC long if both filled.
+    await api.place(market, bid(1_000_000n));
+    await expect(api.place(market, bid(600_000n))).resolves.toMatchObject({
+      error: "risk_max_position",
+    });
+    await expect(api.place(market, bid(500_000n))).resolves.toMatchObject({ ok: true });
+    // Selling only moves the other way from start, by 0.01 BTC: allowed.
+    await expect(
+      api.place(market, {
+        type: "limit",
+        side: "sell",
+        price: 1_000_000_00000000n,
+        quantity: 1_000_000n,
+      }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
+  it("kills the agent and cancels its orders when equity falls past maxLoss", async () => {
+    price = 70_000_00000000n;
+    let ticks = 0;
+    const agent = await start({
+      intervalMs: 10,
+      strategy: {
+        async tick({ api, market }: AgentContext) {
+          ticks += 1;
+          if (ticks === 1) {
+            await api.place(market, bid(10_000n));
+          }
+        },
+      },
+    });
+    await until(() => ticks >= 2);
+
+    // 0.1 BTC from 70,000 to 64,000 is 600 USD of equity gone, past the 500 limit.
+    price = 64_000_00000000n;
+    await until(() => agent.status === "killed");
+    const ticksAtKill = ticks;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    price = 70_000_00000000n;
+
+    expect(agent.killReason).toBe("lost 60000000000 quote minor units, limit 50000000000");
+    expect(ticks).toBe(ticksAtKill);
+    const { api, market } = agent.context;
+    expect(await api.openOrders(market)).toEqual([]);
+    await expect(api.place(market, bid(10_000n))).resolves.toMatchObject({
+      error: "risk_killed",
+    });
+  });
+
+  it("kills the agent after maxFailedTicks failures in a row, not in total", async () => {
+    // fail, fail, succeed, then fail until killed: killed on the third in a row.
+    const script = [false, false, true];
+    let calls = 0;
+    const agent = await start({
+      intervalMs: 5,
+      strategy: {
+        tick() {
+          calls += 1;
+          return (script[calls - 1] ?? false)
+            ? Promise.resolve()
+            : Promise.reject(new Error("the API is down"));
+        },
+      },
+    });
+    await until(() => agent.status === "killed");
+
+    expect(calls).toBe(6);
+    expect(agent.failedTicks).toBe(5);
+    expect(agent.killReason).toBe("3 failed ticks in a row");
+  });
+
+  it("kills on demand, after the tick in flight, and leaves nothing resting", async () => {
+    let release: () => void = () => {};
+    let entered = false;
+    const agent = await start({
+      intervalMs: 5,
+      strategy: {
+        async tick({ api, market }: AgentContext) {
+          entered = true;
+          await new Promise<void>((resolve) => (release = resolve));
+          // Still in the tick when the kill switch trips: this order must not go out.
+          await api.place(market, bid(10_000n));
+        },
+      },
+    });
+    const { api, market } = agent.context;
+    await api.place(market, bid(10_000n));
+    await until(() => entered);
+
+    const killing = agent.kill("operator");
+    release();
+    await killing;
+
+    expect(agent.status).toBe("killed");
+    expect(agent.killReason).toBe("operator");
+    expect(agent.riskRefusals).toBe(1);
+    expect(await api.openOrders(market)).toEqual([]);
   });
 });
