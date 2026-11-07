@@ -1,11 +1,11 @@
 import { inArray } from "drizzle-orm";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Exchange } from "./exchange.ts";
 import { trades } from "./schema.ts";
 import { buildServer } from "./server.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, redis, subscriber, db, tokens, uniqueEmail } = useTestServer();
+const { pool, redis, subscriber, db, tokens, uniqueEmail, testMarket } = useTestServer();
 
 // Its own exchange, so the book holds only what these tests rest.
 const app = buildServer({
@@ -19,6 +19,16 @@ const app = buildServer({
 
 afterAll(async () => {
   await app.close();
+});
+
+// This file's own markets, which only its exchange trades.
+let btc: string;
+let eth: string;
+beforeAll(async () => {
+  [btc, eth] = await Promise.all([
+    testMarket("BTC-USD").then((market) => market.symbol),
+    testMarket("ETH-USD").then((market) => market.symbol),
+  ]);
 });
 
 // A signed-in, funded user, with their id so a test can check it never appears.
@@ -69,17 +79,17 @@ describe("GET /markets/:symbol/book", () => {
     const alice = await trader({ BTC: "1", USD: "10000" });
     const bob = await trader({ BTC: "1" });
     const orderIds = [
-      await place(alice.authorization, "BTC-USD", "sell", "60000", "0.1"),
-      await place(bob.authorization, "BTC-USD", "sell", "60000", "0.2"),
-      await place(bob.authorization, "BTC-USD", "sell", "60100", "0.3"),
-      await place(alice.authorization, "BTC-USD", "buy", "59000", "0.05"),
+      await place(alice.authorization, btc, "sell", "60000", "0.1"),
+      await place(bob.authorization, btc, "sell", "60000", "0.2"),
+      await place(bob.authorization, btc, "sell", "60100", "0.3"),
+      await place(alice.authorization, btc, "buy", "59000", "0.05"),
     ];
 
-    const response = await app.inject({ method: "GET", url: "/markets/BTC-USD/book" });
+    const response = await app.inject({ method: "GET", url: `/markets/${btc}/book` });
 
     expect(response.statusCode).toBe(200);
     expect(response.json<unknown>()).toEqual({
-      market: "BTC-USD",
+      market: btc,
       sequence: 4,
       bids: [{ price: "59000.00000000", quantity: "0.05000000" }],
       asks: [
@@ -93,7 +103,7 @@ describe("GET /markets/:symbol/book", () => {
   });
 
   it("returns only as many levels as asked for", async () => {
-    const response = await app.inject({ method: "GET", url: "/markets/BTC-USD/book?depth=1" });
+    const response = await app.inject({ method: "GET", url: `/markets/${btc}/book?depth=1` });
 
     expect(response.json<{ asks: unknown[] }>().asks).toEqual([
       { price: "60000.00000000", quantity: "0.30000000" },
@@ -101,10 +111,10 @@ describe("GET /markets/:symbol/book", () => {
   });
 
   it("serves an empty book for a market nobody has traded", async () => {
-    const response = await app.inject({ method: "GET", url: "/markets/ETH-USD/book" });
+    const response = await app.inject({ method: "GET", url: `/markets/${eth}/book` });
 
     expect(response.json<unknown>()).toEqual({
-      market: "ETH-USD",
+      market: eth,
       sequence: 0,
       bids: [],
       asks: [],
@@ -117,12 +127,12 @@ describe("GET /markets/:symbol/trades", () => {
     const seller = await trader({ ETH: "1" });
     const buyer = await trader({ USD: "10000" });
     const orderIds = [
-      await place(seller.authorization, "ETH-USD", "sell", "3141.59", "0.5"),
-      await place(buyer.authorization, "ETH-USD", "buy", "3141.59", "0.2"),
-      await place(buyer.authorization, "ETH-USD", "buy", "3141.59", "0.1"),
+      await place(seller.authorization, eth, "sell", "3141.59", "0.5"),
+      await place(buyer.authorization, eth, "buy", "3141.59", "0.2"),
+      await place(buyer.authorization, eth, "buy", "3141.59", "0.1"),
     ];
 
-    const response = await app.inject({ method: "GET", url: "/markets/ETH-USD/trades?limit=200" });
+    const response = await app.inject({ method: "GET", url: `/markets/${eth}/trades?limit=200` });
 
     expect(response.statusCode).toBe(200);
     const { trades } = response.json<{
@@ -157,10 +167,10 @@ describe("GET /markets/:symbol/candles", () => {
     const seller = await trader({ ETH: "1" });
     const buyer = await trader({ USD: "10000" });
     const takerIds: string[] = [];
-    await place(seller.authorization, "ETH-USD", "sell", "3000", "0.1");
-    takerIds.push(await place(buyer.authorization, "ETH-USD", "buy", "3000", "0.1"));
-    await place(seller.authorization, "ETH-USD", "sell", "3010.5", "0.25");
-    takerIds.push(await place(buyer.authorization, "ETH-USD", "buy", "3010.5", "0.25"));
+    await place(seller.authorization, eth, "sell", "3000", "0.1");
+    takerIds.push(await place(buyer.authorization, eth, "buy", "3000", "0.1"));
+    await place(seller.authorization, eth, "sell", "3010.5", "0.25");
+    takerIds.push(await place(buyer.authorization, eth, "buy", "3010.5", "0.25"));
     // Both trades moved into one minute of 2002, where no other test trades.
     await db
       .update(trades)
@@ -169,12 +179,12 @@ describe("GET /markets/:symbol/candles", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/markets/ETH-USD/candles?limit=1&before=2002-01-01T00:01:00Z",
+      url: `/markets/${eth}/candles?limit=1&before=2002-01-01T00:01:00Z`,
     });
 
     expect(response.statusCode).toBe(200);
     expect(response.json<unknown>()).toEqual({
-      market: "ETH-USD",
+      market: eth,
       interval: "1m",
       candles: [
         {
@@ -221,7 +231,12 @@ describe("GET /markets", () => {
     const response = await app.inject({ method: "GET", url: "/markets" });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json<unknown>()).toEqual({
+    // Test markets from files running alongside this one are listed too; the seeded two are
+    // what this checks.
+    const { markets } = response.json<{ markets: { symbol: string }[] }>();
+    expect({
+      markets: markets.filter((market) => ["BTC-USD", "ETH-USD"].includes(market.symbol)),
+    }).toEqual({
       markets: [
         {
           symbol: "BTC-USD",

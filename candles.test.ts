@@ -1,14 +1,14 @@
 import { eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { addTrade, type Candle, type CandleTrade, candleStart, loadCandles } from "./candles.ts";
 import { Exchange } from "./exchange.ts";
 import { deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market } from "./orders.ts";
+import type { Market } from "./orders.ts";
 import { trades, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
-const { db, uniqueEmail } = useTestServer();
+const { db, uniqueEmail, testMarket } = useTestServer();
 
 const units = (value: string): bigint => {
   const parsed = parseAmount(value, 8);
@@ -103,12 +103,9 @@ describe("addTrade", () => {
 describe("loadCandles", () => {
   let btcUsd: Market;
 
-  beforeAll(async () => {
-    const market = await loadMarket(db, "BTC-USD");
-    if (market === undefined) {
-      throw new Error("BTC-USD must be seeded");
-    }
-    btcUsd = market;
+  // Each test's exchange gets a market of its own.
+  beforeEach(async () => {
+    btcUsd = await testMarket("BTC-USD");
   });
 
   async function funded(asset: string, amount: string): Promise<string> {

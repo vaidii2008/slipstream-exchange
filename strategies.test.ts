@@ -10,7 +10,7 @@ import {
 } from "./strategies.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, uniqueEmail } = useTestServer();
+const { app, uniqueEmail, testMarket } = useTestServer();
 const PASSWORD = "strategies-test-password";
 const quiet: Logger = () => {};
 // Limits no test here comes near, for tests about something else.
@@ -23,7 +23,15 @@ const loose: RiskLimits = {
 };
 let baseUrl: string;
 
+// This file's own markets, which only its server's exchange trades.
+let btc: string;
+let eth: string;
+
 beforeAll(async () => {
+  [btc, eth] = await Promise.all([
+    testMarket("BTC-USD").then((market) => market.symbol),
+    testMarket("ETH-USD").then((market) => market.symbol),
+  ]);
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
   if (address === null || typeof address === "string") {
@@ -138,10 +146,10 @@ describe("noiseTrader", () => {
   };
 
   it("trades against resting liquidity and keeps at most maxOpenOrders resting", async () => {
-    // A liquidity provider with a bid and an ask either side of 3,000 on ETH-USD.
+    // A liquidity provider with a bid and an ask either side of 3,000 on ETH/USD.
     const provider = new ApiClient(baseUrl, uniqueEmail("strategies-test"), PASSWORD);
     await provider.signIn();
-    const ethUsd = await provider.market("ETH-USD");
+    const ethUsd = await provider.market(eth);
     await provider.deposit("USD", usd(100_000), 8);
     await provider.deposit("ETH", 20n * 100_000_000n, 8);
     for (const [side, price] of [
@@ -155,7 +163,7 @@ describe("noiseTrader", () => {
     const agent = await runner().start({
       name: "noise",
       email,
-      market: "ETH-USD",
+      market: eth,
       funding: { USD: "10000", ETH: "2" },
       intervalMs: 10,
       limits: loose,
@@ -263,7 +271,7 @@ describe("marketMaker", () => {
     const agent = await runner.start({
       name: "maker",
       email,
-      market: "BTC-USD",
+      market: btc,
       funding: { USD: "10000", BTC: "1" },
       intervalMs: 600_000,
       limits: loose,

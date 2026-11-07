@@ -1,15 +1,15 @@
 import { eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Exchange, MarketBusyError, SerialQueue } from "./exchange.ts";
 import { balancesOf, deposit, openAccount } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market } from "./orders.ts";
+import type { Market } from "./orders.ts";
 import { orders, trades, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
-const { pool, db, uniqueEmail } = useTestServer();
+const { pool, db, uniqueEmail, testMarket } = useTestServer();
 
 // Every amount in these tests is written as the decimal a client would send.
 const units = (value: string, scale = 8): bigint => {
@@ -39,13 +39,9 @@ async function balanceOf(userId: string, asset: string) {
 let btcUsd: Market;
 let ethUsd: Market;
 
-beforeAll(async () => {
-  const [btc, eth] = await Promise.all([loadMarket(db, "BTC-USD"), loadMarket(db, "ETH-USD")]);
-  if (btc === undefined || eth === undefined) {
-    throw new Error("BTC-USD and ETH-USD must be seeded");
-  }
-  btcUsd = btc;
-  ethUsd = eth;
+// Fresh markets for every test, so each test's exchange starts from empty books.
+beforeEach(async () => {
+  [btcUsd, ethUsd] = await Promise.all([testMarket("BTC-USD"), testMarket("ETH-USD")]);
 });
 
 describe("SerialQueue", () => {

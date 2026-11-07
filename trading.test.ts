@@ -1,5 +1,5 @@
 import { createClient } from "redis";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { Exchange } from "./exchange.ts";
 import { release } from "./ledger.ts";
@@ -7,7 +7,27 @@ import { buildServer } from "./server.ts";
 import { createRedisClient } from "./redis.ts";
 import { redisProxy, useTestServer } from "./testing.ts";
 
-const { pool, redis, subscriber, db, tokens, app: sharedApp, uniqueEmail } = useTestServer();
+const {
+  pool,
+  redis,
+  subscriber,
+  db,
+  tokens,
+  app: sharedApp,
+  uniqueEmail,
+  testMarket,
+} = useTestServer();
+
+// Fresh markets for every test, so each exchange here writes markets no other one touches and
+// every test starts from empty books.
+let btc: string;
+let eth: string;
+beforeEach(async () => {
+  [btc, eth] = await Promise.all([
+    testMarket("BTC-USD").then((market) => market.symbol),
+    testMarket("ETH-USD").then((market) => market.symbol),
+  ]);
+});
 
 // Each helper takes the server to talk to. Most tests share the file's server; a scenario that
 // needs an empty book builds its own around a fresh Exchange.
@@ -56,7 +76,16 @@ function postOrder(
   });
 }
 
-const aBuy = { market: "BTC-USD", side: "buy", type: "limit", price: "60000", quantity: "0.1" };
+// The market is read when the order is spread into a request, inside the test.
+const aBuy = {
+  get market() {
+    return btc;
+  },
+  side: "buy",
+  type: "limit",
+  price: "60000",
+  quantity: "0.1",
+};
 
 describe("POST /orders", () => {
   it("places a limit order and returns it at the market's scales", async () => {
@@ -68,7 +97,7 @@ describe("POST /orders", () => {
     expect(response.statusCode).toBe(201);
     expect(response.json<unknown>()).toEqual({
       id: expect.stringMatching(/^[0-9a-f-]{36}$/) as unknown,
-      market: "BTC-USD",
+      market: btc,
       side: "buy",
       type: "limit",
       price: "60000.00000000",
@@ -183,7 +212,7 @@ describe("POST /orders with a client order id", () => {
     expect(repeat.statusCode).toBe(200);
     expect(repeat.json<unknown>()).toEqual({
       id: first.json<{ id: string }>().id,
-      market: "BTC-USD",
+      market: btc,
       side: "buy",
       type: "limit",
       price: "100.00000000",
@@ -343,7 +372,7 @@ describe("GET /orders and GET /fills", () => {
   async function place(authorization: string, side: string, price: string, quantity: string) {
     const response = await postOrder(
       authorization,
-      { market: "BTC-USD", side, type: "limit", price, quantity },
+      { market: btc, side, type: "limit", price, quantity },
       app,
     );
     return response.json<{ id: string }>().id;
@@ -378,12 +407,12 @@ describe("GET /orders and GET /fills", () => {
     expect(ids(await get(alice, "/orders?status=closed"))).toEqual([cancelled, taken]);
     expect(ids(await get(alice, "/orders"))).toEqual([cancelled, resting, taken]);
     expect(ids(await get(alice, "/orders?limit=1"))).toEqual([cancelled]);
-    expect(ids(await get(alice, "/orders?market=ETH-USD"))).toEqual([]);
+    expect(ids(await get(alice, `/orders?market=${eth}`))).toEqual([]);
 
     const [open] = (await get(alice, "/orders?status=open")).json<{ orders: unknown[] }>().orders;
     expect(open).toEqual({
       id: resting,
-      market: "BTC-USD",
+      market: btc,
       side: "buy",
       type: "limit",
       price: "50000.00000000",
@@ -399,7 +428,7 @@ describe("GET /orders and GET /fills", () => {
   it("lists each user's side of their trades as maker or taker", async () => {
     const { alice, bob, ask, taken } = await scenario();
 
-    const fill = { market: "BTC-USD", price: "60000.00000000", quantity: "0.05000000" };
+    const fill = { market: btc, price: "60000.00000000", quantity: "0.05000000" };
     expect((await get(alice, "/fills")).json<unknown>()).toEqual({
       fills: [
         {
@@ -452,7 +481,7 @@ describe("POST /orders with a market order", () => {
 
     const response = await postOrder(
       buyer,
-      { market: "BTC-USD", side: "buy", type: "market", quantity: "0.1" },
+      { market: btc, side: "buy", type: "market", quantity: "0.1" },
       app,
     );
 
@@ -471,7 +500,7 @@ describe("POST /orders with a market order", () => {
 
     const response = await postOrder(
       buyer,
-      { market: "ETH-USD", side: "buy", type: "market", quantity: "1" },
+      { market: eth, side: "buy", type: "market", quantity: "1" },
       app,
     );
 
@@ -509,7 +538,7 @@ describe("two users trading through the API", () => {
   async function place(authorization: string, side: string, price: string, quantity: string) {
     const response = await postOrder(
       authorization,
-      { market: "BTC-USD", side, type: "limit", price, quantity },
+      { market: btc, side, type: "limit", price, quantity },
       app,
     );
     expect(response.statusCode).toBe(201);
@@ -596,7 +625,7 @@ describe("POST /orders rate limit", () => {
     await Promise.all([limited.close(), withoutRedis.close()]);
   });
 
-  const cheapBuy = { ...aBuy, price: "100", quantity: "0.01" };
+  const cheapBuy = () => ({ ...aBuy, price: "100", quantity: "0.01" });
 
   it("refuses a user's orders past the limit with 429 and when to retry", async () => {
     const authorization = await signedInUser(limited);
@@ -604,9 +633,9 @@ describe("POST /orders rate limit", () => {
 
     const statuses = [];
     for (let attempt = 0; attempt < 3; attempt++) {
-      statuses.push((await postOrder(authorization, cheapBuy, limited)).statusCode);
+      statuses.push((await postOrder(authorization, cheapBuy(), limited)).statusCode);
     }
-    const refused = await postOrder(authorization, cheapBuy, limited);
+    const refused = await postOrder(authorization, cheapBuy(), limited);
 
     expect(statuses).toEqual([201, 201, 429]);
     expect(refused.statusCode).toBe(429);
@@ -627,16 +656,16 @@ describe("POST /orders rate limit", () => {
     await postOrder(noisy, { side: "short" }, limited);
     await postOrder(noisy, { side: "short" }, limited);
 
-    await expect(postOrder(noisy, cheapBuy, limited)).resolves.toMatchObject({ statusCode: 429 });
-    await expect(postOrder(quiet, cheapBuy, limited)).resolves.toMatchObject({ statusCode: 201 });
+    await expect(postOrder(noisy, cheapBuy(), limited)).resolves.toMatchObject({ statusCode: 429 });
+    await expect(postOrder(quiet, cheapBuy(), limited)).resolves.toMatchObject({ statusCode: 201 });
   });
 
   it("lets orders through when Redis cannot be reached", async () => {
     const authorization = await signedInUser(withoutRedis);
     await fund(authorization, "USD", "100", withoutRedis);
 
-    const first = await postOrder(authorization, cheapBuy, withoutRedis);
-    const second = await postOrder(authorization, cheapBuy, withoutRedis);
+    const first = await postOrder(authorization, cheapBuy(), withoutRedis);
+    const second = await postOrder(authorization, cheapBuy(), withoutRedis);
 
     expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
   });
@@ -655,7 +684,7 @@ describe("POST /orders rate limit", () => {
       await fund(authorization, "USD", "100", slow);
       proxy.pause();
 
-      const response = await postOrder(authorization, cheapBuy, slow);
+      const response = await postOrder(authorization, cheapBuy(), slow);
 
       expect(response.statusCode).toBe(201);
     } finally {
@@ -711,20 +740,20 @@ describe("a market whose settlement fails", () => {
     await fund(seller, "BTC", "1", app);
     await fund(buyer, "USD", "100000", app);
     await fund(buyer, "ETH", "1", app);
-    const ask = await postOrder(seller, order("BTC-USD", "sell", "60000", "0.1"), app);
+    const ask = await postOrder(seller, order(btc, "sell", "60000", "0.1"), app);
     expect(ask.statusCode).toBe(201);
 
     // Behind the exchange's back, hand the seller's reserved BTC back to them. The engine still
     // holds the ask, so the next fill's ledger posting will find nothing to debit.
     await release(db, await userIdOf(seller), "BTC", 10_000_000n);
 
-    const failed = await postOrder(buyer, order("BTC-USD", "buy", "60000", "0.1"), app);
+    const failed = await postOrder(buyer, order(btc, "buy", "60000", "0.1"), app);
 
     expect(failed.statusCode).toBe(503);
     expect(failed.json<unknown>()).toMatchObject({ error: "market_halted" });
-    expect(halts).toEqual(["BTC-USD"]);
+    expect(halts).toEqual([btc]);
     expect(causes).toEqual([expect.objectContaining({ code: "insufficient_funds" })]);
-    expect(exchange.isHalted("BTC-USD")).toBe(true);
+    expect(exchange.isHalted(btc)).toBe(true);
 
     // Nothing of the failed settlement was written: the buy is pending with its 6,000 still
     // reserved, no trade exists, and every asset's entries still sum to zero.
@@ -754,7 +783,7 @@ describe("a market whose settlement fails", () => {
     }
 
     // The halted market refuses the next order before reserving anything, and cancels too.
-    const refused = await postOrder(buyer, order("BTC-USD", "buy", "50000", "0.1"), app);
+    const refused = await postOrder(buyer, order(btc, "buy", "50000", "0.1"), app);
     expect(refused.statusCode).toBe(503);
     expect(refused.json<unknown>()).toMatchObject({ error: "market_halted" });
     await expect(balances(buyer)).resolves.toMatchObject({
@@ -768,10 +797,10 @@ describe("a market whose settlement fails", () => {
     expect(cancel.statusCode).toBe(503);
 
     // The other market never stopped.
-    const eth = await postOrder(buyer, order("ETH-USD", "sell", "3000", "0.5"), app);
-    expect(eth.statusCode).toBe(201);
-    expect(exchange.isHalted("ETH-USD")).toBe(false);
-    expect(halts).toEqual(["BTC-USD"]);
+    const other = await postOrder(buyer, order(eth, "sell", "3000", "0.5"), app);
+    expect(other.statusCode).toBe(201);
+    expect(exchange.isHalted(eth)).toBe(false);
+    expect(halts).toEqual([btc]);
   });
 });
 

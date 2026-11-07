@@ -4,7 +4,6 @@ import type { WebSocket } from "ws";
 import { Exchange } from "./exchange.ts";
 import { deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
-import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
 import { buildServer, type ServerOptions } from "./server.ts";
 import { createRedisClient } from "./redis.ts";
@@ -12,7 +11,7 @@ import { redisProxy, TEST_SECRET, uniqueMarketDataPrefix, useTestServer } from "
 import { createAccessTokens } from "./tokens.ts";
 import { decode, TOKEN_EXPIRED_CLOSE_CODE } from "./ws.ts";
 
-const { app, pool, redis, subscriber, db, tokens, uniqueEmail } = useTestServer();
+const { app, pool, redis, subscriber, db, tokens, uniqueEmail, testMarket } = useTestServer();
 
 const units = (value: string): bigint => {
   const parsed = parseAmount(value, 8);
@@ -49,13 +48,9 @@ function freshServer(options: ServerOptions = {}) {
   return { exchange, server };
 }
 
-async function btcUsd(): Promise<Market> {
-  const market = await loadMarket(db, "BTC-USD");
-  if (market === undefined) {
-    throw new Error("BTC-USD is not seeded");
-  }
-  return market;
-}
+// A new BTC/USD market for each test that trades, so its sequences start at 1 and only that
+// test's exchange writes them.
+const btcUsd = () => testMarket("BTC-USD");
 
 const limit = (userId: string, side: "buy" | "sell", price: string, quantity: string) => ({
   type: "limit" as const,
@@ -214,12 +209,12 @@ describe("the book channel", () => {
     const seller = await funded({ BTC: "1" });
     const buyer = await funded({ USD: "100000" });
     const client = await connect(server);
-    client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "book", market: market.symbol });
     await client.next();
 
     await expect(client.next()).resolves.toEqual({
       type: "book",
-      market: "BTC-USD",
+      market: market.symbol,
       sequence: 0,
       bids: [],
       asks: [],
@@ -228,7 +223,7 @@ describe("the book channel", () => {
     const ask = await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.1"));
     await expect(client.next()).resolves.toEqual({
       type: "book_update",
-      market: "BTC-USD",
+      market: market.symbol,
       firstSequence: 1,
       sequence: 1,
       changes: [{ side: "sell", price: "60000.00000000", quantity: "0.10000000" }],
@@ -256,11 +251,11 @@ describe("the book channel", () => {
 
     // A late subscriber's snapshot matches the book the deltas built.
     const late = await connect(server);
-    late.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    late.send({ op: "subscribe", channel: "book", market: market.symbol });
     await late.next();
     await expect(late.next()).resolves.toEqual({
       type: "book",
-      market: "BTC-USD",
+      market: market.symbol,
       sequence: 4,
       bids: [{ price: "60000.00000000", quantity: "0.04000000" }],
       asks: [],
@@ -278,14 +273,14 @@ describe("the book channel", () => {
     const market = await btcUsd();
     const seller = await funded({ BTC: "1" });
     const client = await connect(server);
-    client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "book", market: market.symbol });
     await client.next();
     await client.next();
-    client.send({ op: "unsubscribe", channel: "book", market: "BTC-USD" });
+    client.send({ op: "unsubscribe", channel: "book", market: market.symbol });
     await client.next();
 
     await exchange.placeOrder(market, limit(seller, "sell", "70000", "0.1"));
-    client.send({ op: "subscribe", channel: "trades", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "trades", market: market.symbol });
 
     // The next thing to arrive is the reply, not a delta for the order.
     await expect(client.next()).resolves.toMatchObject({ type: "subscribed", channel: "trades" });
@@ -301,7 +296,7 @@ describe("the trades channel", () => {
     const buyer = await funded({ USD: "100000" });
     const seller = await funded({ BTC: "1" });
     const client = await connect(server);
-    client.send({ op: "subscribe", channel: "trades", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "trades", market: market.symbol });
     await client.next();
 
     const bids = [
@@ -315,7 +310,7 @@ describe("the trades channel", () => {
     expect(trades).toEqual([
       {
         type: "trade",
-        market: "BTC-USD",
+        market: market.symbol,
         sequence: 3,
         price: "60100.00000000",
         quantity: "0.10000000",
@@ -340,11 +335,11 @@ describe("the candles channel", () => {
     const buyer = await funded({ USD: "100000" });
     const seller = await funded({ BTC: "1" });
     const client = await connect(server);
-    client.send({ op: "subscribe", channel: "candles", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "candles", market: market.symbol });
     await expect(client.next()).resolves.toEqual({
       type: "subscribed",
       channel: "candles",
-      market: "BTC-USD",
+      market: market.symbol,
     });
 
     // Resting orders trade nothing, so they send no candle.
@@ -361,7 +356,7 @@ describe("the candles channel", () => {
     // trade BTC-USD too, so the candle may hold trades before ours. What ours must do to it:
     expect(first).toMatchObject({
       type: "candle",
-      market: "BTC-USD",
+      market: market.symbol,
       start: expect.stringMatching(/:00\.000Z$/) as unknown,
       close: "60000.00000000",
     });
@@ -434,7 +429,7 @@ describe("the account channel", () => {
     });
     await expect(sellerSocket.next()).resolves.toEqual({
       type: "order",
-      market: "BTC-USD",
+      market: market.symbol,
       id: ask.id,
       clientOrderId: "ask-1",
       status: "open",
@@ -501,7 +496,7 @@ describe("fan-out through Redis", () => {
     client.send({ op: "subscribe", channel: "account" });
     await client.next();
     await client.next();
-    client.send({ op: "subscribe", channel: "trades", market: "BTC-USD" });
+    client.send({ op: "subscribe", channel: "trades", market: market.symbol });
     await client.next();
 
     const ask = await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.1"));
@@ -577,7 +572,7 @@ describe("a subscriber that falls behind", () => {
       await exchange.placeOrder(market, limit(seller, "sell", `${70000 + level}`, "0.01"));
     }
     const fast = await connect(server);
-    fast.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+    fast.send({ op: "subscribe", channel: "book", market: market.symbol });
     await fast.next();
     await fast.next();
     const slow = await connect(server);
@@ -587,7 +582,7 @@ describe("a subscriber that falls behind", () => {
     // pipe absorbs the first ~130 KB before the server's buffer grows, so it asks many times.
     slow.socket.pause();
     for (let request = 0; request < 400; request++) {
-      slow.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+      slow.send({ op: "subscribe", channel: "book", market: market.symbol });
     }
 
     await expect(slowClosed).resolves.toBe(1006);
@@ -666,11 +661,11 @@ describe("a client that misses a sequence", () => {
       const read = async () => {
         const message = await client.next();
         if (book.apply(message)) {
-          client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+          client.send({ op: "subscribe", channel: "book", market: market.symbol });
         }
         return message;
       };
-      client.send({ op: "subscribe", channel: "book", market: "BTC-USD" });
+      client.send({ op: "subscribe", channel: "book", market: market.symbol });
       await read();
       await read();
 
@@ -691,7 +686,7 @@ describe("a client that misses a sequence", () => {
       await expect(read()).resolves.toMatchObject({ type: "book", sequence: 3 });
 
       expect(book.gaps).toBe(1);
-      const rest = await server.inject({ method: "GET", url: "/markets/BTC-USD/book" });
+      const rest = await server.inject({ method: "GET", url: `/markets/${market.symbol}/book` });
       expect(book.asks()).toEqual(rest.json<{ asks: unknown[] }>().asks);
       expect(book.asks()).toHaveLength(3);
       client.close();

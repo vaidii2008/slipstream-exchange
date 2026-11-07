@@ -11,11 +11,19 @@ import {
 } from "./bots.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, uniqueEmail } = useTestServer();
+const { app, uniqueEmail, testMarket } = useTestServer();
 const PASSWORD = "bots-test-password";
 let baseUrl: string;
 
+// This file's own markets, which only its server's exchange trades.
+let btc: string;
+let eth: string;
+
 beforeAll(async () => {
+  [btc, eth] = await Promise.all([
+    testMarket("BTC-USD").then((market) => market.symbol),
+    testMarket("ETH-USD").then((market) => market.symbol),
+  ]);
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
   if (address === null || typeof address === "string") {
@@ -84,7 +92,7 @@ describe("AgentRunner", () => {
     const agent = await runner().start({
       name: "first",
       email,
-      market: "BTC-USD",
+      market: btc,
       funding: { USD: "1000", BTC: "0.5" },
       intervalMs: 20,
       limits: loose,
@@ -94,7 +102,7 @@ describe("AgentRunner", () => {
 
     expect(agent.status).toBe("running");
     expect(seen[0]?.market).toMatchObject({
-      symbol: "BTC-USD",
+      symbol: btc,
       baseAsset: "BTC",
       quoteAsset: "USD",
       baseScale: 8,
@@ -113,7 +121,7 @@ describe("AgentRunner", () => {
     const spec = {
       name: "restarted",
       email,
-      market: "ETH-USD",
+      market: eth,
       funding: { USD: "500" },
       intervalMs: 1000,
       limits: loose,
@@ -137,7 +145,7 @@ describe("AgentRunner", () => {
     const agent = await runner().start({
       name: "stopping",
       email,
-      market: "BTC-USD",
+      market: btc,
       funding: { USD: "1000" },
       intervalMs: 20,
       limits: loose,
@@ -162,7 +170,7 @@ describe("AgentRunner", () => {
     const agent = await runner().start({
       name: "flaky",
       email: uniqueEmail("bots-test"),
-      market: "BTC-USD",
+      market: btc,
       funding: {},
       intervalMs: 10,
       limits: loose,
@@ -185,13 +193,13 @@ describe("AgentRunner", () => {
       runner().start({
         name: "wrong-asset",
         email: uniqueEmail("bots-test"),
-        market: "BTC-USD",
+        market: btc,
         funding: { ETH: "1" },
         intervalMs: 1000,
         limits: loose,
         strategy: { tick: async () => {} },
       }),
-    ).rejects.toThrow("funding ETH is not traded in BTC-USD");
+    ).rejects.toThrow(`funding ETH is not traded in ${btc}`);
   });
 });
 
@@ -253,7 +261,7 @@ describe("risk limits", () => {
     runner().start({
       name: "risky",
       email: uniqueEmail("bots-test"),
-      market: "BTC-USD",
+      market: btc,
       funding: { USD: "10000", BTC: "0.1" },
       intervalMs: 600_000,
       strategy: idle,

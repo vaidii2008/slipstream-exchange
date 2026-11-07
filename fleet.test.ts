@@ -3,7 +3,7 @@ import { AgentRunner, ApiClient, type Logger } from "./bots.ts";
 import { defaultFleet, NOISE_TRADERS_PER_MARKET } from "./fleet.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, uniqueEmail } = useTestServer();
+const { app, uniqueEmail, testMarket } = useTestServer();
 const PASSWORD = "fleet-test-password";
 let baseUrl: string;
 
@@ -46,14 +46,16 @@ describe("defaultFleet", () => {
     const { events, runner: fleetRunner } = runner();
     started.push(fleetRunner);
     const emails = new Map<string, string>();
-    // Equity is marked at the last trade, and other test files trade BTC-USD at other prices
-    // in the same table while this runs, which moves a 2 BTC maker's equity by thousands of
-    // dollars and trips its loss limit. The loss limit has its own tests in bots.test.ts.
+    // The fleet as it ships, limits included, on test markets with the same grids.
+    const markets = new Map<string, string>();
+    for (const template of ["BTC-USD", "ETH-USD"] as const) {
+      markets.set(template, (await testMarket(template)).symbol);
+    }
     const fleet = defaultFleet((name) => {
       const email = uniqueEmail(`fleet-test-${name}`);
       emails.set(name, email);
       return email;
-    }).map((spec) => ({ ...spec, limits: { ...spec.limits, maxLoss: 10n ** 18n } }));
+    }).map((spec) => ({ ...spec, market: markets.get(spec.market) ?? spec.market }));
     for (const spec of fleet) {
       await fleetRunner.start(spec);
     }

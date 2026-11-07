@@ -6,6 +6,7 @@ import { Pool } from "pg";
 import { createClient } from "redis";
 import { afterAll, beforeAll } from "vitest";
 import { Exchange } from "./exchange.ts";
+import { loadMarket, type Market } from "./orders.ts";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
 import { testDatabaseUrl } from "./testdb.ts";
@@ -59,6 +60,37 @@ async function deleteTradingHistory(pool: Pool, emails: string[]): Promise<void>
   }
 }
 
+// A market of the test's own, with the template's assets, tick, step and minimum: a symbol
+// like BTC-USD-1a2b3c4d. A market's sequence numbers have one writer, its exchange, so every
+// Exchange a test creates trades markets nobody else touches, even with test files running
+// in parallel on one database. It also starts with an empty book, as each test expects.
+export async function createTestMarket(
+  pool: Pool,
+  template: "BTC-USD" | "ETH-USD",
+): Promise<Market> {
+  const symbol = `${template}-${randomUUID().slice(0, 8)}`;
+  const db = drizzle({ client: pool });
+  await pool.query(
+    `insert into markets (symbol, base_asset, quote_asset, tick_size, quantity_step, min_quantity)
+     select $1, base_asset, quote_asset, tick_size, quantity_step, min_quantity
+     from markets where symbol = $2`,
+    [symbol, template],
+  );
+  const market = await loadMarket(db, symbol);
+  if (market === undefined) {
+    throw new Error(`${template} must be seeded to copy a test market from it`);
+  }
+  return market;
+}
+
+// Trades and orders on the test markets first, which also catches rows of users the file did
+// not create through uniqueEmail, then the markets themselves.
+async function deleteTestMarkets(pool: Pool, symbols: string[]): Promise<void> {
+  await pool.query("delete from trades where market = any($1)", [symbols]);
+  await pool.query("delete from orders where market = any($1)", [symbols]);
+  await pool.query("delete from markets where symbol = any($1)", [symbols]);
+}
+
 // Test files share one Redis. A server that streams market data gets its own channel prefix,
 // so it never hears another file's trades.
 export function uniqueMarketDataPrefix(): string {
@@ -88,6 +120,13 @@ export function useTestServer() {
   );
 
   const createdEmails: string[] = [];
+  const createdMarkets: string[] = [];
+
+  async function testMarket(template: "BTC-USD" | "ETH-USD"): Promise<Market> {
+    const market = await createTestMarket(pool, template);
+    createdMarkets.push(market.symbol);
+    return market;
+  }
 
   function uniqueEmail(prefix: string): string {
     const email = `${prefix}-${randomUUID()}@slipstream.test`;
@@ -111,6 +150,9 @@ export function useTestServer() {
       await deleteTradingHistory(pool, createdEmails);
       await db.delete(users).where(inArray(users.email, createdEmails));
     }
+    if (createdMarkets.length > 0) {
+      await deleteTestMarkets(pool, createdMarkets);
+    }
     await app.close();
     await Promise.all([
       pool.end(),
@@ -119,7 +161,7 @@ export function useTestServer() {
     ]);
   });
 
-  return { pool, redis, subscriber, db, tokens, exchange, app, uniqueEmail };
+  return { pool, redis, subscriber, db, tokens, exchange, app, uniqueEmail, testMarket };
 }
 
 // A TCP proxy in front of the compose Redis. A test connects its own client through it and

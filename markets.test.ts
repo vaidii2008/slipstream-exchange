@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, notLike } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { fromNumeric } from "./money.ts";
@@ -11,7 +11,8 @@ const base = alias(assets, "base");
 const quote = alias(assets, "quote");
 
 // Reads the markets the migrations actually seeded, so a future migration that adds a market
-// or changes a scale is checked by the same rules.
+// or changes a scale is checked by the same rules. Test markets (BTC-USD-1a2b3c4d), which
+// other files create while this runs, are left out.
 async function listedMarkets() {
   return db
     .select({
@@ -25,6 +26,7 @@ async function listedMarkets() {
     .from(markets)
     .innerJoin(base, eq(base.code, markets.baseAsset))
     .innerJoin(quote, eq(quote.code, markets.quoteAsset))
+    .where(notLike(markets.symbol, "%-%-%"))
     .orderBy(markets.symbol);
 }
 
