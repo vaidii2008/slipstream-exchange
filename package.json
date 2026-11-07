@@ -17,7 +17,8 @@
     "bots": "node --env-file-if-exists=.env fleet.ts",
     "test": "vitest run",
     "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run check --prefix web",
-    "bench": "node engine.bench.ts"
+    "bench": "node engine.bench.ts",
+    "mcp": "node --env-file-if-exists=.env mcp.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -37,6 +38,7 @@
     "@fastify/cookie": "^11.1.3",
     "@fastify/cors": "^11.4.1",
     "@fastify/websocket": "^11.3.7",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@node-rs/argon2": "^2.2.1",
     "drizzle-orm": "^0.45.3",
     "fastify": "^5.12.7",

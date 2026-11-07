@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBotConfig, parseConfig } from "./config.ts";
+import { parseAgentConfig, parseBotConfig, parseConfig } from "./config.ts";
 
 const base = {
   DATABASE_URL: "postgres://slipstream:slipstream@127.0.0.1:5433/slipstream",
@@ -138,5 +138,33 @@ describe("parseBotConfig", () => {
     expect(() =>
       parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_API_URL: "ftp://localhost" }),
     ).toThrow(/must be an http\(s\):\/\/ URL/);
+  });
+});
+
+describe("parseAgentConfig", () => {
+  const agent = { AGENT_EMAIL: "agent@example.com", AGENT_PASSWORD: "agent-password" };
+
+  it("defaults the API URL and market and keeps only the agent variables", () => {
+    expect(parseAgentConfig({ ...base, ...agent })).toEqual({
+      AGENT_API_URL: "http://localhost:3000",
+      AGENT_EMAIL: "agent@example.com",
+      AGENT_PASSWORD: "agent-password",
+      AGENT_MARKET: "BTC-USD",
+    });
+  });
+
+  it("requires an email and a password of at least 8 characters", () => {
+    expect(() => parseAgentConfig({ AGENT_PASSWORD: "agent-password" })).toThrow(/AGENT_EMAIL/);
+    expect(() => parseAgentConfig({ ...agent, AGENT_EMAIL: "not-an-email" })).toThrow(
+      /must be an email address/,
+    );
+    expect(() => parseAgentConfig({ ...agent, AGENT_PASSWORD: "short" })).toThrow(
+      /must be at least 8 characters/,
+    );
+  });
+
+  it("accepts only a listed market", () => {
+    expect(parseAgentConfig({ ...agent, AGENT_MARKET: "ETH-USD" }).AGENT_MARKET).toBe("ETH-USD");
+    expect(() => parseAgentConfig({ ...agent, AGENT_MARKET: "DOGE-USD" })).toThrow(/AGENT_MARKET/);
   });
 });

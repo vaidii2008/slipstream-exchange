@@ -62,3 +62,27 @@ export function parseBotConfig(env: Record<string, string | undefined>): BotConf
   }
   return result.data;
 }
+
+// The MCP server is another client of the API, like the fleet, with one account of its own.
+const agentEnvSchema = z
+  .object({
+    AGENT_API_URL: z
+      .url({ protocol: /^https?$/, hostname: /.+/, error: "must be an http(s):// URL" })
+      .default("http://localhost:3000"),
+    // Registered the first time the server starts, signed in to after.
+    AGENT_EMAIL: z.email({ error: "must be an email address" }),
+    AGENT_PASSWORD: z.string().min(8, { error: "must be at least 8 characters" }).max(256),
+    // The one market the agent trades. Its risk limits are per market.
+    AGENT_MARKET: z.enum(["BTC-USD", "ETH-USD"]).default("BTC-USD"),
+  })
+  .readonly();
+
+export type AgentConfig = z.infer<typeof agentEnvSchema>;
+
+export function parseAgentConfig(env: Record<string, string | undefined>): AgentConfig {
+  const result = agentEnvSchema.safeParse(env);
+  if (!result.success) {
+    throw new Error(`Invalid agent configuration:\n${z.prettifyError(result.error)}`);
+  }
+  return result.data;
+}
