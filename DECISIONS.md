@@ -68,35 +68,46 @@ Each entry: the decision, the alternative, why, and where it lives.
 - **Where:** `parseAmount` in `money.ts`; the only other conversions, `fromNumeric` and
   `formatAmount`, live in the same file.
 
-### A balance is always summed from the entries
+### The entries are the truth; each account caches their sum
 
-- **Decision:** there is no balance column. `balancesOf` and the overdraft check both `SUM` an
-  account's ledger entries when they need the number.
-- **Alternative:** a cached balance column updated in the same transaction as each entry.
-- **Why:** with no second copy of the number, it cannot drift from the entries. The cost is a
-  sum over every entry on each read. That is fine at this size; if the benchmark later shows it
-  matters, a cached column comes as a proposal with numbers.
-- **Where:** `balancesOf` and `postTransaction` in `ledger.ts`.
+- **Decision:** `ledger_accounts.balance` holds the sum of the account's entries.
+  `postTransaction` moves it by the net of its entries in the same transaction, under the
+  account's row lock, and the overdraft check reads it instead of summing. The migration that
+  added it backfilled it from the entries. Balance reads (`balancesOf`, `accountState`) still sum
+  the entries. Until 7 November there was no column.
+- **Alternative:** no column, summing on every check (the original design); or periodic balance
+  checkpoints, which bound the sum but add a second table and a second rule for what a balance is.
+- **Why:** summing made every debit check scale with the account's history. Throughput fell from
+  250 to 123 commands/s over a 1M-command fill. With the cache, on a ledger of 3.6M entries,
+  saturated throughput rose from 179–212 to 269–300 commands/s (see Measurement). The risk of a
+  second copy is drift, so a test runs 8 users trading and cancelling in two markets at once,
+  then checks every account in the database, in one statement, for a cached balance that
+  differs from its entries. With releases skipping the update, it finds 16.
+- **Where:** `postTransaction` in `ledger.ts`; `0012_cache_account_balances.sql`; the "cached
+  balance" tests in `ledger.test.ts` and `exchange.test.ts`.
 
-### Lock only the user accounts a transaction debits, in id order, with FOR NO KEY UPDATE
+### Lock every account a transaction touches, in id order, with FOR NO KEY UPDATE
 
-- **Decision:** `postTransaction` takes `SELECT ... FOR NO KEY UPDATE` on each user account whose
-  net change is negative, sorted by id, then re-sums those accounts and refuses to overdraw them.
-- **Alternative:** lock every account in the transaction, lock in posting order, or use
-  `FOR UPDATE`.
-- **Why:** an account that only gains money cannot be overdrawn, and the system account may go
-  negative, so locking either would just queue writers: every deposit of an asset would wait on
-  one system row. Sorting by id means two transactions that debit the same accounts always
-  request the locks in the same order, so they queue instead of deadlocking. The lock strength
-  matters too. Inserting an entry makes Postgres take `FOR KEY SHARE` on the referenced account
-  for the foreign-key check, and `FOR UPDATE` blocks that. A reserve (locks available, inserts
-  into reserved) and a release (locks reserved, inserts into available) on the same user and
-  asset then wait on each other: 36 of 40 interleaved reserves and releases died with 40P01.
-  `FOR NO KEY UPDATE` does not block `FOR KEY SHARE` but still blocks itself, so two debits of one
-  account still queue. After the switch, 0 of 40 failed, and 50 parallel reservations of 10
-  against 100 still give exactly 10 successes. With the lock removed, 12 got through.
-- **Where:** the `debited` block in `postTransaction`, `ledger.ts`; tests under
-  `concurrent reservations` in `ledger.test.ts`.
+- **Decision:** `postTransaction` locks every account its postings name, debited or credited, the
+  system account included, with one `SELECT ... FOR NO KEY UPDATE` sorted by id. That statement
+  also returns the cached balances, and debits are checked against them. Until 7 November only
+  user accounts with a net debit were locked.
+- **Alternative:** lock only the debited accounts (the original rule), lock in posting order, or
+  use `FOR UPDATE`.
+- **Why:** updating the cached balance takes the row's lock anyway, on credited accounts too.
+  Taken one by one by the UPDATE, those locks would be taken in whatever order the rows were
+  listed. Taken up front by id, two transactions touching the same accounts always ask in the
+  same order and queue. Forty trades in opposite directions between two users, each touching
+  all four of their BTC accounts, finish with 0 failures. Locking in posting order instead gave
+  29 deadlocks (40P01) out of 40. The cost is that deposits of one asset now queue on its system
+  account's row. Deposits are rare next to orders. The lock strength still matters. Inserting an
+  entry takes `FOR KEY SHARE` on the referenced account for the foreign key, and `FOR UPDATE`
+  blocks that. Under the original debit-only rule, 36 of 40 interleaved reserves and releases
+  died with 40P01. `FOR NO KEY UPDATE` does not block it, and it is also the lock a plain UPDATE
+  takes, so the cache's own update never upgrades it. 50 parallel reservations of 10 against
+  100 still give exactly 10 successes.
+- **Where:** `lockAccounts` and `postTransaction` in `ledger.ts`; tests under `concurrent
+reservations` and `the cached balance` in `ledger.test.ts`.
 
 ### The ledger never cascades
 
@@ -218,11 +229,12 @@ meant to catch it.
   by the engine's 2 to 4 million commands per second. Session 11 measures how much.
 - **Where:** `SerialQueue` and `Exchange` in `exchange.ts`.
 
-### A settlement locks every account it debits up front, in id order
+### A settlement locks every account it touches up front, in id order
 
-- **Decision:** before posting any fill, `settle` collects every account the command debits
-  (sellers' base reserved, buyers' quote reserved, released remainders) and locks them all at
-  once with `lockAccounts`, sorted by id.
+- **Decision:** before posting any fill, `settle` collects every account the command touches
+  (both sides of every fill and every released remainder) and locks them all at once with
+  `lockAccounts`, sorted by id. Until the cached balance on 7 November it locked only the
+  accounts it debited.
 - **Alternative:** let each fill's `postTransaction` lock its own accounts as it goes.
 - **Why:** markets settle in parallel. A BTC-USD sell filling two buyers in one order and an
   ETH-USD sell filling the same buyers in the other order took the two USD reserved locks in
@@ -775,12 +787,43 @@ every reservation matching an open order.
   A reservation and a settlement each sum every entry of the accounts they debit, under the
   accounts' row locks. By then a user account had 2,047 entries on average and 3,902 at most,
   and summing three busy accounts took 39 to 58 ms with the load running.
-- **Proposal, not built:** a cached balance per ledger account, updated in the same transaction
-  as each entry under the lock that is already taken, with a check that it equals the sum of
-  the entries. That is a column the plan says to propose first, so it is a proposal here. The
-  rejected alternative is periodic balance checkpoints: they bound the sum, but add a second
-  table and a second rule for what a balance is.
+- **Built on 7 November:** a cached balance per ledger account, updated in the same
+  transaction as each entry under the account's lock. See the next entry for before and after.
 - **Where:** `postTransaction` in `ledger.ts`.
+
+### The cached balance, before and after, on a ledger of 3.6M entries
+
+- **Setup:** `slipstream_bench` with k6's 300 users registered and funded through the API, then
+  padded in SQL with 1,000 reserve and release pairs per user per asset: 3,601,804 entries,
+  about 2,000 on every user account, interleaved across accounts the way a real history is. The
+  first padding wrote each account's entries next to each other on disk, and a sum then read a
+  few pages. That understated the cost, so it was rebuilt. Interleaved, summing three accounts
+  took 60 ms cold. The padded database was kept as a template, and every run below started from
+  a fresh copy of it. The after runs first applied the new migration, whose backfill took
+  0.63–0.76 s including Node's start. Apple M4, Postgres and Redis in Docker Desktop, 7 Nov.
+- **Steady 200 orders/s across both markets for 3 minutes, one run each:**
+
+  | Build  | Placement p50 | p95    | p99    | Mean turn | Mean queue wait | Dropped |
+  | ------ | ------------- | ------ | ------ | --------- | --------------- | ------- |
+  | Before | 28.9 ms       | 571 ms | 1.23 s | 7.3 ms    | 90 ms           | 53      |
+  | After  | 7.5 ms        | 24 ms  | 57 ms  | 3.5 ms    | 1.7 ms          | 0       |
+
+- **Ramp to 600/s across both markets, two runs each,** settled commands a second from
+  Prometheus (30 s rate):
+
+  | Build  | Peak       | Median of the last 80 s, saturated | Mean turn  |
+  | ------ | ---------- | ---------------------------------- | ---------- |
+  | Before | 240–245 /s | 179–212 /s                         | 8.2–9.1 ms |
+  | After  | 325–360 /s | 269–300 /s                         | 5.1–5.6 ms |
+
+- **What it does not separate:** the change also merged the account lookup into the locking
+  statement, so a posting sends one statement fewer. These runs measure the two together. The
+  after numbers also beat Day 15's steady run on a nearly empty ledger (p50 12.8 ms, p99 711
+  ms), where summing was cheap. So something besides the cache accounts for part of the gain:
+  the dropped statement, or a difference between the runs.
+- **Where:** `postTransaction` in `ledger.ts`. The runs used `load/orders.js` with
+  `PROFILE=steady RATE=200 DURATION=3m` and with `PROFILE=ramp PEAK=600`, both with
+  `MARKETS=BTC-USD,ETH-USD`.
 
 ### Two processes on one database: refused, not prevented
 
