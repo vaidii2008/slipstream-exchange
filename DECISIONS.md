@@ -825,18 +825,40 @@ every reservation matching an open order.
   `PROFILE=steady RATE=200 DURATION=3m` and with `PROFILE=ramp PEAK=600`, both with
   `MARKETS=BTC-USD,ETH-USD`.
 
-### Two processes on one database: refused, not prevented
+### Two processes on one database: refused, then prevented
 
 - **Finding:** a restart during the measurements started the new API while the old one was
   still draining about 2,000 queued orders in its 10 s shutdown. Both wrote the same markets.
   Recovery in the new process found pending orders changing under it, and the log's unique
   (market, sequence) would have refused a second writer's command, so it halted both markets
   instead of trading on a book it could not trust. A clean restart opened them with the ledger
-  summing to zero.
-- **Gap:** nothing stops a second process starting. A Postgres advisory lock per market, taken
-  when the market opens and held for the process's life, would make the second process wait
-  or refuse to open it.
+  summing to zero. Nothing stopped the second process starting. The fix is the next entry.
 - **Where:** `#open` in `exchange.ts`.
+
+### One process per market, enforced by a Postgres advisory lock
+
+- **Decision:** before replaying a market, the exchange opens a connection of its own and takes
+  `pg_try_advisory_lock` on the market's name. If another process holds it, the market halts
+  instead of opening and the halt is logged at fatal with the reason. If that connection drops,
+  Postgres has released the lock, so the market halts. Shutdown releases the locks only after
+  in-flight requests, and the settlements they wait on, have finished.
+- **Alternative:** the blocking `pg_advisory_lock`, so a second process waits and takes over when
+  the first exits; a lock row in a table with a heartbeat; or the lock on a pooled connection.
+- **Why:** a session-level advisory lock lives exactly as long as its connection, so a crashed
+  process cannot leave a stale lock behind, which a lock row with a heartbeat would have to
+  expire. A pooled connection would carry the lock back into the pool, to be released or
+  reused by whatever query got it next. Refusing beats waiting: a process that waited would
+  replay a log the first is still appending to. Two real API processes on the bench database:
+  the second logged both markets halted with "open in another process", and once the first shut
+  down a new one opened both. The test terminates the lock's backend and sees the first
+  exchange halt and a third open the market on the book the first left.
+- **Gap:** halting stops new commands, but a settlement already in flight when the lock drops
+  still commits. If a new process opens the market first and settles the same command in
+  recovery, the unique (market, engine_sequence) on trades fails one of the two, which halts
+  rather than pays twice. Closing the gap needs every settlement to check that it still holds
+  the lock.
+- **Where:** `#lock` and `close` in `exchange.ts`; the "two exchanges on one database" tests in
+  `exchange.test.ts`.
 
 ### Interview note: Session 11, measuring it
 
