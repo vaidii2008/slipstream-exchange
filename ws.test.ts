@@ -371,7 +371,9 @@ describe("the candles channel", () => {
     if (second.start === first.start) {
       expect(second).toMatchObject({
         open: first.open,
-        high: "61000.00000000",
+        // The candle loaded at boot may already be higher, if the dev API traded above 61,000
+        // in this minute.
+        high: Number(first.high) > 61000 ? first.high : "61000.00000000",
         low: first.low,
         close: "61000.00000000",
         trades: (first.trades as number) + 1,
