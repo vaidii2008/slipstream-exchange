@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AgentRunner, ApiClient, type Logger, type RiskLimits, type MarketInfo } from "./bots.ts";
+import { AgentRunner, type Logger, type RiskLimits } from "./bots.ts";
+import { ApiClient, type MarketInfo } from "./client.ts";
 import {
   type MakerOptions,
   makerQuotes,

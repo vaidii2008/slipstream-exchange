@@ -1,14 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   AgentRunner,
-  ApiClient,
   type AgentContext,
   type AgentSpec,
   type Logger,
   type RiskLimits,
-  markFrom,
   type Strategy,
 } from "./bots.ts";
+import { ApiClient, markFrom } from "./client.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail, testMarket } = useTestServer();

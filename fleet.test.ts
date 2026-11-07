@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AgentRunner, ApiClient, type Logger } from "./bots.ts";
+import { AgentRunner, type Logger } from "./bots.ts";
+import { ApiClient } from "./client.ts";
 import { defaultFleet, NOISE_TRADERS_PER_MARKET } from "./fleet.ts";
 import { useTestServer } from "./testing.ts";
 

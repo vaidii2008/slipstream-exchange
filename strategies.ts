@@ -2,7 +2,8 @@
 // send, given prices and a random source), tested on its own, and a tick that reads the
 // market over the API, decides and sends.
 
-import type { MarketInfo, OrderRequest, Side, Strategy } from "./bots.ts";
+import type { Strategy } from "./bots.ts";
+import type { MarketInfo, OrderRequest, Side } from "./client.ts";
 
 // A whole number in [0, n).
 function below(random: () => number, n: number): number {
