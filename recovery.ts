@@ -139,7 +139,10 @@ async function checkBook(db: Database, market: Market, engine: Engine): Promise<
   const wrong = resting
     .filter((order) => expected.get(order.id) !== order.remaining)
     .map((order) => order.id);
-  const missing = [...expected.keys()].filter((id) => !resting.some((order) => order.id === id));
+  // A set, not a scan of `resting` per open order: that was open × resting comparisons, 2.8 s
+  // per market at boot with 31,000 orders resting.
+  const restingIds = new Set(resting.map((order) => order.id));
+  const missing = [...expected.keys()].filter((id) => !restingIds.has(id));
   if (wrong.length > 0 || missing.length > 0) {
     throw new Error(
       `rebuilt ${market.symbol} book disagrees with Postgres: resting but not open there ` +

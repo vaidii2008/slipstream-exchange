@@ -234,6 +234,27 @@ describe("recovery when a market opens", () => {
       }),
     ]);
   });
+  it("halts a market where Postgres has an open order the rebuilt book does not", async () => {
+    const market = await testMarket("BTC-USD");
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "100000" });
+    const exchange = new Exchange(db);
+    await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.1"));
+    const bid = await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1"));
+    // Behind the log's back, the database says the filled bid is still open.
+    await db.update(orders).set({ status: "open" }).where(eq(orders.id, bid.id));
+
+    const after = new Exchange(db);
+    const halts: unknown[] = [];
+    after.onHalt((_symbol, error) => halts.push(error));
+
+    await expect(after.open([market])).resolves.toMatchObject([{ halted: true }]);
+    expect(halts).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining(`open there but not resting [${bid.id}]`) as unknown,
+      }),
+    ]);
+  });
 });
 
 describe("a trade's engine sequence", () => {
