@@ -2,16 +2,22 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ApiClient, ApiError } from "./client.ts";
-import { type AgentSession, buildMcpServer, signInAgent } from "./mcp.ts";
+import { type AgentSession, buildMcpServer, defaultLimits, signInAgent } from "./mcp.ts";
+import type { RiskLimits } from "./risk.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail, testMarket } = useTestServer();
 const PASSWORD = "mcp-test-password";
 let baseUrl: string;
 let btc: string;
+// The trading tests' own market, so orders the read tests leave resting cannot fill theirs.
+let trading: string;
 
 beforeAll(async () => {
-  btc = (await testMarket("BTC-USD")).symbol;
+  [btc, trading] = await Promise.all([
+    testMarket("BTC-USD").then((market) => market.symbol),
+    testMarket("BTC-USD").then((market) => market.symbol),
+  ]);
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();
   if (address === null || typeof address === "string") {
@@ -222,5 +228,187 @@ describe("read tools", () => {
     const result = await call(client, "get_order_book", { depth: 21 });
     expect(result.isError).toBe(true);
     expect(result.text).toMatch(/expected number to be <=20 at depth/);
+  });
+});
+
+describe("trading tools", () => {
+  // Small enough to reach in a test: 0.01 BTC an order, 3 resting, 0.02 BTC of position.
+  const tight = (): RiskLimits => ({
+    maxOrderQuantity: 1000000n,
+    maxOpenOrders: 3,
+    maxPosition: 2000000n,
+    maxLoss: 1_000_00000000n,
+  });
+
+  // A funded agent with tight limits, and its MCP client.
+  async function trader() {
+    const email = uniqueEmail("mcp-test");
+    const funding = await signInAgent(baseUrl, email, PASSWORD, trading);
+    await funding.api.deposit("USD", 10_000_00000000n, 8);
+    await funding.api.deposit("BTC", 1_00000000n, 8);
+    const session = await signInAgent(baseUrl, email, PASSWORD, trading, tight);
+    return { session, client: await connect(session) };
+  }
+
+  const bid = (price: string, quantity = "0.001") => ({
+    side: "buy",
+    type: "limit",
+    price,
+    quantity,
+  });
+
+  it("marks place_order destructive and cancel_order idempotent", async () => {
+    const { client } = await trader();
+    const { tools } = await client.listTools();
+    const place = tools.find((tool) => tool.name === "place_order");
+    const cancel = tools.find((tool) => tool.name === "cancel_order");
+    expect(place?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(cancel?.annotations).toMatchObject({ readOnlyHint: false, idempotentHint: true });
+    // The limits are in the description, so the model can stay inside them.
+    expect(place?.description).toContain("at most 0.01000000 BTC");
+  });
+
+  it("rests a limit order, then cancels it once", async () => {
+    const { client } = await trader();
+
+    const placed = await call(client, "place_order", bid("60000"));
+    expect(placed).toMatchObject({
+      isError: false,
+      value: { status: "open", filled: "0.00000000" },
+    });
+    const { id } = placed.value as { id: string };
+    expect((await call(client, "get_open_orders")).value).toMatchObject({ orders: [{ id }] });
+
+    expect((await call(client, "cancel_order", { orderId: id })).value).toEqual({
+      cancelled: true,
+    });
+    expect((await call(client, "cancel_order", { orderId: id })).value).toEqual({
+      cancelled: false,
+    });
+    expect((await call(client, "get_open_orders")).value).toEqual({ orders: [] });
+  });
+
+  it("fills a market order against the book", async () => {
+    const { session, client } = await trader();
+    const other = await counterparty();
+    await other.place(session.market, {
+      type: "limit",
+      side: "sell",
+      price: 65_000_00000000n,
+      quantity: 500000n,
+    });
+
+    const result = await call(client, "place_order", {
+      side: "buy",
+      type: "market",
+      quantity: "0.005",
+    });
+    expect(result).toMatchObject({
+      isError: false,
+      value: { status: "filled", filled: "0.00500000" },
+    });
+  });
+
+  it("refuses a price that is missing, unneeded or malformed, worded as the API words it", async () => {
+    const { client } = await trader();
+
+    const missing = await call(client, "place_order", {
+      side: "buy",
+      type: "limit",
+      quantity: "0.001",
+    });
+    expect(missing).toMatchObject({ isError: true });
+    expect(missing.value).toEqual({
+      error: "invalid_request",
+      issues: [{ field: "price", message: "is required for a limit order" }],
+    });
+    const unneeded = await call(client, "place_order", {
+      side: "buy",
+      type: "market",
+      quantity: "0.001",
+      price: "60000",
+    });
+    expect(unneeded.value).toMatchObject({ issues: [{ field: "price" }] });
+    const decimals = await call(client, "place_order", bid("60000", "0.000000001"));
+    expect(decimals.value).toEqual({
+      error: "invalid_request",
+      issues: [{ field: "quantity", message: "has more decimals than the asset allows" }],
+    });
+    expect((await call(client, "get_open_orders")).value).toEqual({ orders: [] });
+  });
+
+  it("passes the API's own refusals through: off the tick, and not enough funds", async () => {
+    const { client } = await trader();
+
+    const offTick = await call(client, "place_order", bid("60000.005"));
+    expect(offTick.isError).toBe(true);
+    expect(offTick.text).toContain("400");
+    expect(offTick.text).toContain('"field":"price"');
+
+    // 0.01 BTC at 2,000,000 USD is 20,000 USD; the agent holds 10,000.
+    const tooDear = await call(client, "place_order", bid("2000000", "0.01"));
+    expect(tooDear.isError).toBe(true);
+    expect(tooDear.value).toMatchObject({ error: "insufficient_funds" });
+  });
+
+  it("refuses, without sending, an order past each risk limit", async () => {
+    const { client } = await trader();
+
+    const tooBig = await call(client, "place_order", bid("60000", "0.0101"));
+    expect(tooBig).toMatchObject({ isError: true, value: { error: "risk_max_order_quantity" } });
+    expect(tooBig.text).toContain("at most 0.01000000 BTC");
+
+    // Two 0.01 bids reach the 0.02 position limit; a third would pass it.
+    await call(client, "place_order", bid("60000", "0.01"));
+    await call(client, "place_order", bid("60001", "0.01"));
+    const tooLong = await call(client, "place_order", bid("60002", "0.0001"));
+    expect(tooLong).toMatchObject({ isError: true, value: { error: "risk_max_position" } });
+
+    // A sell takes the position back, so the third resting order is allowed and the fourth is not.
+    await call(client, "place_order", {
+      side: "sell",
+      type: "limit",
+      price: "90000",
+      quantity: "0.001",
+    });
+    const tooMany = await call(client, "place_order", {
+      side: "sell",
+      type: "limit",
+      price: "90001",
+      quantity: "0.001",
+    });
+    expect(tooMany).toMatchObject({ isError: true, value: { error: "risk_max_open_orders" } });
+    expect(tooMany.text).toContain("at most 3 orders may rest at once");
+    expect(
+      ((await call(client, "get_open_orders")).value as { orders: unknown[] }).orders,
+    ).toHaveLength(3);
+  });
+
+  it("cannot cancel an order that is not this account's", async () => {
+    const { session, client } = await trader();
+    const other = await counterparty();
+    const theirs = await other.place(session.market, {
+      type: "limit",
+      side: "buy",
+      price: 50_000_00000000n,
+      quantity: 10000n,
+    });
+    if (!theirs.ok) {
+      throw new Error(`their bid was refused: ${theirs.error}`);
+    }
+
+    const result = await call(client, "cancel_order", { orderId: theirs.id });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("404");
+    expect(await other.openOrders(session.market)).toHaveLength(1);
+  });
+
+  it("uses the default limits per base asset", () => {
+    expect(defaultLimits({ baseAsset: "BTC", baseScale: 8, quoteScale: 8 } as never)).toEqual({
+      maxOrderQuantity: 5000000n,
+      maxOpenOrders: 10,
+      maxPosition: 25000000n,
+      maxLoss: 5_000_00000000n,
+    });
   });
 });

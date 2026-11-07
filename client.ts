@@ -29,8 +29,8 @@ export type PlaceResult =
   | { ok: true; id: string; status: string; filled: bigint }
   // The API's own error code (insufficient_funds, rate_limited, market_busy, ...), so a
   // strategy can tell a refusal it should expect from a bug. Status 0 means the risk guard
-  // refused it and nothing was sent.
-  | { ok: false; status: number; error: string };
+  // refused it and nothing was sent. message is the API's explanation, when it sent one.
+  | { ok: false; status: number; error: string; message?: string };
 
 // One price level of the book: the total resting quantity at that price.
 export type BookLevel = { price: bigint; quantity: bigint };
@@ -74,7 +74,7 @@ const marketsReply = z.object({
   ),
 });
 const loginReply = z.object({ accessToken: z.string() });
-const errorReply = z.object({ error: z.string() });
+const errorReply = z.object({ error: z.string(), message: z.string().optional() });
 const balancesReply = z.object({
   balances: z.array(z.object({ asset: z.string(), available: z.string(), reserved: z.string() })),
 });
@@ -255,10 +255,15 @@ export class ApiClient {
       throw new ApiError("POST", "/orders", reply.status, reply.body);
     }
     const parsed = errorReply.safeParse(reply.body);
+    if (!parsed.success) {
+      return { ok: false, status: reply.status, error: "unknown" };
+    }
+    const { error, message } = parsed.data;
     return {
       ok: false,
       status: reply.status,
-      error: parsed.success ? parsed.data.error : "unknown",
+      error,
+      ...(message === undefined ? {} : { message }),
     };
   }
 

@@ -11,27 +11,63 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { ApiClient, type BookLevel, type MarketInfo } from "./client.ts";
+import { ApiClient, type BookLevel, type MarketInfo, type OrderRequest } from "./client.ts";
 import { parseAgentConfig } from "./config.ts";
-import { formatAmount } from "./money.ts";
+import { AMOUNT_MESSAGES, formatAmount, parseAmount } from "./money.ts";
+import { RiskGuard, type RiskLimits, type RiskRefusal } from "./risk.ts";
+
+// Per base asset, so they hold on a test's copy of a market too. An order is at most a few
+// thousand dollars, and the position a few times that: room to trade, not to move the book.
+const SIZE_LIMITS: Record<string, { maxOrderQuantity: string; maxPosition: string }> = {
+  BTC: { maxOrderQuantity: "0.05", maxPosition: "0.25" },
+  ETH: { maxOrderQuantity: "1", maxPosition: "5" },
+};
+
+export function defaultLimits(market: MarketInfo): RiskLimits {
+  const sizes = SIZE_LIMITS[market.baseAsset];
+  if (sizes === undefined) {
+    throw new Error(`no agent limits for ${market.baseAsset}`);
+  }
+  const amount = (decimal: string, scale: number) => {
+    const parsed = parseAmount(decimal, scale);
+    if (!parsed.ok) {
+      throw new Error(`bad agent limit ${decimal}: ${parsed.reason}`);
+    }
+    return parsed.units;
+  };
+  return {
+    maxOrderQuantity: amount(sizes.maxOrderQuantity, market.baseScale),
+    maxOpenOrders: 10,
+    maxPosition: amount(sizes.maxPosition, market.baseScale),
+    maxLoss: amount("5000", market.quoteScale),
+  };
+}
 
 export type AgentSession = {
   api: ApiClient;
   market: MarketInfo;
+  limits: RiskLimits;
+  // Every order the model places goes through it. Reads may use api directly.
+  guard: RiskGuard;
 };
 
 // Registers the agent's account the first time and signs in to it every time after, as a bot
-// does, then reads the market it trades.
+// does, then reads the market it trades. Position limits are measured from the base it holds
+// now, so they count from the start of this session, as a bot's count from its start.
 export async function signInAgent(
   baseUrl: string,
   email: string,
   password: string,
   symbol: string,
+  limitsFor: (market: MarketInfo) => RiskLimits = defaultLimits,
 ): Promise<AgentSession> {
   const api = new ApiClient(baseUrl, email, password);
   await api.signIn();
   const market = await api.market(symbol);
-  return { api, market };
+  const limits = limitsFor(market);
+  const held = (await api.balances()).get(market.baseAsset);
+  const inventory = held === undefined ? 0n : held.available + held.reserved;
+  return { api, market, limits, guard: new RiskGuard(api, market, limits, inventory) };
 }
 
 // Sent to the host once, at initialize. Hosts put it in the model's context, so it is the
@@ -53,11 +89,17 @@ function json(value: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 
+// isError tells the model the call did nothing. The text says why, in the API's own words
+// where the API is the one refusing.
+function failure(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
 // Read tools change nothing, so a host may call them without asking the user first.
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false } as const;
 
 export function buildMcpServer(session: AgentSession): McpServer {
-  const { api, market } = session;
+  const { api, market, limits, guard } = session;
   const price = (units: bigint) => formatAmount(units, market.quoteScale);
   const quantity = (units: bigint) => formatAmount(units, market.baseScale);
   const level = (entry: BookLevel) => ({
@@ -182,7 +224,131 @@ export function buildMcpServer(session: AgentSession): McpServer {
     },
   );
 
+  const refusals: Record<RiskRefusal, string> = {
+    max_order_quantity: `one order may ask for at most ${quantity(limits.maxOrderQuantity)} ${market.baseAsset}`,
+    max_open_orders: `at most ${limits.maxOpenOrders} orders may rest at once; cancel one first`,
+    max_position:
+      `the ${market.baseAsset} position, counting every resting order as filled, may move at most ` +
+      `${quantity(limits.maxPosition)} from where this session started`,
+    killed: "trading is halted",
+  };
+
+  // Parsed here, not only by the API, because the risk checks need the amounts as numbers
+  // before anything is sent. A bad one is worded exactly as the API would word it.
+  const amount = (field: "price" | "quantity", value: string, scale: number) => {
+    const parsed = parseAmount(value, scale);
+    return parsed.ok
+      ? parsed
+      : {
+          ok: false as const,
+          error: JSON.stringify(fieldError(field, AMOUNT_MESSAGES[parsed.reason])),
+        };
+  };
+
+  server.registerTool(
+    "place_order",
+    {
+      title: "Place order",
+      description:
+        "Send a buy or sell order. A limit order needs a price and rests in the book until it fills or " +
+        "is cancelled; a market order has no price and fills at once against the best resting orders. " +
+        "Orders that would break a risk limit are refused before they reach the exchange. Limits: " +
+        `${refusals.max_order_quantity}; ${refusals.max_open_orders}; ${refusals.max_position}.`,
+      inputSchema: {
+        side: z.enum(["buy", "sell"]),
+        type: z.enum(["limit", "market"]),
+        quantity: z.string().max(64).describe(`In ${market.baseAsset}, as a decimal string.`),
+        price: z
+          .string()
+          .max(64)
+          .optional()
+          .describe(
+            `In ${market.quoteAsset}, as a decimal string. Required for limit, absent for market.`,
+          ),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input) => {
+      if (input.type === "limit" && input.price === undefined) {
+        return failure(JSON.stringify(fieldError("price", "is required for a limit order")));
+      }
+      if (input.type === "market" && input.price !== undefined) {
+        return failure(JSON.stringify(fieldError("price", "must be absent for a market order")));
+      }
+      const parsedQuantity = amount("quantity", input.quantity, market.baseScale);
+      if (!parsedQuantity.ok) {
+        return failure(parsedQuantity.error);
+      }
+      let order: OrderRequest;
+      if (input.price === undefined) {
+        order = { type: "market", side: input.side, quantity: parsedQuantity.units };
+      } else {
+        const parsedPrice = amount("price", input.price, market.quoteScale);
+        if (!parsedPrice.ok) {
+          return failure(parsedPrice.error);
+        }
+        order = {
+          type: "limit",
+          side: input.side,
+          price: parsedPrice.units,
+          quantity: parsedQuantity.units,
+        };
+      }
+
+      // An order off the grid comes back from the API as a 400, which the client throws as an
+      // ApiError carrying the API's body; the SDK turns that into an error result.
+      const result = await guard.place(market, order);
+      if (result.ok) {
+        return json({ id: result.id, status: result.status, filled: quantity(result.filled) });
+      }
+      if (result.status === 0) {
+        const reason = Object.entries(refusals).find(([code]) => result.error === `risk_${code}`);
+        return failure(
+          JSON.stringify({
+            error: result.error,
+            message: `refused by the risk limits: ${reason?.[1] ?? result.error}`,
+          }),
+        );
+      }
+      return failure(
+        JSON.stringify({
+          error: result.error,
+          ...(result.message === undefined ? {} : { message: result.message }),
+        }),
+      );
+    },
+  );
+
+  server.registerTool(
+    "cancel_order",
+    {
+      title: "Cancel order",
+      description:
+        "Cancel one of this account's resting orders by the id get_open_orders or place_order gave. " +
+        "cancelled is false if it had already filled or been cancelled.",
+      inputSchema: { orderId: z.uuid() },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ orderId }) => json({ cancelled: await guard.cancel(orderId) }),
+  );
+
   return server;
+}
+
+// The API's shape for a field it refused, so the model sees one error format whichever side
+// caught the mistake.
+function fieldError(field: string, message: string) {
+  return { error: "invalid_request", issues: [{ field, message }] };
 }
 
 async function serve(): Promise<void> {
