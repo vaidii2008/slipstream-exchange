@@ -14,6 +14,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "start": "node --env-file-if-exists=.env main.ts",
+    "bots": "node --env-file-if-exists=.env fleet.ts",
     "test": "vitest run",
     "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run check --prefix web",
     "bench": "node engine.bench.ts"

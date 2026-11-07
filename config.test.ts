@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseConfig } from "./config.ts";
+import { parseBotConfig, parseConfig } from "./config.ts";
 
 const base = {
   DATABASE_URL: "postgres://slipstream:slipstream@127.0.0.1:5433/slipstream",
@@ -116,5 +116,27 @@ describe("parseConfig", () => {
 
   it("freezes the parsed config", () => {
     expect(Object.isFrozen(parseConfig(base))).toBe(true);
+  });
+});
+
+describe("parseBotConfig", () => {
+  it("defaults the API URL and keeps only the bot variables", () => {
+    expect(parseBotConfig({ ...base, BOT_PASSWORD: "bot-password" })).toEqual({
+      BOT_API_URL: "http://localhost:3000",
+      BOT_PASSWORD: "bot-password",
+    });
+  });
+
+  it("requires a password of at least 8 characters", () => {
+    expect(() => parseBotConfig({})).toThrow(/BOT_PASSWORD/);
+    expect(() => parseBotConfig({ BOT_PASSWORD: "short" })).toThrow(
+      /must be at least 8 characters/,
+    );
+  });
+
+  it("rejects an API URL that is not http(s)", () => {
+    expect(() =>
+      parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_API_URL: "ftp://localhost" }),
+    ).toThrow(/must be an http\(s\):\/\/ URL/);
   });
 });

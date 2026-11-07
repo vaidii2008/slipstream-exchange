@@ -40,3 +40,25 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
   }
   return result.data;
 }
+
+// The bot fleet is a separate process and a client of the API, so it needs none of the API's
+// own secrets, only where the API is and the password its agents' accounts use.
+const botEnvSchema = z
+  .object({
+    BOT_API_URL: z
+      .url({ protocol: /^https?$/, hostname: /.+/, error: "must be an http(s):// URL" })
+      .default("http://localhost:3000"),
+    // Every agent account is registered with it the first time and signs in with it after.
+    BOT_PASSWORD: z.string().min(8, { error: "must be at least 8 characters" }).max(256),
+  })
+  .readonly();
+
+export type BotConfig = z.infer<typeof botEnvSchema>;
+
+export function parseBotConfig(env: Record<string, string | undefined>): BotConfig {
+  const result = botEnvSchema.safeParse(env);
+  if (!result.success) {
+    throw new Error(`Invalid bot configuration:\n${z.prettifyError(result.error)}`);
+  }
+  return result.data;
+}
