@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { createServer, connect, type Socket } from "node:net";
 import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -9,6 +8,7 @@ import { afterAll, beforeAll } from "vitest";
 import { Exchange } from "./exchange.ts";
 import { users } from "./schema.ts";
 import { buildServer } from "./server.ts";
+import { testDatabaseUrl } from "./testdb.ts";
 import { createAccessTokens } from "./tokens.ts";
 
 export const TEST_SECRET = "t".repeat(32);
@@ -68,14 +68,8 @@ export function uniqueMarketDataPrefix(): string {
 // Each test file calls this once at the top level. Vitest gives every file its own module
 // graph, so each file gets its own pool and app, and the hooks attach to that file.
 export function useTestServer() {
-  if (existsSync(".env")) {
-    process.loadEnvFile(".env");
-  }
-
-  const databaseUrl = process.env.DATABASE_URL;
-  if (databaseUrl === undefined) {
-    throw new Error("DATABASE_URL is not set: these tests talk to a real postgres");
-  }
+  // slipstream_test, never the dev database. Vitest's global setup has created and migrated it.
+  const databaseUrl = testDatabaseUrl();
   const redisUrl = process.env.REDIS_URL;
   if (redisUrl === undefined) {
     throw new Error("REDIS_URL is not set: these tests talk to a real redis");
