@@ -10,7 +10,8 @@
 // of a fixed mid, so about half the orders cross the book and trade, and the cancels keep
 // the book from growing without bound over a long run.
 //
-// Environment: PROFILE (ramp or steady), RATE and DURATION (steady only), USERS, MARKETS
+// Environment: PROFILE (ramp or steady), PEAK (ramp only), RATE and DURATION (steady only),
+// USERS, MARKETS
 // (comma-separated), API_URL.
 
 import { check } from "k6";
@@ -33,22 +34,18 @@ const GRID = {
 };
 
 const PROFILES = {
-  // Rising until the server cannot keep up: the rate where latency climbs and iterations are
-  // dropped is the ceiling.
+  // Rising in ten even steps to PEAK orders a second, 20 s each, until the server cannot keep
+  // up: the rate where latency climbs and iterations are dropped is the ceiling.
   ramp: {
     executor: "ramping-arrival-rate",
-    startRate: 100,
+    startRate: 0,
     timeUnit: "1s",
     preAllocatedVUs: 200,
     maxVUs: 2000,
-    stages: [
-      { target: 500, duration: "30s" },
-      { target: 1000, duration: "30s" },
-      { target: 1500, duration: "30s" },
-      { target: 2000, duration: "30s" },
-      { target: 3000, duration: "30s" },
-      { target: 4000, duration: "30s" },
-    ],
+    stages: Array.from({ length: 10 }, (_, step) => ({
+      target: Math.round((Number(__ENV.PEAK || 600) * (step + 1)) / 10),
+      duration: "20s",
+    })),
   },
   // A fixed rate held for a while, to read latency at a load the server can sustain.
   steady: {
