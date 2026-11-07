@@ -500,8 +500,8 @@ reports.
 - **Alternative:** a `candles` table updated in the settlement transaction.
 - **Why:** a second copy of every trade has to be kept in step and migrated. No new table
   means no data-model change. A test checks that the SQL gives the same candles as folding
-  the same trades one by one. The cost is a scan of the market's trades on each history
-  read, with no index on time yet.
+  the same trades one by one. The cost of a scan per history read is bounded by the time
+  window below.
 - **Where:** `loadCandles`, `addTrade` and `LiveCandles` in `candles.ts`.
 
 ### A command's trades are stored at the time the feed reports
@@ -527,3 +527,54 @@ reports.
   trades, so the count orders the copies in any arrival order. A restart mid-minute was
   checked by hand: the next candle went from 2 trades to 3, not back to 1.
 - **Where:** `candleMessages` in `feed.ts`; `mergeCandles` in `web/lib/candles.ts`.
+
+### Candle history reads a time window, not the latest N candles
+
+- **Decision:** a history read covers the `limit` minutes before `before` (up to the current
+  minute without it), through an index on `trades (market, created_at)`. A minute with no
+  trades has no candle, so a page can hold fewer than `limit`.
+- **Alternative:** keep "the latest `limit` candles", which skips empty minutes but has to
+  group every trade in the market before it can tell which candles are the latest.
+- **Why:** on a copy of the dev database with 200,000 BTC-USD trades, the default read went
+  from a parallel sequential scan with a 7.7 MB on-disk sort in 23.5 ms to an index scan of
+  2,309 rows in 2.0 ms. The index alone did not help the old query (33.8 ms, still a
+  sequential scan): it needs the time bound to have something to seek to.
+- **Where:** `loadCandles` in `candles.ts`; migration `0008`.
+
+## Trading bots
+
+### Bots are ordinary API clients, reading by REST polling
+
+- **Decision:** every agent registers its own account and trades over the public REST API,
+  reading the last trade, its balances and its open orders at the start of each tick.
+- **Alternative:** call the engine in process, or mirror the book from the socket.
+- **Why:** an in-process bot would skip validation, rate limits, reservation and
+  settlement, so it would prove nothing about them. Polling once a second is far below the
+  20 orders/second limit and needs no second copy of the socket's gap recovery. The cost is
+  up to a tick of staleness, which a noise trader and a wide maker can afford.
+- **Where:** `ApiClient` in `bots.ts`.
+
+### Risk limits sit outside the strategy and count resting orders as filled
+
+- **Decision:** a strategy only sees a `RiskGuard`, which refuses an order locally if it is
+  too large, past the resting cap, or would move inventory past the position limit if it
+  and every resting order on its side filled. A loss limit and a failed-tick limit trip a
+  kill switch that cancels everything and stops the agent for good.
+- **Alternative:** let each strategy check its own limits, or count only filled inventory.
+- **Why:** a limit inside the strategy fails with the strategy's bug. Counting only fills
+  lets an agent rest enough bids to blow through the limit in one sweep.
+- **Weakness:** equity is marked at the last trade, so one trade at an outlier price can kill
+  a maker. The fleet test hit this when other test files traded BTC-USD at 60,000 while the
+  maker held 2 BTC. A mark from the book's mid would be steadier.
+- **Where:** `RiskGuard`, `equity` and `Agent` in `bots.ts`.
+
+### The maker skews by inventory and sends only the difference
+
+- **Decision:** the maker shifts its whole ladder against its inventory, in proportion to its
+  distance from target and capped, and stops quoting the side that adds inventory once at
+  the cap. Each tick cancels only the quotes that changed, before placing the new ones.
+- **Alternative:** cancel everything and requote every tick.
+- **Why:** unchanged quotes keep their place in the queue and the book does not flash empty.
+  Cancelling first means a new bid can never cross an old ask of its own, which
+  self-trade prevention would answer by cancelling the bid.
+- **Where:** `makerQuotes` and `marketMaker` in `strategies.ts`.
