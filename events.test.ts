@@ -164,7 +164,15 @@ describe("rebuilding books from the log", () => {
     // A process that starts with nothing but the database.
     const after = new Exchange(db);
     await expect(after.open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: book.sequence, halted: false, settled: 0, cancelled: 0 },
+      {
+        market: market.symbol,
+        sequence: book.sequence,
+        halted: false,
+        // Seven placements and the cancel.
+        replayed: 8,
+        settled: 0,
+        cancelled: 0,
+      },
     ]);
 
     expect(after.depth(market.symbol, 50)).toEqual(book);
@@ -201,8 +209,9 @@ describe("rebuilding books from the log", () => {
     exchange.onHalt((_symbol, error) => halts.push(error));
 
     await expect(exchange.open([broken, fine])).resolves.toEqual([
-      { market: broken.symbol, sequence: 1, halted: true, settled: 0, cancelled: 0 },
-      { market: fine.symbol, sequence: 0, halted: false, settled: 0, cancelled: 0 },
+      // The gap stops the replay, so nothing counts as replayed.
+      { market: broken.symbol, sequence: 1, halted: true, replayed: 0, settled: 0, cancelled: 0 },
+      { market: fine.symbol, sequence: 0, halted: false, replayed: 0, settled: 0, cancelled: 0 },
     ]);
     expect(halts).toEqual([
       expect.objectContaining({ message: "event log has command 3 where 2 was next" }),

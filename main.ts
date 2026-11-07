@@ -111,8 +111,14 @@ try {
 
   // Before listening, so no order arrives at a book that is still being rebuilt. A market
   // whose log does not replay is halted and logged at fatal; the others open.
+  // Timed because the cost grows with the log: every boot replays each market from its
+  // first command, with no snapshot to start from.
+  const replayStartedAt = performance.now();
   const opened = await exchange.open([...(await loadMarkets(db)).values()]);
-  log.info({ markets: opened }, "books rebuilt from the event log");
+  log.info(
+    { markets: opened, durationMs: Math.round(performance.now() - replayStartedAt) },
+    "books rebuilt from the event log",
+  );
 
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
 } catch (error) {

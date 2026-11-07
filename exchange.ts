@@ -140,9 +140,16 @@ type RunningMarket = {
   pending: number;
   // What recovery finished when the market opened; zero for a market that failed to open.
   recovered: Recovered;
+  // Commands replayed from the log when it opened; zero for a market whose log did not read.
+  replayed: number;
 };
 
-export type OpenedMarket = { market: string; sequence: number; halted: boolean } & Recovered;
+export type OpenedMarket = {
+  market: string;
+  sequence: number;
+  halted: boolean;
+  replayed: number;
+} & Recovered;
 
 // One engine and one queue per market. The books live in this process's memory and are
 // rebuilt from the event log when a market opens: on its first command, or at boot for every
@@ -258,6 +265,7 @@ export class Exchange {
           market: market.symbol,
           sequence: running.engine.sequence,
           halted: running.halted,
+          replayed: running.replayed,
           ...running.recovered,
         };
       }),
@@ -287,10 +295,12 @@ export class Exchange {
       halted: false,
       pending: 0,
       recovered: { settled: 0, cancelled: 0 },
+      replayed: 0,
     };
     try {
       const log = await readLog(this.#db, market.symbol);
       const replayed = replay(running.engine, log);
+      running.replayed = log.length;
       running.recovered = await recover(this.#db, market, running.engine, log, replayed);
     } catch (error) {
       this.#halt(running, market.symbol, error);

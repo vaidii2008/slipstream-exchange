@@ -89,7 +89,7 @@ describe("recovery when a market opens", () => {
 
     const after = new Exchange(db);
     await expect(after.open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: 3, halted: false, settled: 1, cancelled: 0 },
+      { market: market.symbol, sequence: 3, halted: false, replayed: 2, settled: 1, cancelled: 0 },
     ]);
 
     await expect(statusOf(ask.id)).resolves.toEqual({
@@ -148,7 +148,7 @@ describe("recovery when a market opens", () => {
 
     const after = new Exchange(db);
     await expect(after.open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: 1, halted: false, settled: 0, cancelled: 2 },
+      { market: market.symbol, sequence: 1, halted: false, replayed: 1, settled: 0, cancelled: 2 },
     ]);
 
     await expect(statusOf(sell.id)).resolves.toMatchObject({ status: "cancelled" });
@@ -186,7 +186,7 @@ describe("recovery when a market opens", () => {
 
     const again = new Exchange(db);
     await expect(again.open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: 2, halted: false, settled: 0, cancelled: 0 },
+      { market: market.symbol, sequence: 2, halted: false, replayed: 2, settled: 0, cancelled: 0 },
     ]);
 
     await expect(Promise.all([balancesOf(db, seller), balancesOf(db, buyer)])).resolves.toEqual(
@@ -211,7 +211,7 @@ describe("recovery when a market opens", () => {
     await appendCommand(db, market.symbol, 2, { type: "cancel", orderId: "already-gone" });
 
     await expect(new Exchange(db).open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: 2, halted: false, settled: 0, cancelled: 0 },
+      { market: market.symbol, sequence: 2, halted: false, replayed: 2, settled: 0, cancelled: 0 },
     ]);
   });
 
@@ -408,6 +408,7 @@ describe("a process killed mid-load", () => {
         market: market.symbol,
         sequence: log.at(-1)!.sequence + replay(new Engine(market.symbol), log).at(-1)!.length - 1,
         halted: false,
+        replayed: log.length,
         settled: 1,
         cancelled: unlogged.length,
       },
