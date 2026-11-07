@@ -604,6 +604,8 @@ reports.
   maker held 2 BTC. A mark from the book's mid would be steadier.
 - **Where:** `RiskGuard`, `equity` and `Agent` in `bots.ts`.
 - **Update (Day 14):** the mark is now the median of the last 20 trades; see below.
+- **Update (Day 17):** `RiskGuard`, `equity`, `LossLimit` and `cancelAll` moved to `risk.ts`,
+  where the MCP server shares them.
 
 ### The maker skews by inventory and sends only the difference
 
@@ -926,3 +928,62 @@ measured ceiling was 264.
   request before the first API call, and rewriting the bundle is fragile. A new address means a
   rebuild. The API's `WEB_ORIGIN` must match the terminal's address, or CORS refuses it.
 - **Where:** `web/Dockerfile`; `API_URL` in `web/lib/session.ts`.
+
+## Agents over MCP
+
+### The MCP server is one more API client, with no back door
+
+- **Decision:** `mcp.ts` signs in to the public HTTP API as one agent account and turns each
+  tool call into a request the terminal could have made. It shares `ApiClient` with the bots.
+- **Alternative:** run the tools inside the API process and call the exchange directly, which
+  saves a network hop and a sign-in.
+- **Why:** in-process tools would skip authentication, the rate limit and the route
+  validation, so the model could do things no user can, and every new tool would be a new way
+  into the engine. Through the API the model's reach is exactly an account's reach, and a test
+  that it cannot cancel someone else's order gets a 404 from the same route a person hits.
+- **Where:** `signInAgent` and `buildMcpServer` in `mcp.ts`; `client.ts`.
+
+### Guardrails live in the server process, not in the prompt
+
+- **Decision:** every `place_order` goes through the bots' `RiskGuard` before it is sent, and a
+  kill switch trips on the loss limit before and after each order and every 5 s. Once tripped
+  it refuses every order and cancels everything resting. No tool resets it; only restarting
+  the server does. The limits are written into `place_order`'s description too, but only as
+  information.
+- **Alternative:** state the limits in the instructions and trust the model to keep them, or
+  give the model a tool to pause and resume itself.
+- **Why:** a model's compliance with its prompt is a probability, and a limit has to hold
+  every time. The guard runs in code the model cannot reach, so a confused or adversarial
+  model can ask for anything and still only get what the limits allow. The timer covers a
+  resting order filling into a loss while the model is idle.
+- **Weakness:** the limits and the switch live in memory, so a restart resets them, and
+  stopping the server leaves resting orders in the book.
+- **Where:** `KillSwitch` and `place_order` in `mcp.ts`; `RiskGuard`, `LossLimit`, `cancelAll`
+  in `risk.ts`.
+
+### Tool errors are results the model can read, in the API's own words
+
+- **Decision:** a refused order comes back as an error result (`isError: true`) whose text is
+  the API's JSON: its error code and message, or its field-and-issue shape for a bad amount. An
+  amount the server parses itself, to run the risk checks, is worded from the same
+  `AMOUNT_MESSAGES` the API uses. A risk refusal names the limit and its value.
+- **Alternative:** throw a protocol error, or return a generic "order rejected".
+- **Why:** a protocol error tells the host the call broke, not the model why. A generic message
+  leaves the model guessing whether to change the price, the size or nothing. With the real
+  reason it can correct an off-tick price or a too-large quantity in its next call.
+- **Where:** `failure`, `fieldError` and the `place_order` handler in `mcp.ts`;
+  `AMOUNT_MESSAGES` in `money.ts`.
+
+### Interview note: Session 13, an LLM agent trades through MCP
+
+The problem was letting a language model trade on the exchange without trusting it: a model
+can misread a tool's schema, retry blindly or simply decide to keep buying. The design is an
+MCP server over stdio that is only another client of the public API, signed in as one account,
+with every order passing through the same risk guard the bots use and a kill switch that the
+model has no tool to reset. The trade-off is six extra API reads per order (the guard's two
+and two for each loss check, before and after) and limits that live in the server's memory,
+so a restart starts them over. In the
+scripted stdio session the server takes five 0.05 BTC buys up to the 0.25 BTC position limit
+and refuses one more, refuses a 0.06 BTC order and an off-tick price with the reason. When
+other accounts trade at 40,000, the agent's 7,500 USD paper loss trips the 5,000 USD switch:
+its resting sell is cancelled and the next order comes back `risk_killed`.
