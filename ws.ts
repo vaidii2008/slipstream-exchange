@@ -19,6 +19,7 @@ import { z } from "zod";
 import { type Exchange, SerialQueue } from "./exchange.ts";
 import type { FeedChannels, MarketFeedMessage } from "./feed.ts";
 import { accountState, type Database } from "./ledger.ts";
+import type { Metrics } from "./metrics.ts";
 import { formatAmount } from "./money.ts";
 import { loadMarket, type Market } from "./orders.ts";
 import type { ClientMessage, ServerMessage } from "./protocol.ts";
@@ -33,6 +34,7 @@ export type WebSocketDependencies = {
   subscriber: RedisClient;
   channels: FeedChannels;
   limits: WebSocketLimits;
+  metrics: Metrics;
 };
 
 // A client message larger than this closes the connection: commands are tiny.
@@ -217,7 +219,7 @@ async function balancesMessage(db: Database, userId: string): Promise<ServerMess
 
 export function registerWebSocketRoutes(
   app: FastifyInstance,
-  { db, exchange, tokens, subscriber, channels, limits }: WebSocketDependencies,
+  { db, exchange, tokens, subscriber, channels, limits, metrics }: WebSocketDependencies,
 ) {
   const hub = new MarketDataHub();
   const connections = new Set<Connection>();
@@ -406,6 +408,7 @@ export function registerWebSocketRoutes(
   function accept(socket: WebSocket, log: FastifyBaseLogger): void {
     const connection = new Connection(socket, limits.maxBufferedBytes);
     connections.add(connection);
+    metrics.socketConnections.inc();
     socket.on("pong", () => {
       connection.alive = true;
     });
@@ -419,6 +422,7 @@ export function registerWebSocketRoutes(
     });
     socket.on("close", () => {
       connections.delete(connection);
+      metrics.socketConnections.dec();
       clearTimeout(connection.expiry);
       hub.disconnect(connection);
       if (connection.userId !== undefined) {

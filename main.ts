@@ -75,6 +75,7 @@ try {
       logLevel: config.LOG_LEVEL,
       orderRateLimit: { limit: config.ORDER_RATE_LIMIT, windowMs: 1000 },
       webOrigin: config.WEB_ORIGIN,
+      processMetrics: true,
     },
   );
   const log = app.log;

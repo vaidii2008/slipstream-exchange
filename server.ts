@@ -10,6 +10,7 @@ import { DEFAULT_WEB_ORIGIN, type LogLevel } from "./config.ts";
 import type { Exchange } from "./exchange.ts";
 import { feedChannels, publishUpdate } from "./feed.ts";
 import { registerMarketDataRoutes } from "./market.ts";
+import { Metrics } from "./metrics.ts";
 import { loadMarkets } from "./orders.ts";
 import type { RateLimit } from "./ratelimit.ts";
 import type { RedisClient } from "./redis.ts";
@@ -65,6 +66,8 @@ export type ServerOptions = {
   webSocketLimits?: WebSocketLimits;
   // The one browser origin allowed to call the API with credentials.
   webOrigin?: string;
+  // Adds Node's own CPU, memory and event loop metrics to /metrics. Set by main.ts.
+  processMetrics?: boolean;
 };
 
 export const DEFAULT_MARKET_DATA_PREFIX = "slipstream:";
@@ -79,6 +82,7 @@ export function buildServer(
     marketDataPrefix = DEFAULT_MARKET_DATA_PREFIX,
     webSocketLimits = DEFAULT_WEBSOCKET_LIMITS,
     webOrigin = DEFAULT_WEB_ORIGIN,
+    processMetrics = false,
   }: ServerOptions = {},
 ) {
   const app = Fastify({
@@ -133,6 +137,16 @@ export function buildServer(
     });
   });
 
+  const metrics = new Metrics();
+  if (processMetrics) {
+    metrics.collectProcessMetrics();
+  }
+  // Unauthenticated, like /health: Prometheus scrapes it without a token, and it holds counts
+  // per market, nothing about any user. A deployment keeps it off the public listener.
+  app.get("/metrics", async (_request, reply) => {
+    return reply.type(metrics.registry.contentType).send(await metrics.registry.metrics());
+  });
+
   exchange.onHalt((market, error) => {
     app.log.fatal({ err: error, market }, "market halted: settlement failed after matching");
   });
@@ -140,7 +154,7 @@ export function buildServer(
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
   registerWalletRoutes(app, { db, tokens });
-  registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit });
+  registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit, metrics });
   registerMarketDataRoutes(app, { db, exchange });
   const channels = feedChannels(marketDataPrefix);
   const candles = new LiveCandles();
@@ -149,6 +163,7 @@ export function buildServer(
     await candles.load(db, [...(await loadMarkets(db)).values()]);
   });
   const stopPublishing = exchange.onUpdate((update) => {
+    metrics.settled(update);
     publishUpdate(redis, channels, candles, update, app.log);
   });
   app.addHook("onClose", (_instance, done) => {
@@ -162,6 +177,7 @@ export function buildServer(
     subscriber,
     channels,
     limits: webSocketLimits,
+    metrics,
   });
 
   return app;

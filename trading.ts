@@ -7,6 +7,7 @@ import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
 import type { Side } from "./book.ts";
 import { type Exchange, MarketBusyError, MarketHaltedError } from "./exchange.ts";
 import type { Database } from "./ledger.ts";
+import { type Metrics, NO_MARKET, type OrderOutcome } from "./metrics.ts";
 import { formatAmount, fromNumeric, parseAmount } from "./money.ts";
 import { findOrder, listFills, listOrders, type OrderRow, takerFills } from "./history.ts";
 import {
@@ -28,6 +29,7 @@ export type TradingDependencies = {
   exchange: Exchange;
   redis: RedisClient;
   orderRateLimit: RateLimit;
+  metrics: Metrics;
 };
 
 // Prices and quantities travel as strings, like deposit amounts. A market order has no price,
@@ -118,7 +120,7 @@ function marketOf(markets: Map<string, Market>, symbol: string): Market {
 
 export function registerTradingRoutes(
   app: FastifyInstance,
-  { db, tokens, exchange, redis, orderRateLimit }: TradingDependencies,
+  { db, tokens, exchange, redis, orderRateLimit, metrics }: TradingDependencies,
 ) {
   const authenticate = bearerAuth(tokens);
 
@@ -186,30 +188,37 @@ export function registerTradingRoutes(
     const userId = authenticatedUserId(request);
     // Counted before validation, so malformed requests use up the allowance too.
     if (!(await underOrderLimit(request, reply, userId))) {
+      metrics.order(NO_MARKET, "rate_limited");
       return reply;
     }
 
     const parsed = orderBody.safeParse(request.body);
     if (!parsed.success) {
+      metrics.order(NO_MARKET, "invalid");
       return reply.code(400).send(invalidRequest(parsed.error));
     }
     const body = parsed.data;
 
     const market = await loadMarket(db, body.market);
     if (market === undefined) {
+      metrics.order(NO_MARKET, "invalid");
       return reply.code(400).send(fieldError("market", "is not a listed market"));
     }
+    // Past here the market is a listed one, so its symbol is a bounded label.
+    const count = (outcome: OrderOutcome) => metrics.order(market.symbol, outcome);
 
     let price: bigint | null = null;
     if (body.type === "limit") {
       const parsedPrice = parseAmount(body.price, market.quoteScale);
       if (!parsedPrice.ok) {
+        count("invalid");
         return reply.code(400).send(fieldError("price", AMOUNT_MESSAGES[parsedPrice.reason]));
       }
       price = parsedPrice.units;
     }
     const quantity = parseAmount(body.quantity, market.baseScale);
     if (!quantity.ok) {
+      count("invalid");
       return reply.code(400).send(fieldError("quantity", AMOUNT_MESSAGES[quantity.reason]));
     }
 
@@ -227,6 +236,7 @@ export function registerTradingRoutes(
       );
     } catch (error) {
       if (error instanceof DuplicateOrderError) {
+        count("repeat");
         return replyToRepeat(reply, userId, error.orderId, {
           market,
           side: body.side,
@@ -236,11 +246,13 @@ export function registerTradingRoutes(
         });
       }
       if (error instanceof MarketHaltedError || error instanceof MarketBusyError) {
+        count(error instanceof MarketBusyError ? "busy" : "halted");
         return unavailable(reply, error);
       }
       if (!(error instanceof OrderError)) {
         throw error;
       }
+      count("rejected");
       if (error.code === "insufficient_funds" || error.code === "no_liquidity") {
         return reply.code(422).send({ error: error.code, message: error.message });
       }
@@ -248,6 +260,7 @@ export function registerTradingRoutes(
       return reply.code(400).send(fieldError(field, message));
     }
 
+    count(placed.status);
     const quote = (units: bigint) => formatAmount(units, market.quoteScale);
     const base = (units: bigint) => formatAmount(units, market.baseScale);
     return reply.code(201).send({
