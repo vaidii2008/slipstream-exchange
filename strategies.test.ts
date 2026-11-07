@@ -1,6 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentRunner, ApiClient, type Logger, type MarketInfo } from "./bots.ts";
-import { type NoiseOptions, noiseOrder, noiseTrader } from "./strategies.ts";
+import {
+  type MakerOptions,
+  makerQuotes,
+  marketMaker,
+  type NoiseOptions,
+  noiseOrder,
+  noiseTrader,
+} from "./strategies.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail } = useTestServer();
@@ -160,5 +167,134 @@ describe("noiseTrader", () => {
     expect((await api.balances()).get("ETH")?.available).not.toBe(2n * 100_000_000n);
     expect(mostOpen).toBeLessThanOrEqual(3);
     expect(await api.openOrders(ethUsd)).toEqual([]);
+  });
+});
+
+const maker: MakerOptions = {
+  referencePrice: usd(70_000),
+  halfSpreadTicks: 50,
+  levels: 2,
+  levelSpacingTicks: 100,
+  quoteQuantity: 100_000n,
+  targetInventory: 100_000_000n,
+  maxInventory: 50_000_000n,
+  maxSkewTicks: 40,
+};
+const tick = btcUsd.tickSize;
+
+describe("makerQuotes", () => {
+  it("quotes symmetric levels around the centre at the target inventory", () => {
+    expect(makerQuotes(btcUsd, usd(70_000), maker.targetInventory, maker)).toEqual([
+      { side: "buy", price: usd(70_000) - 50n * tick, quantity: 100_000n },
+      { side: "sell", price: usd(70_000) + 50n * tick, quantity: 100_000n },
+      { side: "buy", price: usd(70_000) - 150n * tick, quantity: 100_000n },
+      { side: "sell", price: usd(70_000) + 150n * tick, quantity: 100_000n },
+    ]);
+  });
+
+  it("skews both sides down when long and up when short, in proportion", () => {
+    // Half of maxInventory long: half of maxSkewTicks, 20 ticks, lower.
+    const long = makerQuotes(btcUsd, usd(70_000), 125_000_000n, maker);
+    const short = makerQuotes(btcUsd, usd(70_000), 75_000_000n, maker);
+
+    expect(long.slice(0, 2).map((q) => q.price)).toEqual([
+      usd(70_000) - 70n * tick,
+      usd(70_000) + 30n * tick,
+    ]);
+    expect(short.slice(0, 2).map((q) => q.price)).toEqual([
+      usd(70_000) - 30n * tick,
+      usd(70_000) + 70n * tick,
+    ]);
+  });
+
+  it("stops bidding when full long and stops offering when full short", () => {
+    const fullLong = makerQuotes(btcUsd, usd(70_000), 200_000_000n, maker);
+    const fullShort = makerQuotes(btcUsd, usd(70_000), 0n, maker);
+
+    expect(fullLong.map((q) => q.side)).toEqual(["sell", "sell"]);
+    // Past the cap the skew stays at maxSkewTicks.
+    expect(fullLong[0]?.price).toBe(usd(70_000) + 10n * tick);
+    expect(fullShort.map((q) => q.side)).toEqual(["buy", "buy"]);
+    expect(fullShort[0]?.price).toBe(usd(70_000) - 10n * tick);
+  });
+
+  it("drops bids that would be priced below one tick", () => {
+    const quotes = makerQuotes(btcUsd, 100n * tick, maker.targetInventory, maker);
+
+    expect(quotes.map((q) => [q.side, q.price])).toEqual([
+      ["buy", 50n * tick],
+      ["sell", 150n * tick],
+      ["sell", 250n * tick],
+    ]);
+  });
+});
+
+describe("marketMaker", () => {
+  const runners: AgentRunner[] = [];
+  afterAll(() => Promise.all(runners.map((runner) => runner.stopAll())));
+
+  // The last trade price is read from the trades table, which other test files write to at
+  // the same time, so the maker here sees a price the test sets.
+  class PricedClient extends ApiClient {
+    price = usd(70_000);
+
+    override lastPrice(): Promise<bigint | undefined> {
+      return Promise.resolve(this.price);
+    }
+  }
+
+  it("rests its quotes, leaves unchanged ones alone and requotes after a fill", async () => {
+    const runner = new AgentRunner({ baseUrl, password: PASSWORD, log: quiet });
+    runners.push(runner);
+    const email = uniqueEmail("strategies-test");
+    // Full at 0.01 BTC from target, so one 0.001 BTC fill skews by a tenth of 40 ticks.
+    const options = { ...maker, maxInventory: 1_000_000n };
+    const strategy = marketMaker(options);
+    // Started for its account and funding; the interval is long so the test runs each tick.
+    const agent = await runner.start({
+      name: "maker",
+      email,
+      market: "BTC-USD",
+      funding: { USD: "10000", BTC: "1" },
+      intervalMs: 600_000,
+      strategy,
+    });
+    const api = new PricedClient(baseUrl, email, PASSWORD);
+    await api.signIn();
+    const context = { ...agent.context, api };
+    const market = context.market;
+    const quotes = (orders: { side: string; price: bigint | null; quantity: bigint }[]) =>
+      orders.map((o) => `${o.side} ${o.quantity} @ ${o.price}`).sort();
+
+    await strategy.tick(context);
+    const first = await api.openOrders(market);
+    expect(quotes(first)).toEqual(quotes(makerQuotes(market, usd(70_000), 100_000_000n, options)));
+
+    await strategy.tick(context);
+    const second = await api.openOrders(market);
+    expect(second.map((o) => o.id).sort()).toEqual(first.map((o) => o.id).sort());
+
+    // Someone buys the best ask. The maker is now 0.001 BTC short of its target and the last
+    // trade is at its ask, so the next tick centres there and skews 4 ticks up.
+    const taker = new ApiClient(baseUrl, uniqueEmail("strategies-test"), PASSWORD);
+    await taker.signIn();
+    await taker.deposit("USD", usd(10_000), 8);
+    const bought = await taker.place(market, {
+      type: "market",
+      side: "buy",
+      quantity: maker.quoteQuantity,
+    });
+    expect(bought).toMatchObject({ ok: true, filled: maker.quoteQuantity });
+    api.price = usd(70_000) + 50n * tick;
+
+    await strategy.tick(context);
+    const third = await api.openOrders(market);
+    const expected = makerQuotes(market, api.price, 100_000_000n - maker.quoteQuantity, options);
+    expect(quotes(third)).toEqual(quotes(expected));
+    expect(expected[0]).toEqual({
+      side: "buy",
+      price: api.price + 4n * tick - 50n * tick,
+      quantity: maker.quoteQuantity,
+    });
   });
 });
