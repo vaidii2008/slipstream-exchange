@@ -661,3 +661,136 @@ commands with one settlement blocked mid-flight and up to four orders unlogged; 
 the last command it reported replays to exactly the book it printed, the restart settles the
 one interrupted command and cancels the unlogged orders, and the ledger sums to zero with
 every reservation matching an open order.
+
+## Measurement
+
+### Metrics carry market and outcome labels, never ids
+
+- **Decision:** `/metrics` labels its series by market and outcome only. An order refused before
+  its market is looked up (rate limited, malformed, unlisted market) counts under
+  `market="none"`, never under the market string the client sent.
+- **Alternative:** label by user, to see who is busy, or take the market label from the body.
+- **Why:** every distinct label set is its own series in Prometheus, held in memory and
+  scraped every 5 s. A user or order id label adds a series per user or per order and grows
+  without bound; a market label taken from client input lets anyone create series by sending
+  made-up names. Per-user activity belongs in logs and Postgres, which are built for it.
+- **Where:** `metrics.ts`; the outcome per return path in `POST /orders` in `trading.ts`.
+
+### Two kinds of number, never mixed
+
+- **Decision:** every figure is labelled engine-only or end to end. Engine-only is
+  `npm run bench`: the engine in one process, no I/O. End to end is k6 through HTTP, the
+  reservation, the event log, the settlement and Redis, against a `slipstream_bench` database
+  created for the runs and dropped afterwards, with the bots stopped.
+- **Machine and date:** this MacBook (Apple M4, 10 cores, 16 GB, Node 24.21.0), Postgres 16 and
+  Redis 7 in Docker Desktop (10 CPUs, 7.75 GB), k6 1.2.3 in Docker reaching the API through
+  `host.docker.internal`, the API at its default `LOG_LEVEL=info`. 7 November 2026.
+- **Engine-only:** mixed book near 5,000 resting orders, 4,305,856 commands/s, p50 0.21 µs,
+  p99 0.54 µs. One level near 10,000 orders, 2,258,113 commands/s, cancels p99 1.54 µs.
+- **End to end:** one market saturates near 264 commands/s; both markets together near 320 to 340. Below that, at 200 orders and cancels a second across both markets for 3 minutes, a
+  placement took p50 12.8 ms, p95 150 ms and p99 711 ms, and the match inside it p50 4.1 µs.
+  Details in the next two entries.
+- **Load setup:** 300 users, so even 400 orders/s is 1.3 a second per user against the limit
+  of 20. No run had a 429 (rule: they are counted apart, the limit is not raised). No run had a
+  503 either: k6's cap of 2,000 virtual users bounded in-flight orders below the queue's cap of
+  10,000.
+- **Where:** `load/orders.js`, `load/sockets.js`, `load/benchdb.ts`, `engine.bench.ts`.
+
+### A market's ceiling is its queue's turn, and the turn is Postgres round trips
+
+- **Finding:** each market runs one command at a time, so its ceiling is one over the mean
+  turn: the log append, the match and the settlement. Ramping BTC-USD alone from 0 to 400 a
+  second, the median wait in the queue stayed under 4 ms up to 252 commands/s, then jumped to
+  678 ms at 264/s and grew to 7.5 s as k6 kept sending. The mean turn was 3.8 ms (p50 2.2 ms,
+  p99 24 ms), which predicts 263/s. The match was 3.8 µs of it at p50.
+- **What it is not:** the API's CPU was under 1.2 cores and a CPU profile at the ceiling showed
+  the main thread idle 55% of the time. Postgres had 4 to 8 of the pool's 10 connections idle.
+  Turning `synchronous_commit` off on the bench database moved the two-market peak only from
+  about 338 to 371 commands/s, so commit fsyncs are not the limit either.
+- **What it is:** a resting order sends 16 statements to Postgres over its whole life and a
+  crossing order 43, measured by counting queries; a bare round trip takes 0.167 ms p50. The
+  turn waits on each of its statements in sequence. Two markets share the event loop and
+  Postgres, so each one's turn rose to 5.8 ms and the pair reached about 330/s, not 2 × 264.
+- **Past the ceiling:** latency is Little's law. In the first ramp, which jumped straight past
+  the ceiling, 2,000 orders were in flight at about 233/s, which predicts 8.6 s; the median
+  placement took 8.35 s. Throughput also fell back to about 210/s once the queue was
+  full, and that run did not show why.
+- **The lever, not pulled:** fewer round trips per turn, by taking several queued commands per
+  turn and logging and settling them in one transaction. That changes what a turn is and how
+  recovery reads the frontier, so it is future work, not a measurement-session change.
+- **Where:** `#execute` in `exchange.ts`; `settle` in `settlement.ts`.
+
+### Market data fan-out shares the event loop with the queues
+
+- **Finding:** 200 subscribers on BTC-USD's trades and book, with orders at 100/s across both
+  markets, received 9,945 book deltas and 5,599 trades a second between them with no sequence
+  gap in 1,791,445 deltas. A trade reached a subscriber p50 18 ms, p95 44 ms and p99 69 ms
+  after settlement. Placements in that run took p50 13.9 ms and p99 218 ms.
+- **At 220/s with the same 200 subscribers** the process sent about 25,000 messages a second,
+  event-loop lag p99 reached 89 ms, the mean turn was 10.7 ms against 5.2 ms at 200/s without
+  subscribers, and throughput fell to 177/s. Still no gap: the snapshot-and-delta protocol held while everything slowed.
+- **Caveat:** the delay compares k6's container clock with the API's host clock. The smallest
+  measured delay was −12 ms, so they disagree by at least that much.
+- **What it means:** the engine, its settlements and the socket fan-out are one process on one
+  event loop. Moving fan-out to its own process, which Redis pub/sub already allows, would
+  stop subscribers slowing matching.
+- **Where:** `MarketDataHub.publish` and `Connection.sendText` in `ws.ts`.
+
+### Boot replays the whole log: 0.3 s at 118k commands, 3 s at 1M
+
+- **Finding:** snapshots were cut, so every boot reads and replays each market's whole log
+  before the API listens. Measured on a log filled through the API, three boots each, the
+  markets opening in parallel:
+
+  | Logged commands | Books rebuilt | Launch to healthy | Peak RSS   | Resting orders |
+  | --------------- | ------------- | ----------------- | ---------- | -------------- |
+  | 118,271         | 310 to 320 ms | 761 to 1,119 ms   | 418–449 MB | 6,529          |
+  | 1,011,453       | 2.9 to 3.6 s  | 3.3 to 4.1 s      | 1.5–1.6 GB | 59,734         |
+
+- **Where the time goes at 1M,** per market of about 500,000 commands: reading and decoding
+  the log 1.4 to 1.7 s, the replay itself 0.2 to 0.5 s, the recovery check 0.2 to 0.4 s. The
+  engine is the cheap part; the read is Postgres and zod.
+- **Memory:** the whole log and every replayed event are in memory at once, which is the 1.5
+  GB. Reading the log in pages would cap it; a snapshot would cap both time and memory.
+- **The cost of cutting snapshots** is therefore about 3.5 s of downtime per million commands
+  on this machine, growing in step with the log, plus that memory.
+- **Where:** `#replay` in `exchange.ts`; `readLog` and `replay` in `events.ts`.
+
+### The recovery check uses a set of resting ids
+
+- **Decision:** checking that every order Postgres calls open is on the rebuilt book now looks
+  it up in a set of resting ids.
+- **Alternative:** the scan it replaced, `resting.some` for each open order.
+- **Why:** the scan was open × resting comparisons. At 1M commands, with about 31,000 orders
+  resting per market, it was 2.8 to 3.6 s of each market's boot and took launch to healthy to
+  9.3 to 10.9 s. With the set the check takes 0.2 to 0.4 s and launch to healthy 3.3 to 4.1 s.
+  The kill test never saw it, with tens of orders resting.
+- **Where:** `checkBook` in `recovery.ts`.
+
+### A balance is summed from its whole history, so every order slows as history grows
+
+- **Finding:** filling the log to 1M commands in ten-minute chunks at a fixed offered rate,
+  throughput fell chunk by chunk: about 250, 207, 185, 151, 139, 142 and 123 commands/s. The mean
+  turn rose from 8 ms to 14 ms while the API's CPU fell and the match stayed under 10 µs.
+  A reservation and a settlement each sum every entry of the accounts they debit, under the
+  accounts' row locks. By then a user account had 2,047 entries on average and 3,902 at most,
+  and summing three busy accounts took 39 to 58 ms with the load running.
+- **Proposal, not built:** a cached balance per ledger account, updated in the same transaction
+  as each entry under the lock that is already taken, with a check that it equals the sum of
+  the entries. That is a column the plan says to propose first, so it is a proposal here. The
+  rejected alternative is periodic balance checkpoints: they bound the sum, but add a second
+  table and a second rule for what a balance is.
+- **Where:** `postTransaction` in `ledger.ts`.
+
+### Two processes on one database: refused, not prevented
+
+- **Finding:** a restart during the measurements started the new API while the old one was
+  still draining about 2,000 queued orders in its 10 s shutdown. Both wrote the same markets.
+  Recovery in the new process found pending orders changing under it, and the log's unique
+  (market, sequence) would have refused a second writer's command, so it halted both markets
+  instead of trading on a book it could not trust. A clean restart opened them with the ledger
+  summing to zero.
+- **Gap:** nothing stops a second process starting. A Postgres advisory lock per market, taken
+  when the market opens and held for the process's life, would make the second process wait
+  or refuse to open it.
+- **Where:** `#open` in `exchange.ts`.
