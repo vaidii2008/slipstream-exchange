@@ -460,6 +460,31 @@ describe("the account channel", () => {
     bystander.close();
   });
 
+  it("sends fresh balances when a deposit lands, and no message for the deposit itself", async () => {
+    const userId = await funded({ USD: "100" });
+    const client = await signedIn(userId);
+    const opening = (await client.next()) as { type: string; version: number };
+    expect(opening).toMatchObject({ type: "balances" });
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/deposits",
+      headers: { authorization: `Bearer ${await tokens.issue(userId)}` },
+      payload: { asset: "USD", amount: "250" },
+    });
+    expect(response.statusCode).toBe(201);
+
+    const after = (await client.next()) as { type: string; version: number; balances: unknown[] };
+    expect(after.type).toBe("balances");
+    expect(after.version).toBeGreaterThan(opening.version);
+    expect(after.balances).toContainEqual({
+      asset: "USD",
+      available: "350.00000000",
+      reserved: "0.00000000",
+    });
+    client.close();
+  });
+
   it("closes the connection when its access token expires", async () => {
     const userId = await funded({});
     const shortLived = createAccessTokens(TEST_SECRET, { ttlSeconds: 1 });

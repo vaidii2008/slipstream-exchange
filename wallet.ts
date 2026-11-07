@@ -3,14 +3,18 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { authenticatedUserId, bearerAuth, invalidRequest } from "./auth.ts";
+import { type FeedChannels, publishDeposit } from "./feed.ts";
 import { balancesOf, deposit } from "./ledger.ts";
 import { formatAmount, parseAmount, type ParseFailure } from "./money.ts";
 import { assets } from "./schema.ts";
+import type { RedisClient } from "./redis.ts";
 import type { AccessTokens } from "./tokens.ts";
 
 export type WalletDependencies = {
   db: NodePgDatabase;
   tokens: AccessTokens;
+  redis: RedisClient;
+  channels: FeedChannels;
 };
 
 // Amounts travel as strings: a JSON number is parsed into a float before we ever see it.
@@ -31,7 +35,10 @@ export function fieldError(field: string, message: string) {
   return { error: "invalid_request", issues: [{ field, message }] };
 }
 
-export function registerWalletRoutes(app: FastifyInstance, { db, tokens }: WalletDependencies) {
+export function registerWalletRoutes(
+  app: FastifyInstance,
+  { db, tokens, redis, channels }: WalletDependencies,
+) {
   const authenticate = bearerAuth(tokens);
 
   app.post("/deposits", { onRequest: authenticate }, async (request, reply) => {
@@ -60,6 +67,8 @@ export function registerWalletRoutes(app: FastifyInstance, { db, tokens }: Walle
     }
 
     const transactionId = await deposit(db, userId, asset.code, amount.units);
+    // After the commit, so the balances the gateway re-reads include it.
+    publishDeposit(redis, channels, userId, request.log);
 
     return reply.code(201).send({
       transactionId,

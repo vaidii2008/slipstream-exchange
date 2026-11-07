@@ -17,7 +17,7 @@ import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { z } from "zod";
 import { type Exchange, SerialQueue } from "./exchange.ts";
-import type { FeedChannels, MarketFeedMessage } from "./feed.ts";
+import type { FeedChannels, MarketFeedMessage, UserFeedMessage } from "./feed.ts";
 import { accountState, type Database } from "./ledger.ts";
 import type { Metrics } from "./metrics.ts";
 import { formatAmount } from "./money.ts";
@@ -293,7 +293,10 @@ export function registerWebSocketRoutes(
       return;
     }
     const listener = (text: string) => {
-      hub.publish(topicOf("account", userId), JSON.parse(text) as ServerMessage);
+      const message = JSON.parse(text) as UserFeedMessage;
+      if (message.type !== "deposited") {
+        hub.publish(topicOf("account", userId), message);
+      }
       sendBalances(userId);
     };
     userListeners.set(userId, listener);

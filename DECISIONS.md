@@ -414,9 +414,11 @@ while BTC-USD refuses the next order and ETH-USD still accepts one.
 
 ### A balances message carries a version: the highest ledger entry id it includes
 
-- **Decision:** after an order event for a connected user, the gateway reads their balances
-  together with `max(ledger_entries.id)` in one statement, and the client keeps the message
-  with the highest version.
+- **Decision:** after an order event or a deposit for a connected user, the gateway reads
+  their balances together with their latest ledger entry id in one statement, and the client
+  keeps the message with the highest version. A deposit reaches the gateway as a `deposited`
+  notice on the user's Redis channel, which re-reads balances but is not forwarded, so the
+  socket protocol did not change. Deposits were not pushed until 7 November.
 - **Alternative:** send balances from inside the market's queue, or send deltas.
 - **Why:** two markets can settle for the same user at once, so two balance reads can
   finish in either order. Entry ids only grow, so the higher version saw at least what the

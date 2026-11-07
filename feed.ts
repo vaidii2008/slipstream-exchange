@@ -104,6 +104,33 @@ export function feedChannels(prefix: string) {
 
 export type FeedChannels = ReturnType<typeof feedChannels>;
 
+// What travels on a user's channel: their order messages, which go to their sockets as they
+// are, and a notice that a deposit landed, which does not. Either makes the gateway re-read
+// the user's balances, so a deposit reaches the account channel the way order activity does.
+export type UserFeedMessage = ServerMessage | { type: "deposited" };
+
+// Fire and forget, like every publish here: a dropped one is logged, and the next balances
+// message, or a reload, shows the deposit.
+function publish(
+  redis: RedisClient,
+  channel: string,
+  message: MarketFeedMessage | UserFeedMessage,
+  log: FastifyBaseLogger,
+): void {
+  redis.publish(channel, JSON.stringify(message)).catch((error: unknown) => {
+    log.warn({ err: error, channel }, "market data publish dropped");
+  });
+}
+
+export function publishDeposit(
+  redis: RedisClient,
+  channels: FeedChannels,
+  userId: string,
+  log: FastifyBaseLogger,
+): void {
+  publish(redis, channels.user(userId), { type: "deposited" }, log);
+}
+
 export function publishUpdate(
   redis: RedisClient,
   channels: FeedChannels,
@@ -111,19 +138,14 @@ export function publishUpdate(
   update: MarketUpdate,
   log: FastifyBaseLogger,
 ): void {
-  const send = (channel: string, message: unknown) => {
-    redis.publish(channel, JSON.stringify(message)).catch((error: unknown) => {
-      log.warn({ err: error, channel }, "market data publish dropped");
-    });
-  };
   const { market } = update;
   const message: MarketFeedMessage = {
     book: bookUpdate(update),
     trades: tradeMessages(update),
     candles: candleMessages(candles, update),
   };
-  send(channels.market(market.symbol), message);
+  publish(redis, channels.market(market.symbol), message, log);
   for (const order of update.orders) {
-    send(channels.user(order.userId), orderMessage(market, order));
+    publish(redis, channels.user(order.userId), orderMessage(market, order), log);
   }
 }

@@ -155,10 +155,10 @@ export function buildServer(
 
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
-  registerWalletRoutes(app, { db, tokens });
+  const channels = feedChannels(marketDataPrefix);
+  registerWalletRoutes(app, { db, tokens, redis, channels });
   registerTradingRoutes(app, { db, tokens, exchange, redis, orderRateLimit, metrics });
   registerMarketDataRoutes(app, { db, exchange });
-  const channels = feedChannels(marketDataPrefix);
   const candles = new LiveCandles();
   // onReady runs before the server accepts a request, so before any trade can settle.
   app.addHook("onReady", async () => {
