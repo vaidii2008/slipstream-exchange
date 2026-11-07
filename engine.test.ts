@@ -185,6 +185,23 @@ describe("Engine.submit with a limit order", () => {
   });
 });
 
+describe("Engine.validate", () => {
+  it("throws what submit would throw, and changes nothing either way", () => {
+    const engine = new Engine("TEST");
+    engine.submit(limit("bid", "buy", 99n, 1n));
+    const before = engine.snapshot();
+
+    expect(() => engine.validate(limit("bid", "buy", 100n, 1n))).toThrow(/already on the book/);
+    expect(() => engine.validate(limit("a", "buy", 0n, 1n))).toThrow(RangeError);
+    expect(() => engine.validate({ ...market("m", "buy", 1n), protectionPrice: 0n })).toThrow(
+      RangeError,
+    );
+    expect(() => engine.validate(limit("ask", "sell", 99n, 1n))).not.toThrow();
+    expect(engine.snapshot()).toEqual(before);
+    expect(engine.sequence).toBe(1);
+  });
+});
+
 describe("Engine.submit with a market order", () => {
   it("sweeps price levels in priority order regardless of price", () => {
     const engine = new Engine("TEST");

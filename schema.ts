@@ -3,9 +3,11 @@ import {
   bigint,
   check,
   index,
+  jsonb,
   numeric,
   pgEnum,
   pgTable,
+  primaryKey,
   smallint,
   text,
   timestamp,
@@ -211,4 +213,27 @@ export const trades = pgTable(
     check("trades_price_positive", sql`${table.price} > 0`),
     check("trades_quantity_positive", sql`${table.quantity} > 0`),
   ],
+);
+
+export const engineCommandType = pgEnum("engine_command_type", ["submit", "cancel"]);
+
+// The event log: every command a market's engine was given, written before the engine applies
+// it. Replaying a market's commands in sequence order into an empty engine rebuilds its book,
+// because the engine is deterministic. Rows are only ever appended.
+export const engineEvents = pgTable(
+  "engine_events",
+  {
+    market: text("market")
+      .notNull()
+      .references(() => markets.symbol),
+    // The number the command's first event gets. Every command emits at least one event, so
+    // no two commands in a market share one.
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    commandType: engineCommandType("command_type").notNull(),
+    // The command's arguments, amounts as decimal strings of minor units (see events.ts).
+    payload: jsonb("payload").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  // One writer per market: a second process appending to the same market collides here.
+  (table) => [primaryKey({ columns: [table.market, table.sequence] })],
 );

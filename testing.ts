@@ -84,9 +84,10 @@ export async function createTestMarket(
 }
 
 // Trades and orders on the test markets first, which also catches rows of users the file did
-// not create through uniqueEmail, then the markets themselves.
+// not create through uniqueEmail, then their event logs, then the markets themselves.
 async function deleteTestMarkets(pool: Pool, symbols: string[]): Promise<void> {
   await pool.query("delete from trades where market = any($1)", [symbols]);
+  await pool.query("delete from engine_events where market = any($1)", [symbols]);
   await pool.query("delete from orders where market = any($1)", [symbols]);
   await pool.query("delete from markets where symbol = any($1)", [symbols]);
 }

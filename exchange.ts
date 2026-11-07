@@ -4,6 +4,7 @@
 
 import type { Side } from "./book.ts";
 import { Engine, type EngineEvent, levelsTouched } from "./engine.ts";
+import { appendCommand, applyCommand, type Command, takerLimitOf } from "./events.ts";
 import type { Database } from "./ledger.ts";
 import {
   DuplicateOrderError,
@@ -12,7 +13,6 @@ import {
   type OrderRequest,
   protectionPrice,
   recordOrder,
-  worstPrice,
 } from "./orders.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 
@@ -57,15 +57,15 @@ function summarize(orderId: string, events: EngineEvent[]): PlacedOrder {
   };
 }
 
-// Fail-stop. A settlement that fails has already happened in the engine: the book has
-// matched, rested or removed orders, and the engine cannot undo that. Matching anything more
+// Fail-stop. A command whose settlement fails has already happened in the engine and the event
+// log: the book has matched, rested or removed orders, and neither can undo that. Matching anything more
 // against a book Postgres disagrees with would only spread the damage, so the market stops
 // and stays stopped until the process restarts. Other markets keep trading.
 export class MarketHaltedError extends Error {
   readonly market: string;
 
   constructor(market: string, options?: ErrorOptions) {
-    super(`market ${market} is halted after a failed settlement`, options);
+    super(`market ${market} is halted after a failed command`, options);
     this.name = "MarketHaltedError";
     this.market = market;
   }
@@ -141,7 +141,7 @@ export class Exchange {
     this.#maxPending = maxPendingCommands;
   }
 
-  // Called once per halt with the settlement's error. The server logs it at fatal.
+  // Called once per halt with the error that caused it. The server logs it at fatal.
   onHalt(listener: HaltListener): void {
     this.#haltListeners.push(listener);
   }
@@ -197,12 +197,10 @@ export class Exchange {
     const { id } = await recordOrder(this.#db, market, accepted);
 
     const { clientOrderId: _clientOrderId, ...order } = accepted;
-    const events = await this.#execute(
-      running,
-      market,
-      (engine) => engine.submit({ ...order, id }),
-      worstPrice(accepted),
-    );
+    const events = await this.#execute(running, market, {
+      type: "submit",
+      order: { ...order, id },
+    });
     return summarize(id, events);
   }
 
@@ -216,7 +214,7 @@ export class Exchange {
     }
 
     return this.#admitted(running, market.symbol, async () => {
-      const events = await this.#execute(running, market, (engine) => engine.cancel(orderId), null);
+      const events = await this.#execute(running, market, { type: "cancel", orderId });
       return events.some((event) => event.type === "cancelled") ? "cancelled" : "not_open";
     });
   }
@@ -242,36 +240,47 @@ export class Exchange {
     }
   }
 
-  // Runs one engine command and its settlement as one task in the market's queue, halting the
-  // market if the settlement fails. A command that throws inside the engine is not a reason to
-  // halt: the engine checks its input before changing the book.
-  #execute(
-    running: RunningMarket,
-    market: Market,
-    command: (engine: Engine) => EngineEvent[],
-    takerLimit: bigint | null,
-  ): Promise<EngineEvent[]> {
+  // Runs one engine command as one task in the market's queue: write it to the event log,
+  // apply it to the engine, settle what it did. Input the engine would refuse is refused before
+  // the log, without halting, since nothing has changed yet. After the log write, any failure
+  // halts the market: the log, the book and Postgres no longer agree on what has happened.
+  #execute(running: RunningMarket, market: Market, command: Command): Promise<EngineEvent[]> {
     return running.queue.run(async () => {
       // Commands queued before the halt are refused too. An order among them stays pending
-      // and reserved, like the one whose settlement failed, until Session 10's recovery.
+      // and reserved, like the one whose settlement failed, until recovery on restart.
       if (running.halted) {
         throw new MarketHaltedError(market.symbol);
       }
-      const events = command(running.engine);
-      const settledAt = new Date();
-      let settled;
+      if (command.type === "submit") {
+        running.engine.validate(command.order);
+      }
+      // Write-ahead: once the row commits, the command has happened, whatever fails next.
+      // Recovery replays it and settles what it did.
       try {
-        settled = await settle(this.#db, market, events, takerLimit, settledAt);
+        await appendCommand(this.#db, market.symbol, running.engine.sequence + 1, command);
       } catch (error) {
-        running.halted = true;
-        for (const listener of this.#haltListeners) {
-          listener(market.symbol, error);
-        }
-        throw new MarketHaltedError(market.symbol, { cause: error });
+        throw this.#halt(running, market.symbol, error);
+      }
+      let events: EngineEvent[];
+      let settled: SettledOrder[];
+      const settledAt = new Date();
+      try {
+        events = applyCommand(running.engine, command);
+        settled = await settle(this.#db, market, events, takerLimitOf(command), settledAt);
+      } catch (error) {
+        throw this.#halt(running, market.symbol, error);
       }
       this.#announce(running.engine, market, events, settled, settledAt);
       return events;
     });
+  }
+
+  #halt(running: RunningMarket, symbol: string, error: unknown): MarketHaltedError {
+    running.halted = true;
+    for (const listener of this.#haltListeners) {
+      listener(symbol, error);
+    }
+    return new MarketHaltedError(symbol, { cause: error });
   }
 
   // Every command emits at least one event (a cancel of a missing order emits a rejection),

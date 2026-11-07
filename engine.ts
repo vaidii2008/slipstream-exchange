@@ -118,8 +118,9 @@ export class Engine {
     return this.#stamp(this.#match(order));
   }
 
-  #match(order: NewOrder): EventBody[] {
-    // The worst price the order may trade at, if it has one.
+  // Throws exactly when submit would, without changing anything. The exchange calls it before
+  // writing the order to the event log, so a logged order never fails in the engine.
+  validate(order: NewOrder): void {
     const limit = order.type === "limit" ? order.price : order.protectionPrice;
     if (order.quantity <= 0n || (limit !== undefined && limit <= 0n)) {
       throw new RangeError(`order ${order.id} needs a positive price and quantity`);
@@ -128,6 +129,12 @@ export class Engine {
     if (this.#book.has(order.id)) {
       throw new Error(`order ${order.id} is already on the book`);
     }
+  }
+
+  #match(order: NewOrder): EventBody[] {
+    this.validate(order);
+    // The worst price the order may trade at, if it has one.
+    const limit = order.type === "limit" ? order.price : order.protectionPrice;
 
     const events: EventBody[] = [];
     const makerSide = opposite(order.side);

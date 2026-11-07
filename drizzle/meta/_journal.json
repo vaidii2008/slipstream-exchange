@@ -64,6 +64,13 @@
       "when": 1794011055826,
       "tag": "0008_index_trades_by_market_and_time",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794020026056,
+      "tag": "0009_create_engine_events",
+      "breakpoints": true
     }
   ]
 }
