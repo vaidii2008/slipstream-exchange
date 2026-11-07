@@ -10,7 +10,9 @@ import { engineEvents } from "./schema.ts";
 
 export type Command = { type: "submit"; order: NewOrder } | { type: "cancel"; orderId: string };
 
-export type LoggedCommand = { sequence: number; command: Command };
+// `loggedAt` is when the command was appended: the time recovery records on any trade it
+// settles for the command, since that is when the trade happened.
+export type LoggedCommand = { sequence: number; command: Command; loggedAt: Date };
 
 export function applyCommand(engine: Engine, command: Command): EngineEvent[] {
   return command.type === "submit" ? engine.submit(command.order) : engine.cancel(command.orderId);
@@ -112,6 +114,7 @@ export async function readLog(db: Database, market: string): Promise<LoggedComma
       sequence: engineEvents.sequence,
       commandType: engineEvents.commandType,
       payload: engineEvents.payload,
+      createdAt: engineEvents.createdAt,
     })
     .from(engineEvents)
     .where(eq(engineEvents.market, market))
@@ -119,6 +122,7 @@ export async function readLog(db: Database, market: string): Promise<LoggedComma
   return rows.map((row) => ({
     sequence: row.sequence,
     command: decode(row.commandType, row.payload),
+    loggedAt: row.createdAt,
   }));
 }
 

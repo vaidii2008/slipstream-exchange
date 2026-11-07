@@ -21,6 +21,7 @@ import {
   protectionPrice,
   recordOrder,
 } from "./orders.ts";
+import { type Recovered, recover } from "./recovery.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
@@ -127,7 +128,11 @@ type RunningMarket = {
   queue: SerialQueue;
   halted: boolean;
   pending: number;
+  // What recovery finished when the market opened; zero for a market that failed to open.
+  recovered: Recovered;
 };
+
+export type OpenedMarket = { market: string; sequence: number; halted: boolean } & Recovered;
 
 // One engine and one queue per market. The books live in this process's memory and are
 // rebuilt from the event log when a market opens: on its first command, or at boot for every
@@ -235,11 +240,16 @@ export class Exchange {
 
   // Opens every market before the process takes traffic, so the first order in each does not
   // wait for its replay and the book served from the start is the rebuilt one.
-  async open(markets: Market[]): Promise<{ market: string; sequence: number; halted: boolean }[]> {
+  async open(markets: Market[]): Promise<OpenedMarket[]> {
     return Promise.all(
       markets.map(async (market) => {
         const running = await this.#open(market);
-        return { market: market.symbol, sequence: running.engine.sequence, halted: running.halted };
+        return {
+          market: market.symbol,
+          sequence: running.engine.sequence,
+          halted: running.halted,
+          ...running.recovered,
+        };
       }),
     );
   }
@@ -256,17 +266,22 @@ export class Exchange {
     return opening;
   }
 
-  // A log that cannot be read or replayed halts the market rather than open it with a book
-  // that is not its history. Other markets open as normal.
+  // Rebuilds the book from the log, then finishes what a crash interrupted (recovery.ts). A
+  // log that cannot be replayed, a settlement that fails again or a book that disagrees with
+  // Postgres halts the market rather than open it on a book that is not its history. Other
+  // markets open as normal.
   async #replay(market: Market): Promise<RunningMarket> {
     const running: RunningMarket = {
       engine: new Engine(market.symbol),
       queue: new SerialQueue(),
       halted: false,
       pending: 0,
+      recovered: { settled: 0, cancelled: 0 },
     };
     try {
-      replay(running.engine, await readLog(this.#db, market.symbol));
+      const log = await readLog(this.#db, market.symbol);
+      const replayed = replay(running.engine, log);
+      running.recovered = await recover(this.#db, market, running.engine, log, replayed);
     } catch (error) {
       this.#halt(running, market.symbol, error);
     }
