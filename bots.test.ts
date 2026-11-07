@@ -348,7 +348,8 @@ describe("risk limits", () => {
     expect(agent.killReason).toBe("lost 60000000000 quote minor units, limit 50000000000");
     expect(ticks).toBe(ticksAtKill);
     const { api, market } = agent.context;
-    expect(await api.openOrders(market)).toEqual([]);
+    // The status turns killed before the kill switch's cancels go out, so they are waited for.
+    await expect.poll(() => api.openOrders(market)).toEqual([]);
     await expect(api.place(market, bid(10_000n))).resolves.toMatchObject({
       error: "risk_killed",
     });
