@@ -1,0 +1,11 @@
+# Prometheus's scrape config, mounted into the compose service. The API runs on the host, not
+# in compose, so Prometheus reaches it through Docker's name for the host machine.
+global:
+  # Every 5 s rather than the default minute, so a load run of a few minutes has enough
+  # points to draw rates and percentiles from.
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: slipstream-api
+    static_configs:
+      - targets: ["host.docker.internal:3000"]

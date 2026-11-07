@@ -28,5 +28,23 @@ services:
       timeout: 2s
       retries: 15
 
+  # Scrapes the API's /metrics; open http://localhost:9090 to query it.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    # Docker Desktop defines host.docker.internal itself; Linux needs it mapped to the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
 volumes:
   postgres-data:
+  prometheus-data:
