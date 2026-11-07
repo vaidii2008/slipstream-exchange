@@ -352,23 +352,21 @@ describe("the candles channel", () => {
     await exchange.placeOrder(market, limit(buyer, "buy", "61000", "0.2"));
     const second = (await client.next()) as Record<string, unknown>;
 
-    // The server carried on the latest candle in Postgres at boot, and other test files
-    // trade BTC-USD too, so the candle may hold trades before ours. What ours must do to it:
+    // The market is this test's own, so the candle holds exactly our trades.
     expect(first).toMatchObject({
       type: "candle",
       market: market.symbol,
       start: expect.stringMatching(/:00\.000Z$/) as unknown,
+      open: "60100.00000000",
+      high: "60100.00000000",
+      low: "60000.00000000",
       close: "60000.00000000",
+      trades: 2,
     });
-    expect(Number(first.high)).toBeGreaterThanOrEqual(60100);
-    expect(Number(first.low)).toBeLessThanOrEqual(60000);
-    expect(first.trades).toBeGreaterThanOrEqual(2);
     if (second.start === first.start) {
       expect(second).toMatchObject({
         open: first.open,
-        // The candle loaded at boot may already be higher, if the dev API traded above 61,000
-        // in this minute.
-        high: Number(first.high) > 61000 ? first.high : "61000.00000000",
+        high: "61000.00000000",
         low: first.low,
         close: "61000.00000000",
         trades: (first.trades as number) + 1,
