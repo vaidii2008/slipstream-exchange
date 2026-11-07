@@ -1389,3 +1389,97 @@ to it, the account channel is the piece to split out.
 - `feat(events): append every engine command to the event log before applying it`
 - `feat(engine): rebuild books on boot from a full event-log replay`
 - `test(recovery): kill the process mid-load and prove the rebuilt book is identical`
+
+## Day 14 — Durability and recovery
+
+**Commits landed (14)**
+
+- `test: run the suite against its own slipstream_test database`
+- `fix(bots): value equity at the median of the last 20 trade prices`
+- `test: give every exchange under test its own market`
+- `test(ws): restore the exact candle high in the candle stream test`
+- `feat(events): append every engine command to the event log before applying it`
+- `feat(orders): record a market order's protection price`
+- `feat(engine): rebuild books on first use from a full event-log replay`
+- `test(bots): wait for the kill switch's cancels before checking open orders`
+- `feat(recovery): settle interrupted commands and cancel orders that never reached the log`
+- `feat(db): restore the unique trade sequence per market`
+- `fix(recovery): do not count a rejected cancel as a settlement`
+- `test(recovery): kill the process mid-load and prove the rebuilt book is identical`
+- `docs: record the durability decisions and the Session 10 interview note`
+- `docs: record day 14 in PROGRESS.md`
+
+**What now works**
+
+- Tests run on `slipstream_test`, created and migrated by Vitest's global setup. The name is
+  `DATABASE_URL`'s with `_test` appended, so no setting can point a test run at the dev
+  database. Every exchange under test trades a market of its own (`BTC-USD-1a2b3c4d`), which
+  cleanup deletes. The candle assertion loosened in `7c440d8` is exact again, and the fleet
+  test runs with its shipped loss limits.
+- Bot equity is marked at the median of the last 20 trades. A trade at 60,000 on top of
+  nineteen at 70,000 no longer kills a maker; the test fails when equity uses the last trade.
+- Every engine command is appended to `engine_events` (migration `0009`) inside the market's
+  queue before the engine applies it. A failed log write halts the market.
+- A market opens by replaying its whole log into a fresh engine: same book, same FIFO order,
+  sequences carry on. `main.ts` opens every market before it listens and logs the result.
+- Recovery then settles the commands past the settled frontier, cancels and releases orders
+  that never reached the log, and halts the market if the rebuilt book disagrees with the
+  open orders in Postgres. Unlogged orders are cancelled, not resubmitted, because their
+  clients were never told they were accepted. `orders.protection_price` (migration `0010`)
+  records what a market buy reserved against.
+- Trades are unique on (market, engine_sequence) again (migration `0011`). Settling a command
+  twice fails with 23505 and changes no balance.
+- Kill test, three runs: the child process reported 301 to 303 commands before the SIGKILL,
+  had logged one more than it reported (the blocked settlement), and left 1, 3 and 4 orders
+  unlogged. Each time, the log up to the last reported command replayed to the exact book
+  the process printed. The restart settled 1 command, cancelled the unlogged orders, and
+  rested exactly Postgres's 34 to 49 open orders. The ledger summed to zero, and every user's
+  reserved balance equalled their open orders. 10 of 10 repeat runs passed.
+- Live run on the recreated dev database: the API was `kill -9`ed with the fleet trading
+  (BTC-USD at sequence 571, ETH-USD at 536) and restarted. Both books came back with their 18
+  and 17 open orders, nothing needed settling or cancelling, and trading carried on to 947
+  and 849. The bots logged 7 failed ticks during the restart and none were killed. After the
+  fleet stopped: 0 open, 0 pending, and BTC, ETH and USD each sum to zero.
+- 426 tests in 33 files, up from 403 in 31.
+
+**What is stubbed**
+
+- A boot replays each market's whole log (snapshots were cut on 6 Nov). Boot time grows with
+  the log and has not been measured.
+- Commands settled during recovery are not announced on the feed. Clients get them through a
+  fresh snapshot, and candles load from Postgres when the server starts listening.
+- A command that throws in the engine after being logged halts the market, and replay will
+  throw on it again, so that market will not open until someone repairs the log. Validation
+  before the append makes this a bug, not an input.
+- `orders.test.ts` still records pending orders on the seeded BTC-USD in the test database.
+  No test opens that market, so recovery never cancels them mid-test.
+- Carried over: the browser click-through with the fleet running, drizzle-kit's dev-only audit
+  findings, the web dependencies' moderate audit findings, Safari unchecked.
+
+**Decisions and deviations from the plan**
+
+- The dev database was recreated (approved): restarts had left 86 duplicate trade sequences
+  that the restored constraint rejects, and 68 orders open with no log behind them.
+- Tests get a market per exchange rather than a database per file (approved). See
+  `DECISIONS.md`.
+- `orders.protection_price` is a new column, approved this session.
+- Markets open lazily on first use as well as at boot, so tests need no extra call, and a
+  market added while the process runs still replays before it takes an order.
+
+**Repo shape**
+
+- `testdb.ts`. Pressure: Vitest's global setup must be its own module, and `testing.ts` needs
+  the same URL. `vitest.config.ts` is the framework's file.
+- `events.ts`. Pressure: the log's format changes for its own reasons, and the exchange, replay
+  and recovery all read it; `exchange.ts` was past 300 lines.
+- `recovery.ts`. Pressure: what a crash can leave behind changes for different reasons than the
+  queue, and `exchange.ts` was at 381 lines.
+- `recovery.child.ts`. Pressure: the kill test needs a process of its own to SIGKILL.
+
+**Next: Day 15 — Measure it**
+
+- Click through the terminal in a browser with the fleet running.
+- `feat(metrics): expose orders/sec, trades/sec, socket connections and match latency`
+- `chore(ops): add Prometheus to compose scraping /metrics`
+- `test(load): add k6 scripts for order placement and socket subscribers`
+- `docs: record match latency percentiles and sustained throughput from a real run`
