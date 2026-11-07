@@ -365,12 +365,15 @@ describe("a process killed mid-load", () => {
           return books.length >= 300;
         });
 
-        // Hold every reserved account. The next command that trades or cancels is logged and
-        // applied, then its settlement waits here; the other users' orders are reserved and
-        // recorded behind it, and wait in the queue without being logged.
+        // Hold every user's BTC available account. A settlement locks every account it touches,
+        // and every trade credits the buyer's BTC available, so the next command that trades
+        // (or cancels a sell) is logged and applied, then its settlement waits here. A buy
+        // reserves USD, which is not held, so buys are reserved and recorded behind it and
+        // wait in the queue without being logged.
         await lock.query("begin");
         await lock.query(
-          "select id from ledger_accounts where user_id = any($1) and bucket = 'reserved' for update",
+          `select id from ledger_accounts
+           where user_id = any($1) and asset = 'BTC' and bucket = 'available' for update`,
           [userIds],
         );
         const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");

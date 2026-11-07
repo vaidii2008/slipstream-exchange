@@ -507,6 +507,66 @@ describe("Exchange.placeOrder", () => {
     await expect(balanceOf(second, "USD")).resolves.toMatchObject({ reserved: 0n });
   });
 
+  // Eight users placing crossing orders and cancelling them in two markets at once: reserves as
+  // orders arrive, releases when they are cancelled or fill below their limit, trades between
+  // them. Every account those touch is locked and its cached balance moved by its entries.
+  it("keeps every cached balance equal to its entries under concurrent reserves, releases and trades", async () => {
+    const exchange = new Exchange(db);
+    const traders = await Promise.all(
+      Array.from({ length: 8 }, () => funded({ USD: "1000000", BTC: "10", ETH: "100" })),
+    );
+    // A fixed-seed generator, so a failure names the same mix of orders on the next run as
+    // far as the interleaving allows.
+    let seed = 42;
+    const pick = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+      return seed % n;
+    };
+
+    await Promise.all(
+      traders.map(async (userId, t) => {
+        const resting: { market: Market; id: string }[] = [];
+        for (let i = 0; i < 25; i++) {
+          if (resting.length > 0 && pick(4) === 0) {
+            const [order] = resting.splice(pick(resting.length), 1);
+            await exchange.cancelOrder(order!.market, order!.id);
+            continue;
+          }
+          const market = (i + t) % 2 === 0 ? btcUsd : ethUsd;
+          const mid = market === btcUsd ? 60_000 : 3_000;
+          const side = pick(2) === 0 ? "buy" : "sell";
+          const placed = await exchange.placeOrder(
+            market,
+            limit(userId, side, String(mid + pick(11) - 5), market === btcUsd ? "0.01" : "0.1"),
+          );
+          if (placed.status === "open") {
+            resting.push({ market, id: placed.id });
+          }
+        }
+      }),
+    );
+
+    const activity = await db.execute<{ trades: number; cancelled: number }>(sql`
+      select
+        (select count(*)::int from ${trades} where market in (${btcUsd.symbol}, ${ethUsd.symbol}))
+          as trades,
+        (select count(*)::int from ${orders}
+          where market in (${btcUsd.symbol}, ${ethUsd.symbol}) and status = 'cancelled')
+          as cancelled`);
+    expect(activity.rows[0]?.trades).toBeGreaterThan(0);
+    expect(activity.rows[0]?.cancelled).toBeGreaterThan(0);
+
+    // Every account in the database, in one statement, so other test files posting at the
+    // same time cannot show a half-applied change.
+    const drifted = await db.execute<{ id: number; cached: string; summed: string }>(sql`
+      select a.id, a.balance::text as cached, coalesce(e.total, 0)::text as summed
+      from ledger_accounts a
+      left join (select account_id, sum(amount) as total from ledger_entries group by account_id) e
+        on e.account_id = a.id
+      where a.balance <> coalesce(e.total, 0)`);
+    expect(drifted.rows).toEqual([]);
+  });
+
   it("leaves every asset's ledger summing to zero", async () => {
     const totals = await db.execute<{ asset: string; total: string }>(sql`
       select a.asset, sum(e.amount)::text as total

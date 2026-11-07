@@ -85,6 +85,13 @@
       "when": 1794020600235,
       "tag": "0011_restore_unique_trade_sequence",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794031717346,
+      "tag": "0012_cache_account_balances",
+      "breakpoints": true
     }
   ]
 }

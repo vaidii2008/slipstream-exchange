@@ -10,7 +10,7 @@ import {
   reserve,
 } from "./ledger.ts";
 import { fromNumeric } from "./money.ts";
-import { ledgerEntries, users } from "./schema.ts";
+import { ledgerAccounts, ledgerEntries, users } from "./schema.ts";
 import { useTestServer } from "./testing.ts";
 
 const { db, uniqueEmail } = useTestServer();
@@ -34,6 +34,21 @@ async function entriesOf(accountId: number, scale: number): Promise<bigint[]> {
     .where(eq(ledgerEntries.accountId, accountId))
     .orderBy(ledgerEntries.id);
   return rows.map((row) => fromNumeric(row.amount, scale));
+}
+
+// An account's cached balance and the sum of its entries, read in one statement so both
+// describe the same moment even while other test files post to the same system account.
+async function cachedAndSummed(accountId: number) {
+  const result = await db.execute<{ cached: string; summed: string }>(sql`
+    select a.balance::text as cached,
+      (select coalesce(sum(e.amount), 0) from ${ledgerEntries} e where e.account_id = a.id)::text
+        as summed
+    from ${ledgerAccounts} a where a.id = ${accountId}`);
+  const [row] = result.rows;
+  if (row === undefined) {
+    throw new Error(`no ledger account ${accountId}`);
+  }
+  return { cached: fromNumeric(row.cached, 8), summed: fromNumeric(row.summed, 8) };
 }
 
 async function expectLedgerError(promise: Promise<unknown>, code: string): Promise<void> {
@@ -383,5 +398,101 @@ describe("concurrent reservations", () => {
     expect((usd?.available ?? 0n) + (usd?.reserved ?? 0n)).toBe(1_000n);
     // Each deadlock costs Postgres's 1s deadlock_timeout before it is detected, so a
     // regression needs room to report 40P01 instead of timing out.
+  }, 30_000);
+});
+
+describe("the cached balance", () => {
+  it("moves with every posting and always equals the account's entries", async () => {
+    const buyer = await createUser();
+    const seller = await createUser();
+    await deposit(db, buyer, "USD", 1_000n);
+    await deposit(db, seller, "BTC", 50n);
+    await reserve(db, buyer, "USD", 600n);
+    await reserve(db, seller, "BTC", 20n);
+    // A fill of 20 at 25 against a reservation of 600: 500 to the seller, 100 back.
+    const account = (userId: string, asset: string, bucket: "available" | "reserved") =>
+      openAccount(db, userId, asset, bucket);
+    await postTransaction(db, "trade", [
+      { accountId: await account(seller, "BTC", "reserved"), amount: -20n },
+      { accountId: await account(buyer, "BTC", "available"), amount: 20n },
+      { accountId: await account(buyer, "USD", "reserved"), amount: -600n },
+      { accountId: await account(seller, "USD", "available"), amount: 500n },
+      { accountId: await account(buyer, "USD", "available"), amount: 100n },
+    ]);
+
+    const expected: [string, string, "available" | "reserved", bigint][] = [
+      [buyer, "USD", "available", 500n],
+      [buyer, "USD", "reserved", 0n],
+      [buyer, "BTC", "available", 20n],
+      [seller, "BTC", "available", 30n],
+      [seller, "BTC", "reserved", 0n],
+      [seller, "USD", "available", 500n],
+    ];
+    for (const [userId, asset, bucket, balance] of expected) {
+      await expect(cachedAndSummed(await account(userId, asset, bucket))).resolves.toEqual({
+        cached: balance,
+        summed: balance,
+      });
+    }
+    for (const asset of ["USD", "BTC"]) {
+      const system = await openAccount(db, null, asset, "available");
+      const { cached, summed } = await cachedAndSummed(system);
+      expect(cached).toBe(summed);
+    }
+  });
+
+  it("is untouched by a transaction that is refused", async () => {
+    const userId = await createUser();
+    await deposit(db, userId, "BTC", 100n);
+    const available = await openAccount(db, userId, "BTC", "available");
+
+    await expectLedgerError(reserve(db, userId, "BTC", 101n), "insufficient_funds");
+
+    await expect(cachedAndSummed(available)).resolves.toEqual({ cached: 100n, summed: 100n });
+  });
+
+  // Each trade touches all four of the two users' BTC accounts, listed in opposite orders by
+  // the two directions. Credited accounts are locked too now, so locking in the order the
+  // postings list them would deadlock; id order cannot.
+  it("runs trades in opposite directions between two users in parallel without deadlocking", async () => {
+    const first = await createUser();
+    const second = await createUser();
+    for (const userId of [first, second]) {
+      await deposit(db, userId, "BTC", 1_000n);
+      await reserve(db, userId, "BTC", 1_000n);
+    }
+    const reservedOf = (userId: string) => openAccount(db, userId, "BTC", "reserved");
+    const availableOf = (userId: string) => openAccount(db, userId, "BTC", "available");
+    const pay = async (from: string, to: string) =>
+      postTransaction(db, "trade", [
+        { accountId: await reservedOf(from), amount: -10n },
+        { accountId: await availableOf(to), amount: 10n },
+        { accountId: await availableOf(from), amount: 1n },
+        { accountId: await reservedOf(to), amount: -1n },
+      ]);
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? pay(first, second) : pay(second, first))),
+    );
+
+    const failures = outcomes.flatMap((outcome) => {
+      if (outcome.status === "fulfilled") {
+        return [];
+      }
+      const reason = outcome.reason as { code?: string; cause?: { code?: string } };
+      return [reason.code ?? reason.cause?.code ?? String(outcome.reason)];
+    });
+    expect(failures).toEqual([]);
+    for (const userId of [first, second]) {
+      await expect(cachedAndSummed(await reservedOf(userId))).resolves.toEqual({
+        cached: 780n,
+        summed: 780n,
+      });
+      await expect(cachedAndSummed(await availableOf(userId))).resolves.toEqual({
+        cached: 220n,
+        summed: 220n,
+      });
+    }
+    // Room for a deadlock to be detected and reported as 40P01 rather than time out.
   }, 30_000);
 });

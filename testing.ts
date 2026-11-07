@@ -16,7 +16,8 @@ export const TEST_SECRET = "t".repeat(32);
 
 // Neither the ledger nor orders cascade, so test users' trading rows go first: trades, then
 // orders, then the ledger. Whole ledger transactions are removed, system-account side
-// included, which leaves every remaining transaction balanced.
+// included, which leaves every remaining transaction balanced and every cached balance equal
+// to its account's entries.
 async function deleteTradingHistory(pool: Pool, emails: string[]): Promise<void> {
   const client = await pool.connect();
   try {
@@ -39,6 +40,25 @@ async function deleteTradingHistory(pool: Pool, emails: string[]): Promise<void>
          join users u on u.id = a.user_id
          where u.email = any($1)`,
       [emails],
+    );
+    // The system accounts outlive the test, so their cached balances lose exactly what their
+    // deleted entries had added. Locked in id order first, like any posting, so two files
+    // cleaning up at once cannot deadlock on the system rows.
+    await client.query(
+      `create temporary table doomed_totals on commit drop as
+         select e.account_id as id, sum(e.amount) as total
+         from ledger_entries e
+         join ledger_accounts a on a.id = e.account_id
+         where e.transaction_id in (select id from doomed_transactions) and a.user_id is null
+         group by e.account_id`,
+    );
+    await client.query(
+      `select a.id from ledger_accounts a join doomed_totals d on d.id = a.id
+       order by a.id for no key update of a`,
+    );
+    await client.query(
+      `update ledger_accounts a set balance = a.balance - d.total
+       from doomed_totals d where d.id = a.id`,
     );
     await client.query(
       "delete from ledger_entries where transaction_id in (select id from doomed_transactions)",

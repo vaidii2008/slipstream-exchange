@@ -89,6 +89,10 @@ export const ledgerAccounts = pgTable(
       .notNull()
       .references(() => assets.code),
     bucket: ledgerBucket("bucket").notNull(),
+    // A cache of the sum of this account's entries, kept for speed: checking a debit no longer
+    // reads the account's whole history. The entries stay the source of truth. postTransaction
+    // changes this in the same transaction as the entries it adds, under the account's lock.
+    balance: money("balance").notNull().default("0"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [

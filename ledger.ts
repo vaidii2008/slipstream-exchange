@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, max, sum } from "drizzle-orm";
+import { and, eq, inArray, isNull, max, sql, sum } from "drizzle-orm";
 import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import { formatAmount, fromNumeric } from "./money.ts";
@@ -77,32 +77,55 @@ export async function openAccount(
   return raced.id;
 }
 
-// Locks accounts that are about to be debited, until the enclosing transaction ends. Locks
-// are always taken in ascending id order, whatever order the caller lists them in, so two
-// transactions debiting the same accounts queue instead of deadlocking. A caller about to
-// post several transactions in one commit locks the union first: posting them one by one
-// would take each one's locks in turn, and two such callers could take them in opposite
-// orders. Locking an account this transaction already holds returns at once.
+export type LockedAccount = {
+  id: number;
+  userId: string | null;
+  asset: string;
+  scale: number;
+  // The cached balance as of the lock, at the asset's scale.
+  balance: bigint;
+};
+
+// Locks accounts that are about to change, until the enclosing transaction ends, and returns
+// each one's cached balance as it stands once locked. Every account a transaction touches is
+// locked, debited or credited: updating the cached balance takes the row's lock anyway, and
+// taking it here, all at once, keeps the order under our control. Locks are taken in
+// ascending id order, whatever order the caller lists them in, so two transactions touching
+// the same accounts queue instead of deadlocking. A caller about to post several transactions
+// in one commit locks the union first: posting them one by one would take each one's locks in
+// turn, and two such callers could take them in opposite orders. Locking an account this
+// transaction already holds returns at once.
 //
 // NO KEY UPDATE, not UPDATE: inserting an entry makes Postgres take FOR KEY SHARE on the
-// account it references, for the foreign-key check, and FOR UPDATE blocks that. A reserve
-// (locks available, inserts into reserved) and a release (the reverse) would each wait on
-// the other's row. NO KEY UPDATE still conflicts with itself, so two debits of one account
-// still queue.
-export async function lockAccounts(db: Database, accountIds: number[]): Promise<void> {
+// account it references, for the foreign-key check, and FOR UPDATE blocks that. NO KEY UPDATE
+// is also the lock the balance update itself takes, and it conflicts with itself, so two
+// transactions changing one account still queue.
+//
+// The row is read by the locking statement itself. Under READ COMMITTED a row lock that had
+// to wait returns the row as the previous holder committed it, so the balance is current.
+export async function lockAccounts(db: Database, accountIds: number[]): Promise<LockedAccount[]> {
   if (accountIds.length === 0) {
-    return;
+    return [];
   }
-  await db
-    .select({ id: ledgerAccounts.id })
+  const rows = await db
+    .select({
+      id: ledgerAccounts.id,
+      userId: ledgerAccounts.userId,
+      asset: ledgerAccounts.asset,
+      scale: assets.scale,
+      balance: ledgerAccounts.balance,
+    })
     .from(ledgerAccounts)
+    .innerJoin(assets, eq(assets.code, ledgerAccounts.asset))
     .where(inArray(ledgerAccounts.id, accountIds))
     .orderBy(ledgerAccounts.id)
-    .for("no key update");
+    .for("no key update", { of: ledgerAccounts });
+  return rows.map((row) => ({ ...row, balance: fromNumeric(row.balance, row.scale) }));
 }
 
-// Writes one transaction and all its entries, or nothing. The asset of each posting comes
-// from the database, not the caller, so a caller cannot balance BTC against USD by mislabelling.
+// Writes one transaction and all its entries, and moves each account's cached balance by its
+// entries, or does nothing. The asset of each posting comes from the database, not the caller,
+// so a caller cannot balance BTC against USD by mislabelling.
 export async function postTransaction(
   db: Database,
   kind: TransactionKind,
@@ -116,17 +139,12 @@ export async function postTransaction(
   }
 
   return db.transaction(async (tx) => {
-    const accountIds = [...new Set(postings.map((posting) => posting.accountId))];
-    const accounts = await tx
-      .select({
-        id: ledgerAccounts.id,
-        userId: ledgerAccounts.userId,
-        asset: ledgerAccounts.asset,
-        scale: assets.scale,
-      })
-      .from(ledgerAccounts)
-      .innerJoin(assets, eq(assets.code, ledgerAccounts.asset))
-      .where(inArray(ledgerAccounts.id, accountIds));
+    // Every account the postings name, the system account included. A deposit therefore
+    // queues on its asset's system account; deposits are rare next to orders, and leaving
+    // that one row out would make its cached balance the one that is not its entries' sum.
+    const accounts = await lockAccounts(tx, [
+      ...new Set(postings.map((posting) => posting.accountId)),
+    ]);
     const accountsById = new Map(accounts.map((account) => [account.id, account]));
 
     const totals = new Map<string, bigint>();
@@ -147,38 +165,22 @@ export async function postTransaction(
       }
     }
 
-    // Only a user account that loses money can be overdrawn, so only those are locked and
-    // checked. The system account may go negative, and skipping it keeps every deposit of an
-    // asset from queueing on one row.
-    const debited = [...netChange]
-      .filter(([id, change]) => change < 0n && accountsById.get(id)?.userId !== null)
-      .map(([id]) => id);
-
-    if (debited.length > 0) {
-      await lockAccounts(tx, debited);
-
-      // A new statement after the lock, so under READ COMMITTED it sees every entry committed
-      // by whoever held the lock before us.
-      const sums = await tx
-        .select({ accountId: ledgerEntries.accountId, total: sum(ledgerEntries.amount) })
-        .from(ledgerEntries)
-        .where(inArray(ledgerEntries.accountId, debited))
-        .groupBy(ledgerEntries.accountId);
-      const balanceOf = new Map(sums.map((row) => [row.accountId, row.total ?? "0"]));
-
-      for (const id of debited) {
-        const account = accountsById.get(id);
-        const change = netChange.get(id);
-        if (account === undefined || change === undefined) {
-          throw new Error(`debited account ${id} missing from its own lookup`);
-        }
-        const balance = fromNumeric(balanceOf.get(id) ?? "0", account.scale);
-        if (balance + change < 0n) {
-          throw new LedgerError(
-            "insufficient_funds",
-            `account ${id} holds ${balance} ${account.asset}, cannot take ${-change}`,
-          );
-        }
+    // Only a user account that loses money can be overdrawn. The system account may go
+    // negative: it is minus everything ever deposited.
+    const changes: { account: LockedAccount; change: bigint }[] = [];
+    for (const [id, change] of netChange) {
+      const account = accountsById.get(id);
+      if (account === undefined) {
+        throw new Error(`posted account ${id} missing from its own lookup`);
+      }
+      if (account.userId !== null && account.balance + change < 0n) {
+        throw new LedgerError(
+          "insufficient_funds",
+          `account ${id} holds ${account.balance} ${account.asset}, cannot take ${-change}`,
+        );
+      }
+      if (change !== 0n) {
+        changes.push({ account, change });
       }
     }
 
@@ -193,6 +195,19 @@ export async function postTransaction(
     await tx
       .insert(ledgerEntries)
       .values(rows.map((row) => ({ ...row, transactionId: transaction.id })));
+
+    // One statement for every account, relative to the stored value rather than the one read
+    // under the lock, so it is right even if this transaction already moved the account.
+    if (changes.length > 0) {
+      const values = changes.map(
+        ({ account, change }) =>
+          sql`(${account.id}::bigint, ${formatAmount(change, account.scale)}::numeric)`,
+      );
+      await tx.execute(sql`
+        update ${ledgerAccounts} set balance = ${ledgerAccounts.balance} + v.change
+        from (values ${sql.join(values, sql`, `)}) as v(id, change)
+        where ${ledgerAccounts.id} = v.id`);
+    }
 
     return transaction.id;
   });
@@ -267,8 +282,9 @@ export type Balance = {
   reserved: bigint;
 };
 
-// Every listed asset, zero where the user has no entries. Summed from the entries on every
-// read; there is no stored balance that could drift from them.
+// Every listed asset, zero where the user has no entries. Summed from the entries, the source
+// of truth, not read from the cached balance: a read takes no lock and is off the order path,
+// and accountState's version needs the entries anyway.
 export async function balancesOf(db: Database, userId: string): Promise<Balance[]> {
   return (await accountState(db, userId)).balances;
 }

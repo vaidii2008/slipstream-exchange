@@ -181,12 +181,10 @@ export async function settle(
       }
     }
 
-    // Every account this command debits, locked once in id order before any posting. See
-    // lockAccounts for why posting them one by one could deadlock across markets.
-    const debited = ledgerWork.flatMap((work) =>
-      work.postings.filter((posting) => posting.amount < 0n).map((posting) => posting.accountId),
-    );
-    await lockAccounts(tx, [...new Set(debited)]);
+    // Every account this command touches, debited or credited, locked once in id order before
+    // any posting. See lockAccounts for why posting them one by one could deadlock.
+    const touched = ledgerWork.flatMap((work) => work.postings.map((posting) => posting.accountId));
+    await lockAccounts(tx, [...new Set(touched)]);
 
     for (const work of ledgerWork) {
       await postTransaction(tx, work.kind, work.postings);
