@@ -369,11 +369,14 @@ describe("a process killed mid-load", () => {
         // and every trade credits the buyer's BTC available, so the next command that trades
         // (or cancels a sell) is logged and applied, then its settlement waits here. A buy
         // reserves USD, which is not held, so buys are reserved and recorded behind it and
-        // wait in the queue without being logged.
+        // wait in the queue without being logged. Locked in id order, like every settlement:
+        // in any other order this lock and a running settlement can each hold a row the other
+        // is waiting for, and Postgres kills one of them as a deadlock.
         await lock.query("begin");
         await lock.query(
           `select id from ledger_accounts
-           where user_id = any($1) and asset = 'BTC' and bucket = 'available' for update`,
+           where user_id = any($1) and asset = 'BTC' and bucket = 'available'
+           order by id for update`,
           [userIds],
         );
         const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");
