@@ -1,0 +1,1 @@
+ALTER TABLE "trades" ADD CONSTRAINT "trades_market_engine_sequence" UNIQUE("market","engine_sequence");

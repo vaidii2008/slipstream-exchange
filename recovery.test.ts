@@ -1,11 +1,13 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { appendCommand } from "./events.ts";
+import { appendCommand, readLog, replay, takerLimitOf } from "./events.ts";
+import { Engine } from "./engine.ts";
 import { Exchange } from "./exchange.ts";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
 import { type Market, recordOrder } from "./orders.ts";
 import { orders, trades, users } from "./schema.ts";
+import { settle } from "./settlement.ts";
 import { useTestServer } from "./testing.ts";
 
 const { db, uniqueEmail, testMarket } = useTestServer();
@@ -217,5 +219,35 @@ describe("recovery when a market opens", () => {
         message: expect.stringContaining(`[${ask.id}]`) as unknown,
       }),
     ]);
+  });
+});
+
+describe("a trade's engine sequence", () => {
+  it("is unique per market, so settling a command twice fails and writes nothing", async () => {
+    const market = await testMarket("BTC-USD");
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "100000" });
+    const exchange = new Exchange(db);
+    // Orders that stay resting keep BTC and USD reserved, so a second settlement's ledger
+    // postings would find enough to debit: only the trade's sequence stops it.
+    await exchange.placeOrder(market, limit(seller, "sell", "70000", "0.5"));
+    await exchange.placeOrder(market, limit(buyer, "buy", "50000", "0.2"));
+    await exchange.placeOrder(market, limit(seller, "sell", "60000", "0.1"));
+    await exchange.placeOrder(market, limit(buyer, "buy", "60000", "0.1"));
+    const log = await readLog(db, market.symbol);
+    const replayed = replay(new Engine(market.symbol), log);
+    const before = await Promise.all([balancesOf(db, seller), balancesOf(db, buyer)]);
+
+    // The buy's command, settled already, settled again as a wrong frontier would.
+    await expect(
+      settle(db, market, replayed[3]!, takerLimitOf(log[3]!.command), new Date()),
+    ).rejects.toMatchObject({ cause: expect.objectContaining({ code: "23505" }) as unknown });
+
+    await expect(Promise.all([balancesOf(db, seller), balancesOf(db, buyer)])).resolves.toEqual(
+      before,
+    );
+    await expect(
+      db.select({ id: trades.id }).from(trades).where(eq(trades.market, market.symbol)),
+    ).resolves.toHaveLength(1);
   });
 });

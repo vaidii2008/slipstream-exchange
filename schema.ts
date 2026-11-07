@@ -212,9 +212,9 @@ export const trades = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    // Not unique on (market, engine_sequence) yet: every engine numbers from 1 when the
-    // process starts, so after a restart new trades reuse old numbers. The constraint comes
-    // back once Session 10's recovery restores each market's sequence.
+    // Each market's sequence continues across restarts (the event log replays it), so a trade's
+    // number names it. Settling one command twice fails here instead of paying twice.
+    unique("trades_market_engine_sequence").on(table.market, table.engineSequence),
     index("trades_maker_order_id_idx").on(table.makerOrderId),
     index("trades_taker_order_id_idx").on(table.takerOrderId),
     // Candle reads take one market's trades in a time window (see loadCandles).
