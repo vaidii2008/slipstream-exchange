@@ -2,11 +2,19 @@ import { eq, sql } from "drizzle-orm";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { Exchange, MarketBusyError, SerialQueue } from "./exchange.ts";
+import {
+  Exchange,
+  MarketBusyError,
+  MarketHaltedError,
+  MarketLockedError,
+  MarketLockLostError,
+  SerialQueue,
+} from "./exchange.ts";
 import { balancesOf, deposit, openAccount } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
 import type { Market } from "./orders.ts";
 import { orders, trades, users } from "./schema.ts";
+import { testDatabaseUrl } from "./testdb.ts";
 import { useTestServer } from "./testing.ts";
 
 const { pool, db, uniqueEmail, testMarket } = useTestServer();
@@ -578,6 +586,101 @@ describe("Exchange.placeOrder", () => {
         asset: row.asset,
         total: 0,
       });
+    }
+  });
+});
+
+describe("two exchanges on one database", () => {
+  const lockDatabaseUrl = testDatabaseUrl();
+
+  // Each exchange's halts, by market, with the error that caused them.
+  function locking() {
+    const exchange = new Exchange(db, { lockDatabaseUrl });
+    const halts: { market: string; error: unknown }[] = [];
+    exchange.onHalt((market, error) => halts.push({ market, error }));
+    return { exchange, halts };
+  }
+
+  async function seller() {
+    const [user] = await db
+      .insert(users)
+      .values({ email: uniqueEmail("exchange-lock-test"), passwordHash: "not-a-real-hash" })
+      .returning({ id: users.id });
+    await deposit(db, user!.id, "BTC", units("1"));
+    return user!.id;
+  }
+  const ask = (userId: string) => ({
+    type: "limit" as const,
+    userId,
+    side: "sell" as const,
+    price: units("60000"),
+    quantity: units("0.01"),
+  });
+
+  it("lets one open a market, refuses the other, and halts the first when its lock drops", async () => {
+    const first = locking();
+    const second = locking();
+    const third = locking();
+    try {
+      const userId = await seller();
+      await expect(first.exchange.open([btcUsd])).resolves.toMatchObject([{ halted: false }]);
+
+      // The second refuses to open the market, says why, and reserves nothing for an order.
+      await expect(second.exchange.open([btcUsd])).resolves.toMatchObject([{ halted: true }]);
+      expect(second.halts.map((halt) => halt.market)).toEqual([btcUsd.symbol]);
+      expect(second.halts[0]?.error).toBeInstanceOf(MarketLockedError);
+      await expect(second.exchange.placeOrder(btcUsd, ask(userId))).rejects.toBeInstanceOf(
+        MarketHaltedError,
+      );
+      await expect(balanceOf(userId, "BTC")).resolves.toEqual({
+        available: units("1"),
+        reserved: 0n,
+      });
+      // The lock is per market: the second opens a market the first does not hold.
+      await expect(second.exchange.open([ethUsd])).resolves.toMatchObject([{ halted: false }]);
+
+      // The first trades on.
+      await expect(first.exchange.placeOrder(btcUsd, ask(userId))).resolves.toMatchObject({
+        status: "open",
+      });
+
+      // Its lock connection dies, as it would if Postgres restarted or the network dropped.
+      const terminated = await pool.query<{ ok: boolean }>(
+        `select pg_terminate_backend(pid) as ok from pg_stat_activity
+         where application_name = $1`,
+        [`slipstream market lock ${btcUsd.symbol}`],
+      );
+      expect(terminated.rows).toEqual([{ ok: true }]);
+      await expect.poll(() => first.exchange.isHalted(btcUsd.symbol)).toBe(true);
+      expect(first.halts.map((halt) => halt.market)).toEqual([btcUsd.symbol]);
+      expect(first.halts[0]?.error).toBeInstanceOf(MarketLockLostError);
+      await expect(first.exchange.placeOrder(btcUsd, ask(userId))).rejects.toBeInstanceOf(
+        MarketHaltedError,
+      );
+
+      // With the lock gone, a third process can open the market, on the book the first left.
+      const [opened] = await third.exchange.open([btcUsd]);
+      expect(opened).toMatchObject({ halted: false, replayed: 1 });
+      expect(third.exchange.depth(btcUsd.symbol, 10).asks).toEqual([
+        { price: units("60000"), quantity: units("0.01") },
+      ]);
+    } finally {
+      await Promise.all([first, second, third].map(({ exchange }) => exchange.close()));
+    }
+  });
+
+  it("releases its locks on close, so the next process can open the market", async () => {
+    const first = locking();
+    await first.exchange.open([btcUsd]);
+    await first.exchange.close();
+    expect(first.halts).toEqual([]);
+
+    const next = locking();
+    try {
+      await expect(next.exchange.open([btcUsd])).resolves.toMatchObject([{ halted: false }]);
+      expect(next.halts).toEqual([]);
+    } finally {
+      await next.exchange.close();
     }
   });
 });

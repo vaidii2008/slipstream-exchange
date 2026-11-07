@@ -148,7 +148,9 @@ export function buildServer(
   });
 
   exchange.onHalt((market, error) => {
-    app.log.fatal({ err: error, market }, "market halted: settlement failed after matching");
+    // The error says why: a failed settlement, a log that did not replay, or a lock another
+    // process holds or this one lost.
+    app.log.fatal({ err: error, market }, "market halted");
   });
 
   registerAuthRoutes(app, { db, tokens });

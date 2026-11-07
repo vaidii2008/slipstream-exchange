@@ -66,7 +66,8 @@ try {
   // Same options; a connection in subscribe mode can run nothing else.
   const subscriber = redis.duplicate();
   const db = drizzle({ client: pool });
-  const exchange = new Exchange(db);
+  // Each market's advisory lock on a connection of its own, outside the pool.
+  const exchange = new Exchange(db, { lockDatabaseUrl: config.DATABASE_URL });
 
   // Built before the connections are verified so every startup line goes through pino.
   app = buildServer(
@@ -93,6 +94,8 @@ try {
   // app.close() stops accepting connections and waits for in-flight requests before
   // running onClose, so no request loses its database halfway through.
   app.addHook("onClose", async () => {
+    // Releases the markets' locks only now, once every queued command has settled.
+    await exchange.close();
     await Promise.all([
       redis.isOpen ? redis.close() : undefined,
       subscriber.isOpen ? subscriber.close() : undefined,
