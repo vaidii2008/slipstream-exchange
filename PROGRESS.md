@@ -1313,3 +1313,79 @@ to it, the account channel is the piece to split out.
 - `feat(bots): add a market maker that skews quotes by inventory`
 - `feat(bots): enforce per-agent risk limits with a kill switch`
 - `feat(bots): seed and start the default fleet with one command`
+
+## Day 13 — Trading bots
+
+**Commits landed (10)**
+
+- `perf(market): read candle history from a bounded time window`
+- `feat(bots): add an agent runner with lifecycle and per-agent accounts`
+- `feat(bots): add a noise trader`
+- `feat(bots): add a market maker that skews quotes by inventory`
+- `feat(bots): enforce per-agent risk limits with a kill switch`
+- `fix(bots): record the kill reason when the agent is marked killed`
+- `test(ws): allow a higher candle at boot in the candle stream test`
+- `feat(bots): seed and start the default fleet with one command`
+- `docs: record the bot and candle window decisions`
+- `docs: record day 13 in PROGRESS.md`
+
+**What now works**
+
+- Candle history reads only the requested window through a new index on
+  `trades (market, created_at)` (migration `0008`). On a copy of the dev database with 200,000
+  BTC-USD trades, the default read went from 23.5 ms (sequential scan, 7.7 MB on-disk sort) to
+  2.0 ms (index scan of 2,309 rows). `limit` now counts minutes, not candles; empty minutes
+  return nothing. The boot load reads only the current minute.
+- `npm run bots` starts eight agents: on BTC-USD and ETH-USD, one market maker and three noise
+  traders each. Each registers its own account on first run, signs in on later runs, and is
+  topped up to its funding target. Ctrl-C stops every agent and cancels what it has resting.
+- Bots trade only through the public REST API: `bots.ts` holds the client, the runner, the risk
+  guard and the kill switch; `strategies.ts` the noise trader and the market maker.
+- Noise trader: random side, a market order or a limit within a few ticks of the last trade, a
+  random size on the grid, at most five resting.
+- Market maker: a five-level ladder each side around the last trade, skewed against inventory
+  and one-sided at its inventory cap. Each tick only changes the quotes that differ.
+- Risk guard: per-order size, resting count and a position limit that counts resting orders
+  as filled, checked before anything is sent. The kill switch trips on a loss limit, on too
+  many failed ticks in a row, or on demand.
+- Live run on the dev database: in its first 36 seconds, 64 BTC-USD and 57 ETH-USD trades,
+  both books two-sided (BTC about 10 USD wide, ETH about 0.30), candles building, no failed
+  ticks. On Ctrl-C all eight agents stopped and 0 bot orders were left open.
+- 403 tests in 31 files, up from 376 in 28.
+
+**What is stubbed**
+
+- Equity is marked at the last trade, so one off-price trade can kill a maker. This happened
+  live: running the test suite against the dev database while the fleet traded wrote BTC-USD
+  trades near 60,000, and the BTC maker, holding 2 BTC, stopped itself at a 21,704 USD loss.
+  The fixes are a separate test database (carried over) or a mark from the book's mid.
+- Bots read by REST polling, not the socket. Up to a tick of staleness.
+- A restart tops each agent up to its funding target, so a maker that is short its base gets
+  more on every restart. Bounded by the target.
+- `bots.ts` is 655 lines: the client, the runner and the risk guard. Session 13 extracts the
+  risk controls and gives the client a second consumer; the split belongs there.
+- `BOT_PASSWORD` must be in `.env` for `npm run bots`.
+- Carried over: no separate test database, drizzle-kit's dev-only audit findings, the web
+  dependencies' moderate audit findings, Safari unchecked. The browser click-through is now
+  possible with the fleet running.
+
+**Decisions and deviations from the plan**
+
+- The candle window commit was not in the plan; it was the proposal from Day 12b, approved at
+  the start of this session.
+- Bots poll REST rather than mirror the socket book. See `DECISIONS.md`.
+
+**Repo shape**
+
+- `bots.ts`. Pressure: a separate process that reaches the exchange only over HTTP.
+- `strategies.ts`. Pressure: `bots.ts` at 442 lines, and strategies change for trading
+  reasons, the runner for lifecycle ones.
+- `fleet.ts`. Pressure: which agents run, where and at what size changes on its own, and
+  `bots.ts` passed 650 lines.
+
+**Next: Day 14 — Durability and recovery**
+
+- Click through the terminal in a browser with the fleet running.
+- `feat(events): append every engine command to the event log before applying it`
+- `feat(engine): rebuild books on boot from a full event-log replay`
+- `test(recovery): kill the process mid-load and prove the rebuilt book is identical`
