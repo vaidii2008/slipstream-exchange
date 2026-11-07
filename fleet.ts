@@ -2,7 +2,7 @@
 // keep the book two-sided and trades printing. `npm run bots` registers and funds every agent
 // on first run, signs them back in on later runs, and stops them cleanly on Ctrl-C.
 
-import { AgentRunner, type AgentSpec, jsonLog, type RiskLimits } from "./bots.ts";
+import { type AgentLimits, AgentRunner, type AgentSpec, jsonLog } from "./bots.ts";
 import { parseBotConfig } from "./config.ts";
 import { parseAmount } from "./money.ts";
 import { marketMaker, noiseTrader } from "./strategies.ts";
@@ -108,7 +108,7 @@ export function defaultFleet(
         maxFailedTicks: 30,
       },
     };
-    const noiseLimits: RiskLimits = {
+    const noiseLimits: AgentLimits = {
       maxOrderQuantity: quote,
       maxOpenOrders: 10,
       maxPosition: noiseBase,

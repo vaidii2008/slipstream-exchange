@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AgentRunner, type Logger, type RiskLimits } from "./bots.ts";
+import { type AgentLimits, AgentRunner, type Logger } from "./bots.ts";
 import { ApiClient, type MarketInfo } from "./client.ts";
 import {
   type MakerOptions,
@@ -15,7 +15,7 @@ const { app, uniqueEmail, testMarket } = useTestServer();
 const PASSWORD = "strategies-test-password";
 const quiet: Logger = () => {};
 // Limits no test here comes near, for tests about something else.
-const loose: RiskLimits = {
+const loose: AgentLimits = {
   maxOrderQuantity: 10n ** 12n,
   maxOpenOrders: 100,
   maxPosition: 10n ** 12n,

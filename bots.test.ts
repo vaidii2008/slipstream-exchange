@@ -4,7 +4,7 @@ import {
   type AgentContext,
   type AgentSpec,
   type Logger,
-  type RiskLimits,
+  type AgentLimits,
   type Strategy,
 } from "./bots.ts";
 import { ApiClient, markFrom } from "./client.ts";
@@ -33,7 +33,7 @@ beforeAll(async () => {
 
 const quiet: Logger = () => {};
 // Limits no test here comes near, for tests about something else.
-const loose: RiskLimits = {
+const loose: AgentLimits = {
   maxOrderQuantity: 10n ** 12n,
   maxOpenOrders: 100,
   maxPosition: 10n ** 12n,
@@ -247,7 +247,7 @@ describe("risk limits", () => {
     runners.push(created);
     return created;
   };
-  const limits: RiskLimits = {
+  const limits: AgentLimits = {
     maxOrderQuantity: 1_000_000n,
     maxOpenOrders: 2,
     maxPosition: 1_500_000n,
