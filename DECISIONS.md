@@ -253,6 +253,7 @@ meant to catch it.
   would be half of recovery, since the book would still be empty. The constraint comes back
   in Session 10 with the event log.
 - **Where:** `trades` in `schema.ts`; migrations `0006` and `0007`.
+- **Update (Day 14):** restored in migration `0011`; see "Durability and recovery".
 
 ## Order lifecycle
 
@@ -567,6 +568,7 @@ reports.
   a maker. The fleet test hit this when other test files traded BTC-USD at 60,000 while the
   maker held 2 BTC. A mark from the book's mid would be steadier.
 - **Where:** `RiskGuard`, `equity` and `Agent` in `bots.ts`.
+- **Update (Day 14):** the mark is now the median of the last 20 trades; see below.
 
 ### The maker skews by inventory and sends only the difference
 
@@ -578,3 +580,84 @@ reports.
   Cancelling first means a new bid can never cross an old ask of its own, which
   self-trade prevention would answer by cancelling the bid.
 - **Where:** `makerQuotes` and `marketMaker` in `strategies.ts`.
+
+### Equity is marked at the median of the last 20 trades
+
+- **Decision:** a bot's equity values its base at the median of the newest 20 trade prices,
+  or at the last trade while a market has fewer than 20.
+- **Alternative:** the last trade (what it was), or the mid of the book.
+- **Why:** one off-price fill cannot move a median of 20, so it cannot trip a maker's loss
+  limit; the test puts 60,000 on top of nineteen trades at 70,000 and the maker keeps running.
+  The mid needs a two-sided book and moves every time the maker requotes its own quotes.
+- **Where:** `markFrom` and `equity` in `bots.ts`.
+
+## Durability and recovery
+
+### Every engine command is logged before the engine applies it
+
+- **Decision:** inside the market's queue, a command is validated against the engine, appended
+  to `engine_events` keyed on (market, sequence), applied, then settled. Its sequence is the
+  number its first event gets. Any failure after the append halts the market.
+- **Alternative:** log the command in the settlement's transaction, so log and settlement
+  commit together.
+- **Why:** with the log first, a command that committed to the log has happened, whatever
+  fails next, and replay can always finish it. Logging inside the settlement would make a
+  crash simpler, but the log would then only record what Postgres already holds: it could
+  not rebuild anything that settlement lost. The primary key makes a second writer on a
+  market fail loudly instead of interleaving.
+- **Where:** `#execute` in `exchange.ts`; `appendCommand`, `readLog` and `replay` in
+  `events.ts`; migration `0009`.
+
+### Recovery finishes what a crash interrupted, then checks the book against Postgres
+
+- **Decision:** when a market opens, its whole log is replayed into a fresh engine. Commands
+  past the settled frontier (the highest engine sequence on any of the market's orders) are
+  settled. Orders still pending never reached the log and are cancelled and released. Then
+  every open order in Postgres must rest on the book with the same remaining quantity, or the
+  market halts.
+- **Alternative:** submit the unlogged orders on boot instead of cancelling them.
+- **Why:** the reply to a placed order goes out only after settlement, so the client of an
+  unlogged order was never told it was accepted. Cancelling it is the answer the client
+  already has, a 5xx or a dropped connection. A retry with the same client order id returns
+  the cancelled order, and a new order is unaffected. Submitting it would make an order the
+  client thinks failed trade minutes later. A market buy's release needs its protection
+  price, so `orders.protection_price` records it (migration `0010`).
+- **Where:** `recovery.ts`; `#replay` in `exchange.ts`.
+
+### Trades are unique on (market, engine_sequence) again
+
+- **Decision:** restored the constraint dropped in `0007`, now that sequences continue from
+  the log across restarts.
+- **Alternative:** rely on the frontier rule alone.
+- **Why:** if the frontier rule were ever wrong, a second settlement of a command would move
+  funds twice whenever the users had other orders keeping enough reserved. With the
+  constraint, it fails on the trade insert and the whole settlement rolls back. A test does
+  exactly that and gets Postgres error 23505 with every balance unchanged.
+- **Where:** `trades` in `schema.ts`; migration `0011`.
+
+### Tests run in their own database, with a market per exchange
+
+- **Decision:** the suite runs on `slipstream_test`, derived from `DATABASE_URL` and migrated by
+  Vitest's global setup. Every `Exchange` a test creates trades a market of its own, copied
+  from BTC-USD's or ETH-USD's grid.
+- **Alternative:** clone a database per test file from a template.
+- **Why:** with unique sequences, a market has one writer per database, and about 45 test
+  exchanges traded BTC-USD in parallel. Per-file databases would still leave several exchanges
+  per file on one market, and would need a test-only way to start an engine. Per-exchange
+  markets keep the production code path: every exchange replays its market's log on open.
+- **Where:** `testdb.ts`, `vitest.config.ts`, `testMarket` in `testing.ts`.
+
+### Interview note: Session 10, durability and recovery
+
+The problem was that the order books lived only in memory, so a crash lost every resting order
+and could leave a command half done: reserved but never matched, or matched but never
+settled. Every engine command is now written to a Postgres event log before the engine
+applies it. On boot each market replays its log into a fresh, deterministic engine, settles
+whatever the crash interrupted, cancels the orders that never reached the log, and refuses to
+open if the rebuilt book disagrees with the open orders in Postgres. The trade-off is one more
+write per command, inside the market's single-writer queue, and a boot that replays the whole
+log, because snapshots were cut. In the kill test the process is SIGKILLed after about 300
+commands with one settlement blocked mid-flight and up to four orders unlogged; the log up to
+the last command it reported replays to exactly the book it printed, the restart settles the
+one interrupted command and cancels the unlogged orders, and the ledger sums to zero with
+every reservation matching an open order.
