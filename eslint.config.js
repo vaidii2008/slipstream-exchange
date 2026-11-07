@@ -31,5 +31,12 @@ export default tseslint.config(
     files: ["**/*.js"],
     ...tseslint.configs.disableTypeChecked,
   },
+  {
+    // k6 scripts run in k6's own JavaScript runtime, which defines these.
+    files: ["load/**/*.js"],
+    languageOptions: {
+      globals: { __ENV: "readonly", __VU: "readonly", __ITER: "readonly", console: "readonly" },
+    },
+  },
   prettier,
 );
