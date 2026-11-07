@@ -412,3 +412,141 @@ describe("trading tools", () => {
     });
   });
 });
+
+describe("kill switch", () => {
+  // Loses more than 100 USD and the switch trips.
+  const fragile = (): RiskLimits => ({
+    maxOrderQuantity: 10000000n,
+    maxOpenOrders: 10,
+    maxPosition: 10000000n,
+    maxLoss: 100_00000000n,
+  });
+
+  // An agent on a market of its own, so the mark is that market's last trade: the agent buys
+  // 0.01 BTC at 70,000, rests a bid far below, then two other accounts trade at 10,000. Its
+  // 0.01 BTC is now worth 600 USD less.
+  async function crashed() {
+    const symbol = (await testMarket("BTC-USD")).symbol;
+    const email = uniqueEmail("mcp-test");
+    const funding = await signInAgent(baseUrl, email, PASSWORD, symbol);
+    await funding.api.deposit("USD", 10_000_00000000n, 8);
+    const session = await signInAgent(baseUrl, email, PASSWORD, symbol, fragile);
+    const client = await connect(session);
+    const [seller, buyer] = await Promise.all([counterparty(), counterparty()]);
+    const sell = (price: bigint) =>
+      seller.place(session.market, { type: "limit", side: "sell", price, quantity: 1000000n });
+
+    await sell(70_000_00000000n);
+    const bought = await call(client, "place_order", {
+      side: "buy",
+      type: "market",
+      quantity: "0.01",
+    });
+    expect(bought.value).toMatchObject({ status: "filled" });
+    const resting = await call(client, "place_order", {
+      side: "buy",
+      type: "limit",
+      price: "5000",
+      quantity: "0.001",
+    });
+    expect(resting.value).toMatchObject({ status: "open" });
+
+    await sell(10_000_00000000n);
+    await buyer.place(session.market, { type: "market", side: "buy", quantity: 10000n });
+    return { session, client };
+  }
+
+  it("trips on the next order, cancels what is resting and refuses every order after", async () => {
+    const { session, client } = await crashed();
+
+    const next = await call(client, "place_order", {
+      side: "buy",
+      type: "limit",
+      price: "5000",
+      quantity: "0.001",
+    });
+    expect(next).toMatchObject({ isError: true, value: { error: "risk_killed" } });
+    expect(next.text).toMatch(/halted for good: lost 600\d* quote minor units/);
+    expect(session.kill.tripped).toBe(true);
+    expect(await session.api.openOrders(session.market)).toEqual([]);
+
+    // Sells would lower the risk, but a tripped switch refuses those too.
+    const sell = await call(client, "place_order", {
+      side: "sell",
+      type: "market",
+      quantity: "0.01",
+    });
+    expect(sell).toMatchObject({ isError: true, value: { error: "risk_killed" } });
+    // Reads still work, so the model can see where it stands.
+    expect((await call(client, "get_open_orders")).value).toEqual({ orders: [] });
+  });
+
+  it("trips on the timer while the model makes no calls", async () => {
+    const { session } = await crashed();
+
+    const stop = session.kill.watch(10);
+    try {
+      const deadline = Date.now() + 2000;
+      while (!session.kill.tripped && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      stop();
+    }
+    expect(session.kill.reason).toMatch(/^lost 600\d* quote minor units, limit 10000000000$/);
+    // trip() resolves only after the cancels, so wait for it before looking at the book.
+    await session.kill.trip("again");
+    expect(await session.api.openOrders(session.market)).toEqual([]);
+  });
+
+  it("waits for an order in flight before it cancels", async () => {
+    const { session } = await crashed();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // An order that has passed the guard but not yet reached the API when the switch trips.
+    const inFlight = session.kill.track(
+      gate.then(() =>
+        session.api.place(session.market, {
+          type: "limit",
+          side: "buy",
+          price: 4_000_00000000n,
+          quantity: 100000n,
+        }),
+      ),
+    );
+
+    const tripping = session.kill.trip("operator");
+    release();
+    await Promise.all([inFlight, tripping]);
+    expect(await session.api.openOrders(session.market)).toEqual([]);
+  });
+
+  it("does not trip while the loss is inside the limit", async () => {
+    const symbol = (await testMarket("BTC-USD")).symbol;
+    const email = uniqueEmail("mcp-test");
+    const funding = await signInAgent(baseUrl, email, PASSWORD, symbol);
+    await funding.api.deposit("USD", 10_000_00000000n, 8);
+    const session = await signInAgent(baseUrl, email, PASSWORD, symbol, fragile);
+    const client = await connect(session);
+    const [seller, buyer] = await Promise.all([counterparty(), counterparty()]);
+    const sell = (price: bigint) =>
+      seller.place(session.market, { type: "limit", side: "sell", price, quantity: 1000000n });
+    await sell(70_000_00000000n);
+    await call(client, "place_order", { side: "buy", type: "market", quantity: "0.01" });
+    // 0.01 BTC marked down to 64,000 is 60 USD lost, inside the 100 USD limit.
+    await sell(64_000_00000000n);
+    await buyer.place(session.market, { type: "market", side: "buy", quantity: 10000n });
+
+    await session.kill.check();
+    expect(session.kill.tripped).toBe(false);
+    const next = await call(client, "place_order", {
+      side: "buy",
+      type: "limit",
+      price: "5000",
+      quantity: "0.001",
+    });
+    expect(next).toMatchObject({ isError: false, value: { status: "open" } });
+  });
+});

@@ -14,7 +14,14 @@ import { z } from "zod";
 import { ApiClient, type BookLevel, type MarketInfo, type OrderRequest } from "./client.ts";
 import { parseAgentConfig } from "./config.ts";
 import { AMOUNT_MESSAGES, formatAmount, parseAmount } from "./money.ts";
-import { RiskGuard, type RiskLimits, type RiskRefusal } from "./risk.ts";
+import {
+  cancelAll,
+  equity,
+  LossLimit,
+  RiskGuard,
+  type RiskLimits,
+  type RiskRefusal,
+} from "./risk.ts";
 
 // Per base asset, so they hold on a test's copy of a market too. An order is at most a few
 // thousand dollars, and the position a few times that: room to trade, not to move the book.
@@ -43,12 +50,86 @@ export function defaultLimits(market: MarketInfo): RiskLimits {
   };
 }
 
+// Once tripped it stays tripped for the life of the process: the guard refuses every new
+// order and everything resting is cancelled. Only the operator, by restarting the server,
+// starts trading again. The model has no tool that resets it.
+export class KillSwitch {
+  readonly #api: ApiClient;
+  readonly #market: MarketInfo;
+  readonly #guard: RiskGuard;
+  readonly #loss: LossLimit;
+  readonly #inFlight = new Set<Promise<unknown>>();
+  #tripping: Promise<void> | undefined;
+  reason: string | undefined;
+
+  constructor(api: ApiClient, market: MarketInfo, guard: RiskGuard, loss: LossLimit) {
+    this.#api = api;
+    this.#market = market;
+    this.#guard = guard;
+    this.#loss = loss;
+  }
+
+  get tripped(): boolean {
+    return this.reason !== undefined;
+  }
+
+  // Runs an order placement so that a trip waits for it. Otherwise an order that passed the
+  // guard just before the trip could reach the book after the cancels and stay there.
+  async track<T>(work: Promise<T>): Promise<T> {
+    this.#inFlight.add(work);
+    try {
+      return await work;
+    } finally {
+      this.#inFlight.delete(work);
+    }
+  }
+
+  // Trips the switch if equity has fallen past the loss limit.
+  async check(): Promise<void> {
+    if (this.tripped) {
+      return;
+    }
+    const breach = await this.#loss.breach(this.#api, this.#market);
+    if (breach !== undefined) {
+      await this.trip(breach);
+    }
+  }
+
+  // Safe to call more than once or concurrently: every caller waits for the same cancels.
+  async trip(reason: string): Promise<void> {
+    if (this.#tripping === undefined) {
+      this.reason = reason;
+      this.#guard.killed = true;
+      this.#tripping = (async () => {
+        await Promise.allSettled([...this.#inFlight]);
+        const cancelled = await cancelAll(this.#api, this.#market);
+        console.error(`slipstream mcp: kill switch tripped (${reason}); cancelled ${cancelled}`);
+      })();
+    }
+    await this.#tripping;
+  }
+
+  // Checks on a timer as well as on every order, so a resting order that fills into a loss
+  // trips the switch even while the model has stopped calling tools. Returns the stop.
+  watch(intervalMs: number): () => void {
+    const timer = setInterval(() => {
+      this.check().catch((error: unknown) => {
+        console.error(`slipstream mcp: loss check failed: ${String(error)}`);
+      });
+    }, intervalMs);
+    // The host closing stdin ends the process; this timer must not keep it alive.
+    timer.unref();
+    return () => clearInterval(timer);
+  }
+}
+
 export type AgentSession = {
   api: ApiClient;
   market: MarketInfo;
   limits: RiskLimits;
   // Every order the model places goes through it. Reads may use api directly.
   guard: RiskGuard;
+  kill: KillSwitch;
 };
 
 // Registers the agent's account the first time and signs in to it every time after, as a bot
@@ -67,7 +148,9 @@ export async function signInAgent(
   const limits = limitsFor(market);
   const held = (await api.balances()).get(market.baseAsset);
   const inventory = held === undefined ? 0n : held.available + held.reserved;
-  return { api, market, limits, guard: new RiskGuard(api, market, limits, inventory) };
+  const guard = new RiskGuard(api, market, limits, inventory);
+  const loss = new LossLimit(limits.maxLoss, await equity(api, market));
+  return { api, market, limits, guard, kill: new KillSwitch(api, market, guard, loss) };
 }
 
 // Sent to the host once, at initialize. Hosts put it in the model's context, so it is the
@@ -99,7 +182,7 @@ function failure(text: string): CallToolResult {
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false } as const;
 
 export function buildMcpServer(session: AgentSession): McpServer {
-  const { api, market, limits, guard } = session;
+  const { api, market, limits, guard, kill } = session;
   const price = (units: bigint) => formatAmount(units, market.quoteScale);
   const quantity = (units: bigint) => formatAmount(units, market.baseScale);
   const level = (entry: BookLevel) => ({
@@ -224,6 +307,10 @@ export function buildMcpServer(session: AgentSession): McpServer {
     },
   );
 
+  const haltMessage = () =>
+    `trading is halted for good: ${kill.reason ?? "kill switch tripped"}; every open order was cancelled`;
+  const halted = () => failure(JSON.stringify({ error: "risk_killed", message: haltMessage() }));
+
   const refusals: Record<RiskRefusal, string> = {
     max_order_quantity: `one order may ask for at most ${quantity(limits.maxOrderQuantity)} ${market.baseAsset}`,
     max_open_orders: `at most ${limits.maxOpenOrders} orders may rest at once; cancel one first`,
@@ -253,7 +340,9 @@ export function buildMcpServer(session: AgentSession): McpServer {
         "Send a buy or sell order. A limit order needs a price and rests in the book until it fills or " +
         "is cancelled; a market order has no price and fills at once against the best resting orders. " +
         "Orders that would break a risk limit are refused before they reach the exchange. Limits: " +
-        `${refusals.max_order_quantity}; ${refusals.max_open_orders}; ${refusals.max_position}.`,
+        `${refusals.max_order_quantity}; ${refusals.max_open_orders}; ${refusals.max_position}. ` +
+        `If equity falls more than ${price(limits.maxLoss)} ${market.quoteAsset} below where this ` +
+        "session started, trading halts for good and every open order is cancelled.",
       inputSchema: {
         side: z.enum(["buy", "sell"]),
         type: z.enum(["limit", "market"]),
@@ -274,6 +363,10 @@ export function buildMcpServer(session: AgentSession): McpServer {
       },
     },
     async (input) => {
+      await kill.check();
+      if (kill.tripped) {
+        return halted();
+      }
       if (input.type === "limit" && input.price === undefined) {
         return failure(JSON.stringify(fieldError("price", "is required for a limit order")));
       }
@@ -302,9 +395,15 @@ export function buildMcpServer(session: AgentSession): McpServer {
 
       // An order off the grid comes back from the API as a 400, which the client throws as an
       // ApiError carrying the API's body; the SDK turns that into an error result.
-      const result = await guard.place(market, order);
+      const result = await kill.track(guard.place(market, order));
       if (result.ok) {
-        return json({ id: result.id, status: result.status, filled: quantity(result.filled) });
+        const placed = { id: result.id, status: result.status, filled: quantity(result.filled) };
+        // A fill from this very order can be what pushes equity past the limit.
+        await kill.check();
+        return json(kill.tripped ? { ...placed, halted: haltMessage() } : placed);
+      }
+      if (result.error === "risk_killed") {
+        return halted();
       }
       if (result.status === 0) {
         const reason = Object.entries(refusals).find(([code]) => result.error === `risk_${code}`);
@@ -330,7 +429,7 @@ export function buildMcpServer(session: AgentSession): McpServer {
       title: "Cancel order",
       description:
         "Cancel one of this account's resting orders by the id get_open_orders or place_order gave. " +
-        "cancelled is false if it had already filled or been cancelled.",
+        "cancelled is false if it had already filled or been cancelled. Works after a halt too.",
       inputSchema: { orderId: z.uuid() },
       annotations: {
         readOnlyHint: false,
@@ -351,6 +450,9 @@ function fieldError(field: string, message: string) {
   return { error: "invalid_request", issues: [{ field, message }] };
 }
 
+// How often the loss limit is checked between tool calls. Each check is two GET requests.
+const LOSS_CHECK_MS = 5000;
+
 async function serve(): Promise<void> {
   const config = parseAgentConfig(process.env);
   const session = await signInAgent(
@@ -359,6 +461,7 @@ async function serve(): Promise<void> {
     config.AGENT_PASSWORD,
     config.AGENT_MARKET,
   );
+  session.kill.watch(LOSS_CHECK_MS);
   await buildMcpServer(session).connect(new StdioServerTransport());
   console.error(
     `slipstream mcp: signed in as ${config.AGENT_EMAIL}, trading ${config.AGENT_MARKET}`,
