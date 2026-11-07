@@ -20,6 +20,20 @@ import { useConnection, useSubscription } from "@/lib/socket";
 const UP = "#059669";
 const DOWN = "#dc2626";
 
+// lightweight-charts parses only hex, rgb() and rgba(), but the theme is written in oklch()
+// and Chrome reports computed colours as lab(). Painting one pixel and reading it back gives
+// the browser's own conversion to sRGB, whatever syntax the stylesheet used.
+function toRgba(color: string): string {
+  const context = document.createElement("canvas").getContext("2d");
+  if (context === null) {
+    throw new Error("no 2d canvas context to convert a colour for the chart");
+  }
+  context.fillStyle = color;
+  context.fillRect(0, 0, 1, 1);
+  const [red, green, blue, alpha] = context.getImageData(0, 0, 1, 1).data;
+  return `rgba(${red}, ${green}, ${blue}, ${(alpha ?? 255) / 255})`;
+}
+
 export function CandleChart({ market }: { market: MarketInfo }) {
   const { symbol, tickSize } = market;
   useSubscription("candles", symbol);
@@ -58,7 +72,7 @@ export function CandleChart({ market }: { market: MarketInfo }) {
       autoSize: true,
       layout: {
         background: { color: "transparent" },
-        textColor: getComputedStyle(element).color,
+        textColor: toRgba(getComputedStyle(element).color),
         attributionLogo: false,
       },
       grid: { vertLines: { visible: false }, horzLines: { color: "rgba(128, 128, 128, 0.15)" } },
