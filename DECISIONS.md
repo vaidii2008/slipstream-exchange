@@ -794,3 +794,19 @@ every reservation matching an open order.
   when the market opens and held for the process's life, would make the second process wait
   or refuse to open it.
 - **Where:** `#open` in `exchange.ts`.
+
+### Interview note: Session 11, measuring it
+
+The problem was that the engine benchmark said 4.3 million commands a second and nothing said
+what the exchange as a whole could do, or where the gap went. I added Prometheus metrics
+labelled by market and outcome only, timed each command's wait, turn and match separately, and
+load-tested end to end with k6 at an open-model arrival rate against a throwaway database. The
+trade-off of the design shows up directly: one serial writer per market keeps the book and
+the ledger consistent without locks between commands, so a market's ceiling is one over its
+turn, about 264 commands/s here, because the 4 µs match sits inside a chain of 16 to 43
+Postgres round trips. The same runs found three things to fix rather than defend: a quadratic
+recovery check (boot at 1M commands went from 10 s to 3.4 s once it used a set), balances
+summed from their whole history (throughput fell from 250 to 123 commands/s as it grew), and
+no guard against two processes writing one database. Each number names its machine, date and
+kind, and the ones that predict each other agree: a 3.8 ms mean turn predicts 263/s and the
+measured ceiling was 264.
