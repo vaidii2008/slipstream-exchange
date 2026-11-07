@@ -72,8 +72,9 @@ const agentEnvSchema = z
     // Registered the first time the server starts, signed in to after.
     AGENT_EMAIL: z.email({ error: "must be an email address" }),
     AGENT_PASSWORD: z.string().min(8, { error: "must be at least 8 characters" }).max(256),
-    // The one market the agent trades. Its risk limits are per market.
-    AGENT_MARKET: z.enum(["BTC-USD", "ETH-USD"]).default("BTC-USD"),
+    // The one market the agent trades. The markets table is the list of what exists, so an
+    // unlisted symbol is refused at startup by the API, not here.
+    AGENT_MARKET: z.string().min(1).max(32).default("BTC-USD"),
   })
   .readonly();
 

@@ -163,8 +163,8 @@ describe("parseAgentConfig", () => {
     );
   });
 
-  it("accepts only a listed market", () => {
+  it("takes any market symbol, leaving the API to say whether it is listed", () => {
     expect(parseAgentConfig({ ...agent, AGENT_MARKET: "ETH-USD" }).AGENT_MARKET).toBe("ETH-USD");
-    expect(() => parseAgentConfig({ ...agent, AGENT_MARKET: "DOGE-USD" })).toThrow(/AGENT_MARKET/);
+    expect(() => parseAgentConfig({ ...agent, AGENT_MARKET: "" })).toThrow(/AGENT_MARKET/);
   });
 });

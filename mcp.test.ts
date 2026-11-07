@@ -84,6 +84,13 @@ describe("signInAgent", () => {
     expect(again.market).toMatchObject({ symbol: btc, baseAsset: "BTC", quoteAsset: "USD" });
   });
 
+  it("fails on a market the API does not list", async () => {
+    const email = uniqueEmail("mcp-test");
+    await expect(signInAgent(baseUrl, email, PASSWORD, "DOGE-USD")).rejects.toThrow(
+      "market DOGE-USD is not listed",
+    );
+  });
+
   it("fails on the wrong password for an existing account", async () => {
     const email = uniqueEmail("mcp-test");
     await signInAgent(baseUrl, email, PASSWORD, btc);
