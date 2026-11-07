@@ -207,6 +207,28 @@ describe("Exchange.placeOrder", () => {
     expect(stored.map((row) => row.createdAt)).toEqual([reported[2], reported[2]]);
   });
 
+  it("times each command's wait, its turn in the queue and the match within that turn", async () => {
+    const exchange = new Exchange(db);
+    const timings: { waitSeconds: number; matchSeconds: number; commandSeconds: number }[] = [];
+    exchange.onUpdate((update) => timings.push(update.timing));
+    const seller = await funded({ BTC: "1" });
+    const buyer = await funded({ USD: "60000" });
+
+    await Promise.all([
+      exchange.placeOrder(btcUsd, limit(seller, "sell", "60000", "0.1")),
+      exchange.placeOrder(btcUsd, limit(seller, "sell", "60001", "0.1")),
+      exchange.placeOrder(btcUsd, limit(buyer, "buy", "60001", "0.2")),
+    ]);
+
+    expect(timings).toHaveLength(3);
+    for (const { waitSeconds, matchSeconds, commandSeconds } of timings) {
+      expect(waitSeconds).toBeGreaterThanOrEqual(0);
+      expect(matchSeconds).toBeGreaterThan(0);
+      // The turn includes the log append and the settlement, both Postgres round trips.
+      expect(commandSeconds).toBeGreaterThan(matchSeconds);
+    }
+  });
+
   it("fills part of an order and rests the rest, still reserved at its own limit", async () => {
     const exchange = new Exchange(db);
     const seller = await funded({ BTC: "0.2" });

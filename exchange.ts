@@ -94,7 +94,16 @@ export class MarketBusyError extends Error {
 
 export type HaltListener = (market: string, error: unknown) => void;
 
-// What one settled command did, for market data. Sequences are the command's first and last
+// How long one command took, in seconds, split where the time goes: waiting behind the
+// commands queued ahead of it, then its own turn in the queue (the log append, the match and
+// the settlement), of which the match in memory is a part.
+export type CommandTiming = {
+  waitSeconds: number;
+  matchSeconds: number;
+  commandSeconds: number;
+};
+
+// What one settled command did, for market data, and how long it took, for metrics. Sequences are the command's first and last
 // event numbers: the next update in the market starts at `sequence + 1`, so a consumer that
 // sees anything else missed one.
 export type MarketUpdate = {
@@ -109,6 +118,7 @@ export type MarketUpdate = {
   levels: { side: Side; price: bigint; quantity: bigint }[];
   // Each order the command changed, as settlement left it. Private to each order's owner.
   orders: SettledOrder[];
+  timing: CommandTiming;
 };
 
 // Called inside the market's queue, in sequence order, after the settlement has committed.
@@ -309,7 +319,9 @@ export class Exchange {
   // the log, without halting, since nothing has changed yet. After the log write, any failure
   // halts the market: the log, the book and Postgres no longer agree on what has happened.
   #execute(running: RunningMarket, market: Market, command: Command): Promise<EngineEvent[]> {
+    const enqueuedAt = performance.now();
     return running.queue.run(async () => {
+      const startedAt = performance.now();
       // Commands queued before the halt are refused too. An order among them stays pending
       // and reserved, like the one whose settlement failed, until recovery on restart.
       if (running.halted) {
@@ -327,14 +339,22 @@ export class Exchange {
       }
       let events: EngineEvent[];
       let settled: SettledOrder[];
+      let matchSeconds: number;
       const settledAt = new Date();
       try {
+        const matchStartedAt = performance.now();
         events = applyCommand(running.engine, command);
+        matchSeconds = (performance.now() - matchStartedAt) / 1000;
         settled = await settle(this.#db, market, events, takerLimitOf(command), settledAt);
       } catch (error) {
         throw this.#halt(running, market.symbol, error);
       }
-      this.#announce(running.engine, market, events, settled, settledAt);
+      const timing = {
+        waitSeconds: (startedAt - enqueuedAt) / 1000,
+        matchSeconds,
+        commandSeconds: (performance.now() - startedAt) / 1000,
+      };
+      this.#announce(running.engine, market, events, settled, settledAt, timing);
       return events;
     });
   }
@@ -355,6 +375,7 @@ export class Exchange {
     events: EngineEvent[],
     orders: SettledOrder[],
     settledAt: Date,
+    timing: CommandTiming,
   ): void {
     const first = events[0];
     const last = events.at(-1);
@@ -373,6 +394,7 @@ export class Exchange {
         quantity: engine.quantityAt(side, price),
       })),
       orders,
+      timing,
     };
     for (const listener of this.#updateListeners) {
       listener(update);

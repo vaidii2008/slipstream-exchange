@@ -107,6 +107,13 @@ describe("GET /metrics", () => {
     expect(orders(symbol, "rejected")).toBe(1);
     expect(orders("none", "rate_limited")).toBe(1);
     expect(sample(text, "slipstream_trades_total", { market: symbol })).toBe(1);
+    // One observation per command that reached the queue: the three placed orders. The
+    // rejected and rate-limited ones never did.
+    for (const histogram of ["queue_wait", "command", "match"]) {
+      expect(sample(text, `slipstream_${histogram}_seconds_count`, { market: symbol })).toBe(3);
+    }
+    // Le is the bucket's upper bound: every match took 10 ms or less.
+    expect(sample(text, "slipstream_match_seconds_bucket", { le: "0.01", market: symbol })).toBe(3);
   });
 
   it("counts an order refused for its body under no market, whatever market it names", async () => {
