@@ -277,22 +277,55 @@ export class ApiClient {
     }));
   }
 
-  // The price of the market's latest trade, or undefined before its first.
-  async lastPrice(market: MarketInfo): Promise<bigint | undefined> {
-    const path = `/markets/${encodeURIComponent(market.symbol)}/trades?limit=1`;
+  // The prices of the market's latest trades, newest first.
+  async recentPrices(market: MarketInfo, limit: number): Promise<bigint[]> {
+    const path = `/markets/${encodeURIComponent(market.symbol)}/trades?limit=${limit}`;
     const reply = await this.#send("GET", path, undefined, false);
     if (reply.status !== 200) {
       throw new ApiError("GET", path, reply.status, reply.body);
     }
-    const [latest] = tradesReply.parse(reply.body).trades;
-    return latest === undefined ? undefined : units(latest.price, market.quoteScale);
+    return tradesReply
+      .parse(reply.body)
+      .trades.map((trade) => units(trade.price, market.quoteScale));
   }
+
+  // The price of the market's latest trade, or undefined before its first.
+  async lastPrice(market: MarketInfo): Promise<bigint | undefined> {
+    const [latest] = await this.recentPrices(market, 1);
+    return latest;
+  }
+
+  // The price equity is valued at. See markFrom.
+  async markPrice(market: MarketInfo): Promise<bigint | undefined> {
+    return markFrom(await this.recentPrices(market, MARK_WINDOW));
+  }
+}
+
+// Trades the mark looks back over.
+export const MARK_WINDOW = 20;
+
+// The median of the last MARK_WINDOW trade prices, or the last trade's while there are fewer.
+// The last trade alone lets one off-price fill (a market order sweeping a thin book, a test
+// run writing to the wrong database) swing a maker's equity by thousands and trip its loss
+// limit; one outlier in twenty cannot move a median. With an even window it is the mean of
+// the two middle prices, rounded down. `prices` is newest first; undefined when empty.
+export function markFrom(prices: bigint[]): bigint | undefined {
+  if (prices.length < MARK_WINDOW) {
+    return prices[0];
+  }
+  const sorted = prices.slice(0, MARK_WINDOW).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const upper = sorted[MARK_WINDOW / 2];
+  const lower = sorted[MARK_WINDOW / 2 - 1];
+  if (upper === undefined || lower === undefined) {
+    throw new Error("mark window has no middle");
+  }
+  return (lower + upper) / 2n;
 }
 
 // What a strategy may call. On a running agent it is the agent's RiskGuard, not the client.
 export type TradingApi = Pick<
   ApiClient,
-  "balances" | "openOrders" | "lastPrice" | "place" | "cancel"
+  "balances" | "openOrders" | "lastPrice" | "markPrice" | "place" | "cancel"
 >;
 
 export type AgentContext = {
@@ -319,7 +352,7 @@ export type RiskLimits = {
   // that side as if it had filled, so no sequence of fills can pass it.
   maxPosition: bigint;
   // A fall in equity since start, in quote minor units, that trips the kill switch. Equity is
-  // the quote balance plus the base balance valued at the last trade.
+  // the quote balance plus the base balance valued at the mark (see markFrom).
   maxLoss: bigint;
   // Failed ticks in a row that trip it: an agent that keeps failing is not trading on what
   // it thinks it is.
@@ -356,6 +389,10 @@ export class RiskGuard implements TradingApi {
 
   lastPrice(market: MarketInfo) {
     return this.#api.lastPrice(market);
+  }
+
+  markPrice(market: MarketInfo) {
+    return this.#api.markPrice(market);
   }
 
   cancel(orderId: string) {
@@ -411,10 +448,10 @@ export class RiskGuard implements TradingApi {
   }
 }
 
-// Quote balance plus base valued at the last trade, in quote minor units, or undefined before
-// the market's first trade. Rounded down: it feeds a limit, not the ledger.
+// Quote balance plus base valued at the mark, in quote minor units, or undefined before the
+// market's first trade. Rounded down: it feeds a limit, not the ledger.
 export async function equity(api: TradingApi, market: MarketInfo): Promise<bigint | undefined> {
-  const [balances, price] = await Promise.all([api.balances(), api.lastPrice(market)]);
+  const [balances, price] = await Promise.all([api.balances(), api.markPrice(market)]);
   if (price === undefined) {
     return undefined;
   }

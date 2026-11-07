@@ -6,6 +6,7 @@ import {
   type AgentSpec,
   type Logger,
   type RiskLimits,
+  markFrom,
   type Strategy,
 } from "./bots.ts";
 import { useTestServer } from "./testing.ts";
@@ -194,18 +195,39 @@ describe("AgentRunner", () => {
   });
 });
 
+describe("markFrom", () => {
+  it("is undefined before the first trade", () => {
+    expect(markFrom([])).toBeUndefined();
+  });
+
+  it("is the newest price while there are fewer than twenty trades", () => {
+    expect(markFrom([5n, 100n, 100n])).toBe(5n);
+  });
+
+  it("is the median of the newest twenty, ignoring one outlier and anything older", () => {
+    const prices = [1n, ...Array<bigint>(19).fill(70n), 999n];
+    expect(markFrom(prices)).toBe(70n);
+  });
+
+  it("averages the two middle prices, rounded down", () => {
+    // Ten at 10 and ten at 13: the middle two are 10 and 13.
+    expect(markFrom([...Array<bigint>(10).fill(13n), ...Array<bigint>(10).fill(10n)])).toBe(11n);
+  });
+});
+
 describe("risk limits", () => {
   const runners: AgentRunner[] = [];
   afterAll(async () => {
     await Promise.all(runners.map((runner) => runner.stopAll()));
   });
 
-  // The last price comes from the trades table, which other test files write to at the same
-  // time, so equity here is measured at a price the test sets.
+  // Equity is measured at prices the test sets: `prices` are the recent trades, newest first.
+  // One price is fewer than the mark window, so the mark is that price.
   let price = 70_000_00000000n;
+  let prices: bigint[] | undefined;
   class PricedClient extends ApiClient {
-    override lastPrice(): Promise<bigint | undefined> {
-      return Promise.resolve(price);
+    override recentPrices(): Promise<bigint[]> {
+      return Promise.resolve(prices ?? [price]);
     }
   }
   const runner = () => {
@@ -322,6 +344,36 @@ describe("risk limits", () => {
     await expect(api.place(market, bid(10_000n))).resolves.toMatchObject({
       error: "risk_killed",
     });
+  });
+
+  it("does not kill a maker when one trade in the last twenty is off-price", async () => {
+    const steady = Array<bigint>(20).fill(70_000_00000000n);
+    prices = steady;
+    let ticks = 0;
+    try {
+      const agent = await start({
+        intervalMs: 10,
+        strategy: {
+          tick() {
+            ticks += 1;
+            return Promise.resolve();
+          },
+        },
+      });
+      await until(() => ticks >= 2);
+
+      // A new trade at 60,000 on top of nineteen at 70,000. Valued at the last trade, 0.1 BTC
+      // would be worth 1,000 USD less, past the 500 limit; at the median it is worth the same.
+      prices = [60_000_00000000n, ...steady.slice(0, 19)];
+      const before = ticks;
+      await until(() => ticks >= before + 5);
+
+      expect(agent.status).toBe("running");
+      expect(agent.killReason).toBeUndefined();
+      await agent.stop();
+    } finally {
+      prices = undefined;
+    }
   });
 
   it("kills the agent after maxFailedTicks failures in a row, not in total", async () => {
