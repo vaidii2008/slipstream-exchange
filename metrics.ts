@@ -30,9 +30,12 @@ export type OrderOutcome =
 // is not used: it is client input, and any string would become a series.
 export const NO_MARKET = "none";
 
-// Half a millisecond to 2.5 s: a command's Postgres round trips at the low end, a backed-up
-// queue at the high end.
-const QUEUE_BUCKETS = [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5];
+// Half a millisecond to 10 s: a command's Postgres round trips at the low end, a backed-up
+// queue at the high end. A saturated load run queued commands for about 8 s, past the 2.5 s
+// these first stopped at, which hid how long the waits were.
+const QUEUE_BUCKETS = [
+  0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+];
 
 export class Metrics {
   // One registry per server rather than prom-client's global one, so a test file can build
