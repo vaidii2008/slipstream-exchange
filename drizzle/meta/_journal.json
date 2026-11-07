@@ -57,6 +57,13 @@
       "when": 1793937170976,
       "tag": "0007_drop_unique_trade_sequence",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794011055826,
+      "tag": "0008_index_trades_by_market_and_time",
+      "breakpoints": true
     }
   ]
 }

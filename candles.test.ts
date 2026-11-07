@@ -193,12 +193,62 @@ describe("loadCandles", () => {
       },
     ]);
 
-    // Paging back: only the minutes before the one `before` falls in, latest first by limit.
-    await expect(
-      loadCandles(db, btcUsd, { limit: 1, before: new Date("2001-01-01T00:03:30Z") }),
-    ).resolves.toEqual([loaded[0]]);
+    // The window is the `limit` minutes before the one `before` falls in. Empty minutes
+    // count towards it and return no candle.
     await expect(
       loadCandles(db, btcUsd, { limit: 1, before: new Date("2001-01-01T00:04:00Z") }),
     ).resolves.toEqual([loaded[1]]);
+    await expect(
+      loadCandles(db, btcUsd, { limit: 1, before: new Date("2001-01-01T00:03:30Z") }),
+    ).resolves.toEqual([]);
+    await expect(
+      loadCandles(db, btcUsd, { limit: 2, before: new Date("2001-01-01T00:03:30Z") }),
+    ).resolves.toEqual([loaded[0]]);
+    await expect(
+      loadCandles(db, btcUsd, { limit: 2, before: new Date("2001-01-01T00:04:00Z") }),
+    ).resolves.toEqual([loaded[1]]);
+  });
+
+  it("without before, reads up to the current minute and no further back than limit", async () => {
+    const exchange = new Exchange(db);
+    const seller = await funded("BTC", "1");
+    const buyer = await funded("USD", "100000");
+    const lift = async (price: string) => {
+      await exchange.placeOrder(btcUsd, {
+        type: "limit",
+        userId: seller,
+        side: "sell",
+        price: units(price),
+        quantity: units("0.1"),
+      });
+      return exchange.placeOrder(btcUsd, {
+        type: "limit",
+        userId: buyer,
+        side: "buy",
+        price: units(price),
+        quantity: units("0.1"),
+      });
+    };
+
+    // One trade now, in the current minute, and one in the minute just outside a 3-minute
+    // window that ends with the current minute. If the clock passes a minute boundary before
+    // the read, the window moves forward and both still hold.
+    const recent = await lift("62000");
+    const old = await lift("63000");
+    const now = new Date();
+    const current = candleStart(now);
+    await db.update(trades).set({ createdAt: now }).where(eq(trades.takerOrderId, recent.id));
+    await db
+      .update(trades)
+      .set({ createdAt: new Date(current.getTime() - 3 * 60_000) })
+      .where(eq(trades.takerOrderId, old.id));
+
+    const loaded = await loadCandles(db, btcUsd, { limit: 3 });
+
+    // Other tests may trade in the same minute, so only this test's bounds are asserted.
+    expect(loaded.at(-1)?.start).toEqual(current);
+    expect(loaded.every((candle) => candle.start.getTime() > current.getTime() - 3 * 60_000)).toBe(
+      true,
+    );
   });
 });

@@ -1,0 +1,1 @@
+CREATE INDEX "trades_market_created_at_idx" ON "trades" USING btree ("market","created_at");

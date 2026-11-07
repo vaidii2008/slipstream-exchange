@@ -206,6 +206,8 @@ export const trades = pgTable(
     // back once Session 10's recovery restores each market's sequence.
     index("trades_maker_order_id_idx").on(table.makerOrderId),
     index("trades_taker_order_id_idx").on(table.takerOrderId),
+    // Candle reads take one market's trades in a time window (see loadCandles).
+    index("trades_market_created_at_idx").on(table.market, table.createdAt),
     check("trades_price_positive", sql`${table.price} > 0`),
     check("trades_quantity_positive", sql`${table.quantity} > 0`),
   ],

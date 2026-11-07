@@ -30,7 +30,7 @@ const tradesQuery = z.strictObject({
 // 1,440 is one day of one-minute candles.
 const candlesQuery = z.strictObject({
   limit: z.coerce.number().int().min(1).max(1440).default(500),
-  // Paging back: the start of the oldest candle the client already has.
+  // Paging back: the start of the oldest minute the client already asked for.
   before: z.iso
     .datetime({ offset: true })
     .transform((value) => new Date(value))
