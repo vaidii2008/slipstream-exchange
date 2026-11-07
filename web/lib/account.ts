@@ -2,7 +2,7 @@
 // state of each of their orders.
 //
 // The server sends the whole balance sheet on subscribe and again after every settlement
-// that touches the user, each with a version: the highest ledger entry id it includes. Two
+// that touches the user and every deposit, each with a version: the highest ledger entry id it includes. Two
 // markets can settle for the same user at once, and the API reads their balances
 // independently, so the newer sheet can arrive first. The store keeps the highest version
 // and drops anything older, rather than trusting arrival order.
@@ -15,6 +15,7 @@
 import { create } from "zustand";
 import type { ServerMessage } from "@slipstream/protocol";
 import { compareAmounts } from "./markets";
+import { apiFetch } from "./session";
 
 type BalancesMessage = Extract<ServerMessage, { type: "balances" }>;
 
@@ -46,6 +47,22 @@ export const useBalances = create<BalanceStore>((set) => ({
     set({ sheet: undefined });
   },
 }));
+
+// What "Add demo funds" deposits: enough to trade both markets at the bots' prices.
+export const DEMO_FUNDS = [
+  { asset: "USD", amount: "100000" },
+  { asset: "BTC", amount: "1" },
+  { asset: "ETH", amount: "10" },
+] as const;
+
+// Simulated deposits through the same endpoint as any other. One after another, so a failure
+// stops the rest and says which asset it reached. The new balances arrive over the account
+// channel, not from these replies.
+export async function addDemoFunds(): Promise<void> {
+  for (const { asset, amount } of DEMO_FUNDS) {
+    await apiFetch("/deposits", { method: "POST", body: { asset, amount }, auth: true });
+  }
+}
 
 export type OrderStatus = "pending" | "open" | "filled" | "cancelled";
 

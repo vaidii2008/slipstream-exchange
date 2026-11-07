@@ -1,7 +1,9 @@
 "use client";
 
-import { useBalances } from "@/lib/account";
-import { useSession } from "@/lib/session";
+import { useMutation } from "@tanstack/react-query";
+import { Button } from "@/components/ui/button";
+import { addDemoFunds, DEMO_FUNDS, useBalances } from "@/lib/account";
+import { ApiError, useSession } from "@/lib/session";
 import { useSubscription } from "@/lib/socket";
 
 export function Balances() {
@@ -13,7 +15,10 @@ export function Balances() {
         <h2 className="font-medium">Balances</h2>
       </header>
       {status === "signed_in" ? (
-        <BalanceTable />
+        <>
+          <BalanceTable />
+          <DemoFunds />
+        </>
       ) : (
         <p className="px-3 pb-3 text-xs text-muted-foreground">Log in to see your balances.</p>
       )}
@@ -49,5 +54,30 @@ function BalanceTable() {
         ))}
       </tbody>
     </table>
+  );
+}
+
+const ADDED = DEMO_FUNDS.map(({ asset, amount }) => `${amount} ${asset}`).join(", ");
+
+function DemoFunds() {
+  const funding = useMutation({ mutationFn: addDemoFunds });
+  const failure =
+    funding.error instanceof ApiError ? funding.error.message : "could not reach the exchange";
+
+  return (
+    <div className="flex items-center gap-2 px-3 pb-3">
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={funding.isPending}
+        onClick={() => funding.mutate()}
+      >
+        {funding.isPending ? "Adding…" : "Add demo funds"}
+      </Button>
+      <p role="status" className="text-xs text-muted-foreground">
+        {funding.isError ? <span className="text-destructive">{failure}</span> : null}
+        {funding.isSuccess ? `Added ${ADDED}.` : null}
+      </p>
+    </div>
   );
 }
