@@ -23,21 +23,8 @@ Open [http://localhost:3001](http://localhost:3001) and register an account. Eig
 market maker and three noise traders per market, start quoting and trading BTC-USD and ETH-USD
 as soon as the API is healthy. Prometheus is on [http://localhost:9090](http://localhost:9090).
 
-The terminal has no deposit form yet, so fund your account through the API with the email
-and password you registered:
-
-```sh
-EMAIL=you@example.com PASSWORD='your password'
-TOKEN=$(curl -s localhost:3000/login -H 'content-type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | sed -E 's/.*"accessToken":"([^"]+)".*/\1/')
-for deposit in '{"asset":"USD","amount":"100000"}' '{"asset":"BTC","amount":"1"}'; do
-  curl -s localhost:3000/deposits -H "authorization: Bearer $TOKEN" \
-    -H 'content-type: application/json' -d "$deposit"; echo
-done
-```
-
-Reload the terminal to see the new balances: a deposit is not pushed over the socket, only
-order activity is.
+Click **Add demo funds** in the balances panel for 100,000 simulated USD, 1 BTC and 10 ETH,
+then trade.
 
 The `app` profile builds two images from this repo and runs, in order: Postgres, Redis and
 Prometheus; the migrations; the API; then the bot fleet and the terminal. Ports are published
