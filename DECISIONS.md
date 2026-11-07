@@ -2,6 +2,26 @@
 
 Each entry: the decision, the alternative, why, and where it lives.
 
+## Five decisions worth defending
+
+The rest of this file is every decision in the order the code met it. These five carry the
+design; each link goes to its full entry.
+
+1. [One serial queue per market covers the engine and its settlement](#one-serial-queue-per-market-covers-the-engine-and-its-settlement).
+   A single writer per market makes the book lock-free and the settlements commit in event
+   order. The price is a ceiling of one over the turn, about 264 commands/s here.
+2. [Reserve and record first, then match and settle in a second transaction](#reserve-and-record-first-then-match-and-settle-in-a-second-transaction).
+   The engine cannot roll back, so it only ever sees orders that are already funded.
+3. [The entries are the truth; each account caches their sum](#the-entries-are-the-truth-each-account-caches-their-sum),
+   with [every account locked in id order](#lock-every-account-a-transaction-touches-in-id-order-with-for-no-key-update).
+   Balances derive from a double-entry ledger. The cache took saturated throughput from
+   179–212 to 269–300 commands/s; the lock order took 29 deadlocks in 40 to 0.
+4. [Every engine command is logged before the engine applies it](#every-engine-command-is-logged-before-the-engine-applies-it).
+   A command in the log has happened, so a restart replays it and finishes it.
+5. [The book channel is a snapshot plus deltas that carry absolute level totals](#the-book-channel-is-a-snapshot-plus-deltas-that-carry-absolute-level-totals).
+   A repeated delta does no harm and a missed one shows as a sequence gap. No gap appeared in
+   1,791,445 deltas under load.
+
 ## Auth and sessions
 
 ### A replayed refresh token revokes its whole family
@@ -859,8 +879,8 @@ every reservation matching an open order.
   recovery, the unique (market, engine_sequence) on trades fails one of the two, which halts
   rather than pays twice. Closing the gap needs every settlement to check that it still holds
   the lock.
-- **Where:** `acquireMarketLock` in `marketlock.ts`; `#lock` and `close` in `exchange.ts`; the "two exchanges on one database" tests in
-  `exchange.test.ts`.
+- **Where:** `acquireMarketLock` in `marketlock.ts`; `#lock` and `close` in `exchange.ts`; the
+  "two exchanges on one database" tests in `exchange.test.ts`.
 
 ### Interview note: Session 11, measuring it
 
@@ -877,3 +897,30 @@ summed from their whole history (throughput fell from 250 to 123 commands/s as i
 no guard against two processes writing one database. Each number names its machine, date and
 kind, and the ones that predict each other agree: a 3.8 ms mean turn predicts 263/s and the
 measured ceiling was 264.
+
+## Shipping
+
+### One API image runs the API, the migrations and the bots, chosen by command
+
+- **Decision:** the root `Dockerfile` builds one image with the runtime dependencies and every
+  runtime `.ts` file. Compose runs it three times: `node migrate.ts` once, then `node main.ts`,
+  then `node fleet.ts`. Migrations use drizzle-orm's migrator, not drizzle-kit, which is a dev
+  dependency.
+- **Alternative:** an image per process, or migrating inside the API's boot.
+- **Why:** the three share code, dependencies and the Node version, so one image cannot drift
+  out of step with itself. A separate migrate step fails visibly before the API starts, and
+  the API never boots against a schema it does not expect. Compose makes the API wait for it
+  to exit 0.
+- **Where:** `Dockerfile`, `migrate.ts`, the `app` profile in `compose.yaml`.
+
+### The terminal's API address is a build argument
+
+- **Decision:** `NEXT_PUBLIC_API_URL` is an `ARG` of `web/Dockerfile`, and the README says it is
+  fixed when the image is built.
+- **Alternative:** read it at runtime, through a config endpoint or a script that rewrites the
+  bundle on start.
+- **Why:** Next.js inlines `NEXT_PUBLIC_` values into the browser bundle during `next build`.
+  An environment variable on the running container is never read. A runtime config fetch adds a
+  request before the first API call, and rewriting the bundle is fragile. A new address means a
+  rebuild. The API's `WEB_ORIGIN` must match the terminal's address, or CORS refuses it.
+- **Where:** `web/Dockerfile`; `API_URL` in `web/lib/session.ts`.
