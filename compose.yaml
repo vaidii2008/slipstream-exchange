@@ -45,6 +45,72 @@ services:
       timeout: 2s
       retries: 15
 
+  # The whole stack from the repo's own images: `docker compose --profile app up`, then open
+  # http://localhost:3001. Without the profile only the services above start, for running
+  # the API and the terminal from source. The secrets below are fixed so the quick start
+  # needs no .env; they are for this local simulator only.
+  migrate:
+    profiles: [app]
+    build: .
+    image: slipstream-api:local
+    command: ["node", "migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://slipstream:slipstream@postgres:5432/slipstream
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: [app]
+    build: .
+    image: slipstream-api:local
+    environment:
+      DATABASE_URL: postgres://slipstream:slipstream@postgres:5432/slipstream
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: local-demo-only-access-token-secret-0123456789
+      # Must be the terminal's address as the browser sees it, or CORS refuses its requests.
+      WEB_ORIGIN: http://localhost:3001
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  bots:
+    profiles: [app]
+    build: .
+    image: slipstream-api:local
+    command: ["node", "fleet.ts"]
+    environment:
+      BOT_API_URL: http://api:3000
+      # From .env when it sets one, so bot accounts a source run registered still sign in.
+      BOT_PASSWORD: ${BOT_PASSWORD:-local-demo-only-bot-password}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # Baked into the bundle at build time: the API's address as the browser sees it.
+        NEXT_PUBLIC_API_URL: http://localhost:3000
+    image: slipstream-web:local
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   postgres-data:
   prometheus-data:
