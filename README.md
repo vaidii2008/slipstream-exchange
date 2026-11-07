@@ -57,7 +57,46 @@ cd web && npm ci && npm run dev # terminal on :3001
 ```
 
 `npm run check` is the gate every commit passes: format, typecheck, lint, the test suite
-(440 tests against real Postgres and Redis) and the terminal's typecheck, lint and build.
+(466 tests against real Postgres and Redis) and the terminal's typecheck, lint and build.
+
+### Letting a language model trade
+
+`mcp.ts` is a [Model Context Protocol](https://modelcontextprotocol.io) server. A host such as
+Claude Desktop or Claude Code starts it as a child process and talks to it over stdin and
+stdout. It signs in to the API as one agent account and offers seven tools: `get_market`,
+`get_order_book`, `get_recent_trades`, `get_balances`, `get_open_orders`, `place_order` and
+`cancel_order`.
+
+It is one more client of the public API, like the terminal and the bots. Every tool call
+becomes an HTTP request a person could have made, and every order goes through the same risk
+guard as a bot's before it is sent: 0.05 BTC (or 1 ETH) per order, 0.25 BTC (or 5 ETH) of
+position, 10 resting orders. If equity falls more than 5,000 USD below where the session
+started, a kill switch cancels everything resting and refuses every order after, until the
+server is restarted. The model sees each refusal as an error result, with the reason.
+
+Set `AGENT_EMAIL`, `AGENT_PASSWORD` and optionally `AGENT_MARKET` (default `BTC-USD`) and
+`AGENT_API_URL`. The account is registered on first start. Fund it from the terminal's "Add
+demo funds" button after signing in as it; the model has no deposit tool. A host config looks
+like this, with absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "slipstream": {
+      "command": "/path/to/node",
+      "args": ["/path/to/slipstream-exchange/mcp.ts"],
+      "env": {
+        "AGENT_API_URL": "http://localhost:3000",
+        "AGENT_EMAIL": "agent@agents.slipstream.local",
+        "AGENT_PASSWORD": "a-password-of-8-or-more"
+      }
+    }
+  }
+}
+```
+
+stdout is the protocol channel. Run it as `node mcp.ts` or `npm run --silent mcp`; plain
+`npm run mcp` prints npm's banner to stdout, which a host reads as a malformed message.
 
 ## Architecture
 
@@ -191,6 +230,10 @@ from 7.0–7.5 ms to 0.07–0.21 ms, a single Postgres query timed in `psql` wit
 - **One process per market.** The advisory lock refuses a second writer, but a settlement
   already in flight when the lock drops still commits. The trades table's unique (market,
   sequence) makes a double settlement fail and halt rather than pay twice.
+- **The MCP server's limits last one process.** The position and loss limits count from where
+  the server started, and a tripped kill switch resets on restart. Orders carry no client
+  order id, so a `place_order` retried after a timeout can place twice. Stopping the server
+  leaves the agent's resting orders in the book.
 - **A market's ceiling is its round trips.** One command at a time means one market tops out
   at a few hundred commands a second here. Settling several queued commands per transaction is
   the lever, and it is not built.
@@ -210,7 +253,10 @@ reasons are in the commit history: each `refactor:` commit names its pressure.
 | `events.ts`, `recovery.ts`        | The engine event log, replay and crash recovery.             |
 | `trading.ts`, `wallet.ts`         | Order and balance routes.                                    |
 | `ws.ts`, `feed.ts`, `protocol.ts` | WebSocket gateway, Redis feed, the wire types.               |
-| `bots.ts`, `strategies.ts`        | Bot runtime, risk limits, market maker and noise trader.     |
+| `client.ts`                       | The typed HTTP client the bots and the MCP server share.     |
+| `risk.ts`                         | Pre-trade limits, the loss limit and cancel-all.             |
+| `bots.ts`, `strategies.ts`        | Bot runtime, market maker and noise trader.                  |
+| `mcp.ts`                          | The MCP server that lets a language model trade.             |
 | `money.ts`                        | The only conversion between decimal strings and minor units. |
 | `web/`                            | The trading terminal.                                        |
 | `load/`                           | k6 scripts and the bench database tool.                      |
