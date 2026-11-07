@@ -1,6 +1,7 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import {
+  accountState,
   balancesOf,
   deposit,
   LedgerError,
@@ -221,6 +222,35 @@ describe("balancesOf", () => {
       scale: 8,
       available: 380n,
       reserved: 120n,
+    });
+  });
+});
+
+describe("accountState", () => {
+  it("starts at version 0 for a user with no entries", async () => {
+    const userId = await createUser();
+
+    await expect(accountState(db, userId)).resolves.toMatchObject({ version: 0 });
+  });
+
+  it("versions balances by the user's own latest entry, not anyone else's", async () => {
+    const userId = await createUser();
+    const someoneElse = await createUser();
+    await deposit(db, userId, "BTC", 500n);
+    await reserve(db, userId, "BTC", 200n);
+    await deposit(db, userId, "USD", 100n);
+    await deposit(db, someoneElse, "BTC", 999n);
+    const latest = await db.execute<{ id: string }>(sql`
+      select max(e.id)::text as id from ledger_entries e
+      join ledger_accounts a on a.id = e.account_id
+      where a.user_id = ${userId}`);
+
+    const state = await accountState(db, userId);
+
+    expect(state.version).toBe(Number(latest.rows[0]?.id));
+    expect(state.balances.find((balance) => balance.asset === "BTC")).toMatchObject({
+      available: 300n,
+      reserved: 200n,
     });
   });
 });

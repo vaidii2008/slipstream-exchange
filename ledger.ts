@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, max, sql, sum } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import { formatAmount, fromNumeric } from "./money.ts";
@@ -282,9 +282,7 @@ export type Balance = {
   reserved: bigint;
 };
 
-// Every listed asset, zero where the user has no entries. Summed from the entries, the source
-// of truth, not read from the cached balance: a read takes no lock and is off the order path,
-// and accountState's version needs the entries anyway.
+// Every listed asset, zero where the user has no accounts yet.
 export async function balancesOf(db: Database, userId: string): Promise<Balance[]> {
   return (await accountState(db, userId)).balances;
 }
@@ -292,6 +290,10 @@ export async function balancesOf(db: Database, userId: string): Promise<Balance[
 // Balances with a version: the highest ledger entry id they include, 0 before any. Entry ids
 // only grow, so of two reads the one with the higher version saw at least everything the
 // other did. Both come from one statement, so they always describe the same moment.
+//
+// Balances come from the cached column, not from summing entries: bots read their balances
+// every tick, and a sum grows with each account's history while competing with settlement
+// for Postgres. Each account's latest entry id is one lookup on (account_id, id).
 export async function accountState(
   db: Database,
   userId: string,
@@ -301,16 +303,18 @@ export async function accountState(
       asset: assets.code,
       scale: assets.scale,
       bucket: ledgerAccounts.bucket,
-      total: sum(ledgerEntries.amount),
-      lastEntry: max(ledgerEntries.id),
+      total: ledgerAccounts.balance,
+      // pg returns a bigint as a string; null for an account with no entries, or no account.
+      lastEntry: sql<string | null>`(
+        select max(${ledgerEntries.id}) from ${ledgerEntries}
+        where ${ledgerEntries.accountId} = ${ledgerAccounts.id}
+      )`,
     })
     .from(assets)
     .leftJoin(
       ledgerAccounts,
       and(eq(ledgerAccounts.asset, assets.code), eq(ledgerAccounts.userId, userId)),
     )
-    .leftJoin(ledgerEntries, eq(ledgerEntries.accountId, ledgerAccounts.id))
-    .groupBy(assets.code, assets.scale, ledgerAccounts.bucket)
     .orderBy(assets.code);
 
   let version = 0;
@@ -325,8 +329,8 @@ export async function accountState(
     if (row.bucket !== null && row.total !== null) {
       balance[row.bucket] = fromNumeric(row.total, row.scale);
     }
-    if (row.lastEntry !== null && row.lastEntry > version) {
-      version = row.lastEntry;
+    if (row.lastEntry !== null) {
+      version = Math.max(version, Number(row.lastEntry));
     }
     balances.set(row.asset, balance);
   }

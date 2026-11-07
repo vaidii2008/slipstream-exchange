@@ -73,8 +73,9 @@ Each entry: the decision, the alternative, why, and where it lives.
 - **Decision:** `ledger_accounts.balance` holds the sum of the account's entries.
   `postTransaction` moves it by the net of its entries in the same transaction, under the
   account's row lock, and the overdraft check reads it instead of summing. The migration that
-  added it backfilled it from the entries. Balance reads (`balancesOf`, `accountState`) still sum
-  the entries. Until 7 November there was no column.
+  added it backfilled it from the entries. Since 7 November, balance reads (`balancesOf`,
+  `accountState`) read it too. Their version, the latest entry id, is one lookup on an
+  `(account_id, id)` index. Until 7 November there was no column.
 - **Alternative:** no column, summing on every check (the original design); or periodic balance
   checkpoints, which bound the sum but add a second table and a second rule for what a balance is.
 - **Why:** summing made every debit check scale with the account's history. Throughput fell from

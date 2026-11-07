@@ -92,6 +92,13 @@
       "when": 1794031717346,
       "tag": "0012_cache_account_balances",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1794034796641,
+      "tag": "0013_index_entries_by_account_and_id",
+      "breakpoints": true
     }
   ]
 }

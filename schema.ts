@@ -134,7 +134,9 @@ export const ledgerEntries = pgTable(
     amount: money("amount").notNull(),
   },
   (table) => [
-    index("ledger_entries_account_id_idx").on(table.accountId),
+    // With id second, an account's latest entry is one index lookup: accountState reads it as
+    // a balance's version without visiting the account's history.
+    index("ledger_entries_account_id_id_idx").on(table.accountId, table.id),
     index("ledger_entries_transaction_id_idx").on(table.transactionId),
     check("ledger_entries_amount_nonzero", sql`${table.amount} <> 0`),
   ],
