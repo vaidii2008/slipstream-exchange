@@ -201,6 +201,18 @@ describe("recovery when a market opens", () => {
     ]);
   });
 
+  it("does not count a rejected cancel after the frontier as a settlement", async () => {
+    const market = await testMarket("BTC-USD");
+    const seller = await funded({ BTC: "1" });
+    await new Exchange(db).placeOrder(market, limit(seller, "sell", "60000", "0.1"));
+    // A cancel of an order that is not resting: one rejected event, nothing to write.
+    await appendCommand(db, market.symbol, 2, { type: "cancel", orderId: "already-gone" });
+
+    await expect(new Exchange(db).open([market])).resolves.toEqual([
+      { market: market.symbol, sequence: 2, halted: false, settled: 0, cancelled: 0 },
+    ]);
+  });
+
   it("halts a market whose rebuilt book disagrees with Postgres", async () => {
     const market = await testMarket("BTC-USD");
     const seller = await funded({ BTC: "1" });

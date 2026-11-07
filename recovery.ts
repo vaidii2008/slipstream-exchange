@@ -45,10 +45,10 @@ export async function recover(
 
 // Settlement writes the number of every event it applies onto the orders it touches, and a
 // market's commands settle one at a time in log order. So the highest number on any of the
-// market's orders is the last settled event, and every command numbered after it is unsettled.
-// (A command whose only event is a rejected cancel writes nothing, settled or not, and needs
-// nothing.) At most the last command is unsettled after a crash; after a halt, the command
-// whose settlement failed, which may fail again and halt the market again.
+// market's orders is the last settled event, and every command numbered after it is unsettled,
+// except a rejected cancel, which writes nothing and needs nothing. At most the last command
+// that writes is unsettled after a crash; after a halt, the command whose settlement failed,
+// which may fail again and halt the market again.
 async function settleInterrupted(
   db: Database,
   market: Market,
@@ -67,7 +67,9 @@ async function settleInterrupted(
     if (events === undefined) {
       throw new Error(`replay returned no events for command ${sequence}`);
     }
-    if (sequence > frontier) {
+    // A rejected cancel writes nothing, so it can sit past the frontier settled or not.
+    const writes = events.some((event) => event.type !== "cancel_rejected");
+    if (sequence > frontier && writes) {
       // Trades are unique on (market, engine_sequence): if this rule were ever wrong and the
       // command had settled, the insert fails and the market halts rather than pay twice.
       await settle(db, market, events, takerLimitOf(command), loggedAt);
