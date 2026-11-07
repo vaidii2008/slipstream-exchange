@@ -1756,3 +1756,82 @@ to it, the account channel is the piece to split out.
 **Repo shape**
 
 - No new files.
+
+## Day 17 — An LLM agent trades through MCP
+
+**Commits landed (12)**
+
+- `refactor(bots): extract the API client so a second client can share it`
+- `refactor(bots): extract the risk controls so a second client can share them`
+- `feat(mcp): add an MCP server over stdio that signs in as an agent account`
+- `feat(mcp): expose read tools for the market, order book, recent trades, balances and open orders`
+- `refactor(money): move the amount parse messages next to parseAmount`
+- `feat(mcp): expose place and cancel order tools gated by the risk limits`
+- `feat(mcp): block trading tools and cancel open orders when the kill switch trips`
+- `fix(config): let the API say which markets exist, not a list in AGENT_MARKET`
+- `test(mcp): drive a scripted tool session against a running exchange`
+- `docs: add the MCP server to the README with its limits and a host config`
+- `docs: record the MCP server's decisions and the Session 13 interview note`
+- `docs: record day 17 in PROGRESS.md`
+
+**What now works**
+
+- `node mcp.ts` (or `npm run --silent mcp`) is an MCP server on stdio. It registers or signs in
+  to the account in `AGENT_EMAIL` and `AGENT_PASSWORD`, reads `AGENT_MARKET` (default BTC-USD)
+  and puts the market's grid in its initialize instructions.
+- Seven tools: `get_market`, `get_order_book` (up to 20 levels), `get_recent_trades` (up to
+  50), `get_balances`, `get_open_orders`, all marked read-only; `place_order` (destructive) and
+  `cancel_order` (idempotent). Amounts are decimal strings both ways.
+- Every order passes the bots' `RiskGuard`: 0.05 BTC or 1 ETH per order, 0.25 BTC or 5 ETH of
+  position counting resting orders as filled, 10 resting orders. A refused order is never sent.
+- The kill switch checks the 5,000 USD loss limit before and after each order and every 5 s.
+  Tripped, it waits for any order in flight, cancels everything resting and refuses every
+  order after; reads and cancels still work. Breaking the in-flight wait or the pre-order
+  check each fails a test.
+- Every refusal is an error result with a reason: the limit and its value, the API's own
+  error code and message, or the API's wording for a bad amount.
+- The scripted stdio session runs the real process against a test server in about 1.4 s.
+  5 of 5 repeat runs passed with no child process left.
+- 466 tests in 36 files, up from 441.
+
+**What is stubbed**
+
+- Stopping the MCP server leaves the agent's resting orders in the book; a bot cancels its
+  own on stop.
+- `place_order` sends no client order id, so a retry after a timeout can place twice.
+- Not tried with a real host (Claude Desktop or Claude Code). The stdio test uses the SDK's
+  own client.
+- Carried over: the in-flight settlement gap when a market's lock drops, drizzle-kit's
+  dev-only audit findings, the web dependencies' moderate audit findings, Safari unchecked.
+  `npm audit --omit=dev` reports zod below 4.6.6 (high) and fast-uri (moderate); both were in
+  the lockfile before this session.
+
+**Decisions and deviations from the plan**
+
+- The plan's one refactor became three: the API client (`client.ts`), the risk controls
+  (`risk.ts`) and the amount messages (into `money.ts`), each with its pressure named.
+- `maxFailedTicks` is about ticks, so it moved to a new `AgentLimits` type in `bots.ts`;
+  `RiskLimits` keeps the four limits a non-bot client shares.
+- Added `get_market`: the model cannot build a valid order without the tick and step.
+- After a trip, `cancel_order` still works; only `place_order` is blocked. A cancel can only
+  lower risk, and after the trip there is nothing left to cancel.
+- `AGENT_MARKET` started as an enum and became any symbol, checked against the API at startup,
+  so the stdio test can run on a market of its own.
+- The model has no deposit tool. The operator funds the account; otherwise the model could
+  undo its own loss limit.
+- Tests for each tool travel with the tool's commit (in process, `mcp.test.ts`); the plan's
+  test commit is the stdio session (`mcp.session.test.ts`).
+
+**Repo shape**
+
+- New: `client.ts`, `risk.ts` (refactors, pressure named), `mcp.ts` (a new process),
+  `mcp.test.ts`, `mcp.session.test.ts` (a child-process harness, and `mcp.test.ts` is past
+  500 lines).
+- `mcp.ts` is 481 lines: the session and kill switch, then the tools. If Session 14's agent
+  loop needs the session without the tools, that is the split.
+- New dependency: `@modelcontextprotocol/sdk` 1.32.2 (approved).
+
+**Next: Session 14 — Agent evals (stretch)**
+
+- No migrations this session. New `.env` lines: `AGENT_EMAIL`, `AGENT_PASSWORD`, and
+  optionally `AGENT_MARKET` and `AGENT_API_URL` (see `.env.example`).
