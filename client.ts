@@ -32,6 +32,12 @@ export type PlaceResult =
   // refused it and nothing was sent.
   | { ok: false; status: number; error: string };
 
+// One price level of the book: the total resting quantity at that price.
+export type BookLevel = { price: bigint; quantity: bigint };
+export type Book = { bids: BookLevel[]; asks: BookLevel[] };
+
+export type Trade = { price: bigint; quantity: bigint; takerSide: Side; createdAt: string };
+
 export type OpenOrder = {
   id: string;
   side: Side;
@@ -84,7 +90,18 @@ const ordersReply = z.object({
     }),
   ),
 });
-const tradesReply = z.object({ trades: z.array(z.object({ price: z.string() })) });
+const tradesReply = z.object({
+  trades: z.array(
+    z.object({
+      price: z.string(),
+      quantity: z.string(),
+      takerSide: z.enum(["buy", "sell"]),
+      createdAt: z.string(),
+    }),
+  ),
+});
+const levelReply = z.object({ price: z.string(), quantity: z.string() });
+const bookReply = z.object({ bids: z.array(levelReply), asks: z.array(levelReply) });
 
 export class ApiError extends Error {
   readonly status: number;
@@ -271,14 +288,37 @@ export class ApiClient {
 
   // The prices of the market's latest trades, newest first.
   async recentPrices(market: MarketInfo, limit: number): Promise<bigint[]> {
+    return (await this.recentTrades(market, limit)).map((trade) => trade.price);
+  }
+
+  // The market's latest trades, newest first.
+  async recentTrades(market: MarketInfo, limit: number): Promise<Trade[]> {
     const path = `/markets/${encodeURIComponent(market.symbol)}/trades?limit=${limit}`;
     const reply = await this.#send("GET", path, undefined, false);
     if (reply.status !== 200) {
       throw new ApiError("GET", path, reply.status, reply.body);
     }
-    return tradesReply
-      .parse(reply.body)
-      .trades.map((trade) => units(trade.price, market.quoteScale));
+    return tradesReply.parse(reply.body).trades.map((trade) => ({
+      price: units(trade.price, market.quoteScale),
+      quantity: units(trade.quantity, market.baseScale),
+      takerSide: trade.takerSide,
+      createdAt: trade.createdAt,
+    }));
+  }
+
+  // The best `depth` levels each side, best first.
+  async book(market: MarketInfo, depth: number): Promise<Book> {
+    const path = `/markets/${encodeURIComponent(market.symbol)}/book?depth=${depth}`;
+    const reply = await this.#send("GET", path, undefined, false);
+    if (reply.status !== 200) {
+      throw new ApiError("GET", path, reply.status, reply.body);
+    }
+    const body = bookReply.parse(reply.body);
+    const level = (entry: z.infer<typeof levelReply>): BookLevel => ({
+      price: units(entry.price, market.quoteScale),
+      quantity: units(entry.quantity, market.baseScale),
+    });
+    return { bids: body.bids.map(level), asks: body.asks.map(level) };
   }
 
   // The price of the market's latest trade, or undefined before its first.
