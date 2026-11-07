@@ -297,200 +297,212 @@ const printed = (book: { sequence: number; bids: unknown[]; asks: unknown[] }): 
     ),
   ) as Book;
 
-// Resolves once `check` passes, polling every 20 ms.
-async function until(check: () => Promise<boolean> | boolean, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+// Resolves once `check` passes, polling every 20 ms. The ceiling is generous because each
+// condition depends on how busy Postgres is: straight after a load run on the same server, a
+// 10 s ceiling was passed. A passing run returns as soon as its condition holds, so the
+// ceiling only bounds how long a failing run takes to say so.
+const WAIT_CEILING_MS = 60_000;
+
+async function until(what: string, check: () => Promise<boolean> | boolean): Promise<void> {
+  const startedAt = Date.now();
   while (!(await check())) {
-    if (Date.now() > deadline) {
-      throw new Error("timed out waiting");
+    if (Date.now() - startedAt > WAIT_CEILING_MS) {
+      throw new Error(`timed out after ${WAIT_CEILING_MS} ms waiting for ${what}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
 describe("a process killed mid-load", () => {
-  it("leaves a log that rebuilds its book, finishes its settlement and balances", async () => {
-    const market = await testMarket("BTC-USD");
-    const userIds: string[] = [];
-    for (let i = 0; i < 6; i++) {
-      const userId = await funded({ USD: "100000000", BTC: "10000" });
-      // Every account settlement can debit exists before the lock below is taken.
-      for (const asset of ["USD", "BTC"]) {
-        await openAccount(db, userId, asset, "reserved");
-      }
-      userIds.push(userId);
-    }
-
-    const child = spawn(
-      process.execPath,
-      ["recovery.child.ts", market.symbol, JSON.stringify(userIds)],
-      {
-        env: { ...process.env, DATABASE_URL: testDatabaseUrl() },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    const books: Book[] = [];
-    let partial = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      const lines = (partial + chunk).split("\n");
-      partial = lines.pop() ?? "";
-      books.push(...lines.map((line) => JSON.parse(line) as Book));
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    let exited = false;
-    const exit = new Promise<NodeJS.Signals | number | null>((resolve) => {
-      child.on("exit", (code, signal) => {
-        exited = true;
-        resolve(signal ?? code);
-      });
-    });
-
-    const lock = await pool.connect();
-    try {
-      await until(() => {
-        if (exited) {
-          throw new Error(`the load process exited early: ${stderr}`);
+  it(
+    "leaves a log that rebuilds its book, finishes its settlement and balances",
+    async () => {
+      const market = await testMarket("BTC-USD");
+      const userIds: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const userId = await funded({ USD: "100000000", BTC: "10000" });
+        // Every account settlement can debit exists before the lock below is taken.
+        for (const asset of ["USD", "BTC"]) {
+          await openAccount(db, userId, asset, "reserved");
         }
-        return books.length >= 300;
-      });
-
-      // Hold every reserved account. The next command that trades or cancels is logged and
-      // applied, then its settlement waits here; the other users' orders are reserved and
-      // recorded behind it, and wait in the queue without being logged.
-      await lock.query("begin");
-      await lock.query(
-        "select id from ledger_accounts where user_id = any($1) and bucket = 'reserved' for update",
-        [userIds],
-      );
-      const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");
-      await until(async () => {
-        const waiting = await pool.query<{ n: number }>(
-          `select count(*)::int as n from pg_locks
-           where locktype = 'transactionid' and not granted and transactionid::text = $1`,
-          [holder.rows[0]?.xid],
-        );
-        return (waiting.rows[0]?.n ?? 0) > 0;
-      });
-      const logged = async () => (await readLog(db, market.symbol)).map((entry) => entry.sequence);
-      // Wait for orders the log has not seen: pending, and not the blocked command's own.
-      await until(async () => {
-        const ids = new Set(
-          (await readLog(db, market.symbol)).flatMap((entry) =>
-            entry.command.type === "submit" ? [entry.command.order.id] : [],
-          ),
-        );
-        const pending = await db
-          .select({ id: orders.id })
-          .from(orders)
-          .where(and(eq(orders.market, market.symbol), eq(orders.status, "pending")));
-        return pending.some((order) => !ids.has(order.id));
-      });
-
-      child.kill("SIGKILL");
-      await expect(exit).resolves.toBe("SIGKILL");
-      expect((await logged()).at(-1)).toBe(books.at(-1)!.sequence + 1);
-    } finally {
-      child.kill("SIGKILL");
-      await lock.query("rollback");
-      lock.release();
-    }
-
-    // The process died between logging a command and settling it, with other orders reserved
-    // and never logged.
-    const log = await readLog(db, market.symbol);
-    const loggedIds = new Set(
-      log.flatMap((entry) => (entry.command.type === "submit" ? [entry.command.order.id] : [])),
-    );
-    const pendingBefore = await db
-      .select({ id: orders.id })
-      .from(orders)
-      .where(and(eq(orders.market, market.symbol), eq(orders.status, "pending")));
-    const unlogged = pendingBefore.filter((order) => !loggedIds.has(order.id));
-    expect(unlogged.length).toBeGreaterThan(0);
-
-    // The log up to the last command the process reported rebuilds exactly the book it had.
-    const last = books.at(-1)!;
-    const prefix = new Engine(market.symbol);
-    replay(
-      prefix,
-      log.filter((entry) => entry.sequence <= last.sequence),
-    );
-    expect(printed(prefix.depth(100_000))).toEqual(last);
-
-    // A new process opens the market: it settles the interrupted command and cancels the
-    // orders that never reached the log.
-    const after = new Exchange(db);
-    await expect(after.open([market])).resolves.toEqual([
-      {
-        market: market.symbol,
-        sequence: log.at(-1)!.sequence + replay(new Engine(market.symbol), log).at(-1)!.length - 1,
-        halted: false,
-        replayed: log.length,
-        settled: 1,
-        cancelled: unlogged.length,
-      },
-    ]);
-
-    // Nothing is left pending, and the rebuilt book is the open orders in Postgres.
-    const rows = await db
-      .select({
-        userId: orders.userId,
-        side: orders.side,
-        price: orders.price,
-        quantity: orders.quantity,
-        filled: orders.filledQuantity,
-        status: orders.status,
-      })
-      .from(orders)
-      .where(eq(orders.market, market.symbol));
-    expect(rows.filter((row) => row.status === "pending")).toEqual([]);
-    const open = rows
-      .filter((row) => row.status === "open")
-      .map((row) => ({
-        userId: row.userId,
-        side: row.side,
-        price: fromNumeric(row.price!, 8),
-        remaining: fromNumeric(row.quantity, 8) - fromNumeric(row.filled, 8),
-      }));
-    const levels = (side: "buy" | "sell") => {
-      const totals = new Map<bigint, bigint>();
-      for (const order of open.filter((o) => o.side === side)) {
-        totals.set(order.price, (totals.get(order.price) ?? 0n) + order.remaining);
+        userIds.push(userId);
       }
-      return [...totals]
-        .sort(([a], [b]) => (side === "buy" ? (a > b ? -1 : 1) : a < b ? -1 : 1))
-        .map(([price, quantity]) => ({ price, quantity }));
-    };
-    const rebuilt = after.depth(market.symbol, 100_000);
-    expect(rebuilt.bids).toEqual(levels("buy"));
-    expect(rebuilt.asks).toEqual(levels("sell"));
 
-    // Every asset still sums to zero, and each user's reserved balance is exactly what their
-    // open orders hold: nothing the crash interrupted is left stranded.
-    for (const { total } of await ledgerTotals()) {
-      expect(total).toBe(0);
-    }
-    for (const userId of userIds) {
-      const mine = open.filter((order) => order.userId === userId);
-      const held = (side: "buy" | "sell") => mine.filter((order) => order.side === side);
-      await expect(balance(userId, "BTC")).resolves.toMatchObject({
-        reserved: held("sell").reduce((sum, order) => sum + order.remaining, 0n),
+      const child = spawn(
+        process.execPath,
+        ["recovery.child.ts", market.symbol, JSON.stringify(userIds)],
+        {
+          env: { ...process.env, DATABASE_URL: testDatabaseUrl() },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      const books: Book[] = [];
+      let partial = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        const lines = (partial + chunk).split("\n");
+        partial = lines.pop() ?? "";
+        books.push(...lines.map((line) => JSON.parse(line) as Book));
       });
-      await expect(balance(userId, "USD")).resolves.toMatchObject({
-        reserved: held("buy").reduce(
-          (sum, order) => sum + notional(order.price, order.remaining, 8),
-          0n,
-        ),
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
       });
-    }
+      let exited = false;
+      const exit = new Promise<NodeJS.Signals | number | null>((resolve) => {
+        child.on("exit", (code, signal) => {
+          exited = true;
+          resolve(signal ?? code);
+        });
+      });
 
-    // And the market trades on from where the log ends.
-    const next = await after.placeOrder(market, limit(userIds[0]!, "buy", "50000", "0.001"));
-    expect(next.status).toBe("open");
-    expect(after.depth(market.symbol, 1).sequence).toBe(rebuilt.sequence + 1);
-  }, 30_000);
+      const lock = await pool.connect();
+      try {
+        await until("the load process to report 300 commands", () => {
+          if (exited) {
+            throw new Error(`the load process exited early: ${stderr}`);
+          }
+          return books.length >= 300;
+        });
+
+        // Hold every reserved account. The next command that trades or cancels is logged and
+        // applied, then its settlement waits here; the other users' orders are reserved and
+        // recorded behind it, and wait in the queue without being logged.
+        await lock.query("begin");
+        await lock.query(
+          "select id from ledger_accounts where user_id = any($1) and bucket = 'reserved' for update",
+          [userIds],
+        );
+        const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");
+        await until("a settlement to wait on the held accounts", async () => {
+          const waiting = await pool.query<{ n: number }>(
+            `select count(*)::int as n from pg_locks
+           where locktype = 'transactionid' and not granted and transactionid::text = $1`,
+            [holder.rows[0]?.xid],
+          );
+          return (waiting.rows[0]?.n ?? 0) > 0;
+        });
+        const logged = async () =>
+          (await readLog(db, market.symbol)).map((entry) => entry.sequence);
+        // Wait for orders the log has not seen: pending, and not the blocked command's own.
+        await until("an order reserved behind the blocked settlement", async () => {
+          const ids = new Set(
+            (await readLog(db, market.symbol)).flatMap((entry) =>
+              entry.command.type === "submit" ? [entry.command.order.id] : [],
+            ),
+          );
+          const pending = await db
+            .select({ id: orders.id })
+            .from(orders)
+            .where(and(eq(orders.market, market.symbol), eq(orders.status, "pending")));
+          return pending.some((order) => !ids.has(order.id));
+        });
+
+        child.kill("SIGKILL");
+        await expect(exit).resolves.toBe("SIGKILL");
+        expect((await logged()).at(-1)).toBe(books.at(-1)!.sequence + 1);
+      } finally {
+        child.kill("SIGKILL");
+        await lock.query("rollback");
+        lock.release();
+      }
+
+      // The process died between logging a command and settling it, with other orders reserved
+      // and never logged.
+      const log = await readLog(db, market.symbol);
+      const loggedIds = new Set(
+        log.flatMap((entry) => (entry.command.type === "submit" ? [entry.command.order.id] : [])),
+      );
+      const pendingBefore = await db
+        .select({ id: orders.id })
+        .from(orders)
+        .where(and(eq(orders.market, market.symbol), eq(orders.status, "pending")));
+      const unlogged = pendingBefore.filter((order) => !loggedIds.has(order.id));
+      expect(unlogged.length).toBeGreaterThan(0);
+
+      // The log up to the last command the process reported rebuilds exactly the book it had.
+      const last = books.at(-1)!;
+      const prefix = new Engine(market.symbol);
+      replay(
+        prefix,
+        log.filter((entry) => entry.sequence <= last.sequence),
+      );
+      expect(printed(prefix.depth(100_000))).toEqual(last);
+
+      // A new process opens the market: it settles the interrupted command and cancels the
+      // orders that never reached the log.
+      const after = new Exchange(db);
+      await expect(after.open([market])).resolves.toEqual([
+        {
+          market: market.symbol,
+          sequence:
+            log.at(-1)!.sequence + replay(new Engine(market.symbol), log).at(-1)!.length - 1,
+          halted: false,
+          replayed: log.length,
+          settled: 1,
+          cancelled: unlogged.length,
+        },
+      ]);
+
+      // Nothing is left pending, and the rebuilt book is the open orders in Postgres.
+      const rows = await db
+        .select({
+          userId: orders.userId,
+          side: orders.side,
+          price: orders.price,
+          quantity: orders.quantity,
+          filled: orders.filledQuantity,
+          status: orders.status,
+        })
+        .from(orders)
+        .where(eq(orders.market, market.symbol));
+      expect(rows.filter((row) => row.status === "pending")).toEqual([]);
+      const open = rows
+        .filter((row) => row.status === "open")
+        .map((row) => ({
+          userId: row.userId,
+          side: row.side,
+          price: fromNumeric(row.price!, 8),
+          remaining: fromNumeric(row.quantity, 8) - fromNumeric(row.filled, 8),
+        }));
+      const levels = (side: "buy" | "sell") => {
+        const totals = new Map<bigint, bigint>();
+        for (const order of open.filter((o) => o.side === side)) {
+          totals.set(order.price, (totals.get(order.price) ?? 0n) + order.remaining);
+        }
+        return [...totals]
+          .sort(([a], [b]) => (side === "buy" ? (a > b ? -1 : 1) : a < b ? -1 : 1))
+          .map(([price, quantity]) => ({ price, quantity }));
+      };
+      const rebuilt = after.depth(market.symbol, 100_000);
+      expect(rebuilt.bids).toEqual(levels("buy"));
+      expect(rebuilt.asks).toEqual(levels("sell"));
+
+      // Every asset still sums to zero, and each user's reserved balance is exactly what their
+      // open orders hold: nothing the crash interrupted is left stranded.
+      for (const { total } of await ledgerTotals()) {
+        expect(total).toBe(0);
+      }
+      for (const userId of userIds) {
+        const mine = open.filter((order) => order.userId === userId);
+        const held = (side: "buy" | "sell") => mine.filter((order) => order.side === side);
+        await expect(balance(userId, "BTC")).resolves.toMatchObject({
+          reserved: held("sell").reduce((sum, order) => sum + order.remaining, 0n),
+        });
+        await expect(balance(userId, "USD")).resolves.toMatchObject({
+          reserved: held("buy").reduce(
+            (sum, order) => sum + notional(order.price, order.remaining, 8),
+            0n,
+          ),
+        });
+      }
+
+      // And the market trades on from where the log ends.
+      const next = await after.placeOrder(market, limit(userIds[0]!, "buy", "50000", "0.001"));
+      expect(next.status).toBe("open");
+      expect(after.depth(market.symbol, 1).sequence).toBe(rebuilt.sequence + 1);
+      // Three waits at their ceiling, plus the replay and checks after them.
+    },
+    4 * WAIT_CEILING_MS,
+  );
 });
