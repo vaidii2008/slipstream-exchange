@@ -7,8 +7,10 @@ services:
       POSTGRES_USER: slipstream
       POSTGRES_PASSWORD: slipstream
       POSTGRES_DB: slipstream
+    # The host port can move so a second copy of the stack (the agent evals' own, under
+    # another project name) runs beside this one.
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:${SLIPSTREAM_POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +23,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "127.0.0.1:6380:6379"
+      - "127.0.0.1:${SLIPSTREAM_REDIS_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 2s

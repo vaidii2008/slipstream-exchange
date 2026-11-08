@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { parseAgentConfig, parseAgentLoopConfig, parseBotConfig, parseConfig } from "./config.ts";
+import {
+  parseAgentConfig,
+  parseAgentLoopConfig,
+  parseBotConfig,
+  parseConfig,
+  parseEvalConfig,
+} from "./config.ts";
 
 const base = {
   DATABASE_URL: "postgres://slipstream:slipstream@127.0.0.1:5433/slipstream",
@@ -202,5 +208,15 @@ describe("BOT_SEED", () => {
     expect(() => parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_SEED: "-1" })).toThrow(
       /BOT_SEED/,
     );
+  });
+});
+
+describe("parseEvalConfig", () => {
+  it("needs only the key and the model, since the evals make their own accounts", () => {
+    expect(parseEvalConfig({ ANTHROPIC_API_KEY: "sk-test" })).toEqual({
+      ANTHROPIC_API_KEY: "sk-test",
+      AGENT_MODEL: "claude-haiku-5-5",
+    });
+    expect(() => parseEvalConfig({})).toThrow(/ANTHROPIC_API_KEY/);
   });
 });

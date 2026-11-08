@@ -19,7 +19,8 @@
     "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run check --prefix web",
     "bench": "node engine.bench.ts",
     "mcp": "node --env-file-if-exists=.env mcp.ts",
-    "agent": "node --env-file-if-exists=.env agent.ts"
+    "agent": "node --env-file-if-exists=.env agent.ts",
+    "eval": "node --env-file-if-exists=.env evals.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

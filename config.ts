@@ -95,16 +95,15 @@ export function parseAgentConfig(env: Record<string, string | undefined>): Agent
   return result.data;
 }
 
-// The agent loop starts the MCP server, so it needs the server's variables, plus the model
-// and the key to call it with. The key is read here and passed to the SDK, and never to the
-// MCP server's process.
-const agentLoopEnvSchema = agentEnvSchema
-  .unwrap()
-  .extend({
-    ANTHROPIC_API_KEY: z.string().min(1, { error: "is required to call the model" }),
-    AGENT_MODEL: z.string().min(1).default("claude-haiku-5-5"),
-  })
-  .readonly();
+// The model an agent loop runs and the key to call it with. The key is read here and passed
+// to the SDK, and never to the MCP server's process.
+const modelEnv = {
+  ANTHROPIC_API_KEY: z.string().min(1, { error: "is required to call the model" }),
+  AGENT_MODEL: z.string().min(1).default("claude-haiku-5-5"),
+};
+
+// The agent loop starts the MCP server, so it needs the server's variables too.
+const agentLoopEnvSchema = agentEnvSchema.unwrap().extend(modelEnv).readonly();
 
 export type AgentLoopConfig = z.infer<typeof agentLoopEnvSchema>;
 
@@ -112,6 +111,19 @@ export function parseAgentLoopConfig(env: Record<string, string | undefined>): A
   const result = agentLoopEnvSchema.safeParse(env);
   if (!result.success) {
     throw new Error(`Invalid agent loop configuration:\n${z.prettifyError(result.error)}`);
+  }
+  return result.data;
+}
+
+// The evals make their own exchange and accounts, so they need only the model.
+const evalEnvSchema = z.object(modelEnv).readonly();
+
+export type EvalConfig = z.infer<typeof evalEnvSchema>;
+
+export function parseEvalConfig(env: Record<string, string | undefined>): EvalConfig {
+  const result = evalEnvSchema.safeParse(env);
+  if (!result.success) {
+    throw new Error(`Invalid eval configuration:\n${z.prettifyError(result.error)}`);
   }
   return result.data;
 }
