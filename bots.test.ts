@@ -5,6 +5,7 @@ import {
   type AgentSpec,
   type Logger,
   type AgentLimits,
+  seededRandom,
   type Strategy,
 } from "./bots.ts";
 import { ApiClient, markFrom } from "./client.ts";
@@ -199,6 +200,79 @@ describe("AgentRunner", () => {
         strategy: { tick: async () => {} },
       }),
     ).rejects.toThrow(`funding ETH is not traded in ${btc}`);
+  });
+});
+
+describe("seededRandom", () => {
+  const draws = (random: () => number, n = 5) => Array.from({ length: n }, () => random());
+
+  it("gives the same sequence for the same seed and name", () => {
+    expect(draws(seededRandom(42, "btc-usd-noise-1"))).toEqual(
+      draws(seededRandom(42, "btc-usd-noise-1")),
+    );
+  });
+
+  it("gives another sequence for another seed or another agent", () => {
+    const base = draws(seededRandom(42, "btc-usd-noise-1"));
+    expect(draws(seededRandom(43, "btc-usd-noise-1"))).not.toEqual(base);
+    expect(draws(seededRandom(42, "btc-usd-noise-2"))).not.toEqual(base);
+  });
+
+  it("stays in [0, 1) and spreads evenly", () => {
+    const values = draws(seededRandom(7, "spread"), 10_000);
+    expect(values.every((value) => value >= 0 && value < 1)).toBe(true);
+    // Each tenth of the range gets close to a tenth of the draws.
+    for (let bucket = 0; bucket < 10; bucket += 1) {
+      const count = values.filter((value) => Math.floor(value * 10) === bucket).length;
+      expect(count).toBeGreaterThan(900);
+      expect(count).toBeLessThan(1100);
+    }
+  });
+});
+
+describe("AgentRunner with a seed", () => {
+  const runners: AgentRunner[] = [];
+  afterAll(async () => {
+    await Promise.all(runners.map((runner) => runner.stopAll()));
+  });
+
+  // Starts two agents on a runner seeded with `seed` and returns the first draws each one's
+  // strategy saw. The agents tick concurrently, so a shared stream would hand them numbers
+  // in whatever order their ticks happened to run.
+  async function firstDraws(seed: number): Promise<Record<string, number[]>> {
+    const runner = new AgentRunner({ baseUrl, password: PASSWORD, log: quiet, seed });
+    runners.push(runner);
+    const seen: Record<string, number[]> = {};
+    for (const name of ["one", "two"]) {
+      seen[name] = [];
+      await runner.start({
+        name,
+        email: uniqueEmail("bots-test"),
+        market: btc,
+        funding: { USD: "10" },
+        intervalMs: 5,
+        limits: loose,
+        strategy: {
+          tick: ({ random }) => {
+            seen[name]?.push(random());
+            return Promise.resolve();
+          },
+        },
+      });
+    }
+    await until(() => Object.values(seen).every((values) => values.length >= 4));
+    await runner.stopAll();
+    return Object.fromEntries(
+      Object.entries(seen).map(([name, values]) => [name, values.slice(0, 4)]),
+    );
+  }
+
+  it("hands each agent the same draws on every run with the same seed", async () => {
+    const [first, again, other] = await Promise.all([firstDraws(9), firstDraws(9), firstDraws(10)]);
+
+    expect(again).toEqual(first);
+    expect(first.one).not.toEqual(first.two);
+    expect(other.one).not.toEqual(first.one);
   });
 });
 

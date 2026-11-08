@@ -139,7 +139,11 @@ export function defaultFleet(
 
 async function runFleet(): Promise<void> {
   const config = parseBotConfig(process.env);
-  const runner = new AgentRunner({ baseUrl: config.BOT_API_URL, password: config.BOT_PASSWORD });
+  const runner = new AgentRunner({
+    baseUrl: config.BOT_API_URL,
+    password: config.BOT_PASSWORD,
+    ...(config.BOT_SEED === undefined ? {} : { seed: config.BOT_SEED }),
+  });
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {
@@ -163,7 +167,11 @@ async function runFleet(): Promise<void> {
     await runner.stopAll();
     throw error;
   }
-  jsonLog("fleet_started", { agents: runner.agents.length, api: config.BOT_API_URL });
+  jsonLog("fleet_started", {
+    agents: runner.agents.length,
+    api: config.BOT_API_URL,
+    seed: config.BOT_SEED ?? null,
+  });
 }
 
 if (import.meta.main) {

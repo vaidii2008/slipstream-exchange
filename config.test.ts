@@ -191,3 +191,16 @@ describe("parseAgentLoopConfig", () => {
     expect(() => parseAgentLoopConfig({ ANTHROPIC_API_KEY: "sk-test" })).toThrow(/AGENT_EMAIL/);
   });
 });
+
+describe("BOT_SEED", () => {
+  it("is optional, and a whole number when set", () => {
+    expect(parseBotConfig({ BOT_PASSWORD: "bot-password" }).BOT_SEED).toBeUndefined();
+    expect(parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_SEED: "7" }).BOT_SEED).toBe(7);
+    expect(() => parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_SEED: "1.5" })).toThrow(
+      /must be a whole number/,
+    );
+    expect(() => parseBotConfig({ BOT_PASSWORD: "bot-password", BOT_SEED: "-1" })).toThrow(
+      /BOT_SEED/,
+    );
+  });
+});

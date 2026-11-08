@@ -179,22 +179,43 @@ export class Agent {
   }
 }
 
+// A pseudo-random source in [0, 1) that gives the same sequence for the same seed and name.
+// Each agent gets a stream of its own, so the order agents happen to tick in cannot change
+// which numbers any one of them draws. mulberry32 over an FNV-1a hash of the two: small, fast
+// and well enough spread for choosing order sides and sizes; not for anything secret.
+export function seededRandom(seed: number, name: string): () => number {
+  let state = 0x811c9dc5;
+  for (const char of `${seed}:${name}`) {
+    state = Math.imul(state ^ char.charCodeAt(0), 0x01000193) >>> 0;
+  }
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 export type RunnerOptions = {
   baseUrl: string;
   password: string;
-  random?: () => number;
+  // With a seed, every agent's choices (and the jitter between its ticks) come from
+  // seededRandom, so two runs on the same seed make the same draws. Without one, Math.random.
+  // The market still differs between runs: HTTP latency decides which order reaches the book
+  // first.
+  seed?: number;
   log?: Logger;
   // How each agent's client is made. Tests swap in one with a fixed last price.
   client?: (baseUrl: string, email: string, password: string) => ApiClient;
 };
 
 export class AgentRunner {
-  readonly #options: Required<RunnerOptions>;
+  readonly #options: Required<Omit<RunnerOptions, "seed">> & { seed?: number };
   readonly agents: Agent[] = [];
 
   constructor(options: RunnerOptions) {
     this.#options = {
-      random: Math.random,
       log: jsonLog,
       client: (baseUrl, email, password) => new ApiClient(baseUrl, email, password),
       ...options,
@@ -203,7 +224,8 @@ export class AgentRunner {
 
   // Signs the agent in (registering it the first time), tops up its funding and starts it.
   async start(spec: AgentSpec): Promise<Agent> {
-    const { baseUrl, password, random, log, client } = this.#options;
+    const { baseUrl, password, seed, log, client } = this.#options;
+    const random = seed === undefined ? Math.random : seededRandom(seed, spec.name);
     const api = client(baseUrl, spec.email, password);
     await api.signIn();
     const market = await api.market(spec.market);

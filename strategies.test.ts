@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type AgentLimits, AgentRunner, type Logger } from "./bots.ts";
+import { type AgentLimits, AgentRunner, type Logger, seededRandom } from "./bots.ts";
 import { ApiClient, type MarketInfo } from "./client.ts";
 import {
   type MakerOptions,
@@ -65,17 +65,6 @@ function scripted(...values: number[]): () => number {
   };
 }
 
-// A small seeded generator (mulberry32) for tests that need many draws.
-function seeded(seed: number): () => number {
-  let state = seed;
-  return () => {
-    state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 const noise: NoiseOptions = {
   referencePrice: usd(70_000),
   limitShare: 0.5,
@@ -115,7 +104,7 @@ describe("noiseOrder", () => {
   });
 
   it("keeps every order on the market's grid and within its bounds", () => {
-    const random = seeded(7);
+    const random = seededRandom(7, "noise-orders");
     const orders = Array.from({ length: 2000 }, () =>
       noiseOrder(btcUsd, usd(70_000), random, noise),
     );
@@ -141,7 +130,7 @@ describe("noiseTrader", () => {
   const runners: AgentRunner[] = [];
   afterAll(() => Promise.all(runners.map((runner) => runner.stopAll())));
   const runner = () => {
-    const created = new AgentRunner({ baseUrl, password: PASSWORD, log: quiet, random: seeded(1) });
+    const created = new AgentRunner({ baseUrl, password: PASSWORD, log: quiet, seed: 1 });
     runners.push(created);
     return created;
   };

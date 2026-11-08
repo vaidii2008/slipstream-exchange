@@ -50,6 +50,13 @@ const botEnvSchema = z
       .default("http://localhost:3000"),
     // Every agent account is registered with it the first time and signs in with it after.
     BOT_PASSWORD: z.string().min(8, { error: "must be at least 8 characters" }).max(256),
+    // Makes every bot's choices repeatable run to run; unset, they are random.
+    BOT_SEED: z.coerce
+      .number()
+      .int({ error: "must be a whole number" })
+      .min(0)
+      .max(2 ** 32 - 1)
+      .optional(),
   })
   .readonly();
 
