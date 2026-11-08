@@ -3,7 +3,7 @@
 // the trading decisions (a bot strategy, a language model), so nothing that decides what to
 // trade can also decide to trade past them.
 
-import type { ApiClient, MarketInfo, OrderRequest, PlaceResult, Side } from "./client.ts";
+import type { ApiClient, Balance, MarketInfo, OrderRequest, PlaceResult, Side } from "./client.ts";
 
 // What a trading client may call. A bot's strategy and the MCP server's tools get a RiskGuard
 // in this shape, never the bare client.
@@ -121,9 +121,12 @@ export class RiskGuard implements TradingApi {
 // market's first trade. Rounded down: it feeds a limit, not the ledger.
 export async function equity(api: TradingApi, market: MarketInfo): Promise<bigint | undefined> {
   const [balances, price] = await Promise.all([api.balances(), api.markPrice(market)]);
-  if (price === undefined) {
-    return undefined;
-  }
+  return price === undefined ? undefined : valueAt(balances, price, market);
+}
+
+// Balances valued at a given price of base in quote, both in minor units. Separate from
+// equity() for a caller that needs to know which price the value used.
+export function valueAt(balances: Map<string, Balance>, price: bigint, market: MarketInfo): bigint {
   const total = (asset: string) => {
     const held = balances.get(asset);
     return held === undefined ? 0n : held.available + held.reserved;
