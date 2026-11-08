@@ -956,8 +956,8 @@ measured ceiling was 264.
   every time. The guard runs in code the model cannot reach, so a confused or adversarial
   model can ask for anything and still only get what the limits allow. The timer covers a
   resting order filling into a loss while the model is idle.
-- **Weakness:** the limits and the switch live in memory, so a restart resets them, and
-  stopping the server leaves resting orders in the book.
+- **Weakness:** the limits and the switch live in memory, so a restart resets them. (Stopping
+  the server used to leave resting orders in the book; since Session 14 it cancels them.)
 - **Where:** `KillSwitch` and `place_order` in `mcp.ts`; `RiskGuard`, `LossLimit`, `cancelAll`
   in `risk.ts`.
 
@@ -987,3 +987,101 @@ scripted stdio session the server takes five 0.05 BTC buys up to the 0.25 BTC po
 and refuses one more, refuses a 0.06 BTC order and an off-tick price with the reason. When
 other accounts trade at 40,000, the agent's 7,500 USD paper loss trips the 5,000 USD switch:
 its resting sell is cancelled and the next order comes back `risk_killed`.
+
+## Agent evals
+
+### place_order requires a client order id, and a repeat answers with the first order
+
+- **Decision:** `place_order` takes a required `clientOrderId`, passed to the API's idempotency
+  key. Its description tells the model to use a new one per order and the same one when it
+  retries after a call that failed without a reason. The API answers a repeat with 200 and the
+  first order; the tool reports `repeated: true`.
+- **Alternative:** leave it optional, or have the server generate one per call.
+- **Why:** a host can time out a call the exchange still carried out, and only the caller knows
+  whether a second call is a retry or a new order. A server-made id would be new on every call
+  and protect nothing. Required, because a model that may leave it out will.
+- **Weakness:** the risk guard still checks a retry and counts the first attempt if it rests,
+  so a retry at a limit can be refused although the first attempt went through. The
+  description says to check `get_open_orders` then.
+- **Where:** `place_order` in `mcp.ts`; `ApiClient.place` in `client.ts`.
+
+### Stopping the MCP server cancels the agent's orders, within 3 s
+
+- **Decision:** the server stops on the first of stdin closing, SIGTERM or SIGINT, and stopping
+  is the kill switch's halt: refuse new orders, wait for the one in flight, cancel everything
+  resting, exit 0. The cancels get 3 s, then it exits 1.
+- **Alternative:** leave the orders resting for the next session, or cancel with no deadline.
+- **Why:** an order left resting holds the account's funds and can fill into a loss with no
+  loss limit watching. The MCP stdio shutdown, which the SDK's client follows, closes stdin,
+  waits 2 s, sends SIGTERM, waits 2 s and then SIGKILLs; 3 s finishes inside that, and an API
+  that never answers cannot hold the process open. Later signals are ignored so the SIGTERM
+  after a slow stdin close does not cut the cancels short.
+- **Where:** `KillSwitch.stop` and `stopOnExit` in `mcp.ts`.
+
+### A manual agent loop that prices every request before sending the next
+
+- **Decision:** `runAgent` calls the Messages API itself, runs each tool call through the MCP
+  client in order, and returns all results in one user message. After each request it adds the
+  reported usage, priced at Haiku 5.5's rates (cache writes 1.25x, reads 0.1x, five times the
+  rate above 100K prompt tokens). It stops at the turn limit, the deadline, the dollar budget,
+  or once the next prompt could pass 75K tokens. Tools and system are a cached prefix and the
+  conversation's breakpoint moves forward each turn.
+- **Alternative:** the SDK's beta tool runner.
+- **Why:** the runner runs the loop for you, but the budget has to be checked between
+  requests, the tools live in another process behind MCP, and every call has to be recorded for
+  scoring. Tool calls run in order rather than in parallel, because two orders sent at once
+  would race each other through the risk checks.
+- **Where:** `runAgent`, `requestCost` and `recordedCall` in `agent.ts`.
+
+### Every episode runs on a fresh stack in its own Compose project
+
+- **Decision:** before each episode, `docker compose -p slipstream-eval down --volumes`, then up
+  Postgres and Redis on ports 5434 and 6381, migrate, and start the API on 3100. The project
+  name is fixed in the harness.
+- **Alternative:** one stack for the whole run with new accounts per episode, or the dev
+  database.
+- **Why:** an episode that inherits a book, a trade history or a mark from the last one is not
+  the same experiment as the one before it, and its seed means nothing. A separate project has
+  separate volumes, so wiping it cannot touch the dev data. The cost is small: the 20-episode
+  run took about 36 minutes, 101 to 107 s inside each episode (90 s of it the horizon, the
+  rest the fleet's warm-up), plus a few seconds each to reset the stack and start the API.
+- **Where:** `freshStack`, `startApi` and `runEpisode` in `evals.ts`; the port variables in
+  `compose.yaml`.
+
+### One seeded stream per bot, not one per fleet
+
+- **Decision:** with a seed, each bot draws from `seededRandom(seed, its name)`, mulberry32
+  over an FNV-1a hash of the two.
+- **Alternative:** one seeded generator shared by the fleet.
+- **Why:** bots tick concurrently, so a shared stream hands out numbers in whatever order their
+  ticks happened to run, and the same seed gives different choices. Per bot, each one's draws
+  repeat exactly. The market still differs a little between runs, because HTTP latency decides
+  which order reaches the book first.
+- **Where:** `seededRandom` and `AgentRunner.start` in `bots.ts`.
+
+### The baseline trades through the same MCP server, and both are judged against holding
+
+- **Decision:** the rule-based baseline is a market maker that requotes one tick inside the
+  best prices every 3 s, calling the same MCP tools as the agent under the same limits. Each
+  episode records the marks it was valued at, and the score subtracts what holding the
+  starting 0.1 BTC would have made over the same marks.
+- **Alternative:** a baseline that calls the API directly, and raw P&L as the score.
+- **Why:** through the same server, the baseline meets the same refusals and its calls are
+  scored by the same rules, so the comparison is about the decisions only. 0.1 BTC moves about
+  7 USD for a 0.1% move in price, which can be larger than anything a policy's trading does in
+  90 s; P&L over holding takes the market's own move out.
+- **Where:** `baselinePolicy` in `baseline.ts`; `holdPnl` and `overHold` in `score.ts`.
+
+### Interview note: Session 14, agent evals
+
+The problem was saying whether an LLM agent trades well, when one 90-second run of a market
+moved by seeded but latency-sensitive bots says almost nothing. The design runs each policy on
+ten seeds, every episode on a freshly wiped stack, and scores the agent against a rule-based
+market maker that uses the same MCP tools and limits, with P&L measured over what holding the
+starting 0.1 BTC made on the same marks. The trade-off is that the comparison is narrow (one
+model, one market, one prompt, 90 s) and slow, about 36 minutes for 20 episodes, though cheap
+at 0.0346 USD of Haiku 5.5 for the agent's ten. The numbers show why the design matters: the
+agent's mean P&L was higher (3.01 against 1.80 USD), but over holding it averaged -0.002 USD
+while the baseline earned +0.66 and beat holding in 10 of 10 seeds. Raw P&L would have crowned
+the wrong policy. The agent also made 280 tool calls with no invalid call and no risk refusal,
+so the tool contract held even where the strategy did not.
