@@ -1907,7 +1907,7 @@ to it, the account channel is the piece to split out.
 - New: `agent.ts` (a new process), `evals.ts` (a new process), `score.ts` (pure scoring,
   split from `evals.ts`), `baseline.ts` (a second policy), each with a test file.
 - New dependency: `@anthropic-ai/sdk` 1.6.0 (approved).
-- `evals.ts` is about 430 lines: episodes, the stack and the CLI. If the stack grows, the
+- `evals.ts` is 450 lines: episodes, the stack and the CLI. If the stack grows, the
   Compose and API helpers are the split.
 
 **Next: stretch list**
