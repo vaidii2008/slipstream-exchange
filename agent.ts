@@ -128,7 +128,9 @@ export function taskPrompt(maxTurns: number): string {
     "Equity is your quote balance plus your base balance valued at the median of the market's last 20 trades.",
     `You have at most ${maxTurns} turns; each of your replies is one turn, and you may call several tools in one turn.`,
     "Other traders act while you think, so the book can change between turns.",
-    "Orders still resting when the session ends are cancelled. Keep your reasoning short.",
+    "The session ends when you reply without calling a tool, or when the turns or the time run out.",
+    "When it ends, every order still resting is cancelled, so an order you want filled needs the session to stay open: keep checking the book and your orders instead of replying early.",
+    "Keep your reasoning short.",
   ].join("\n");
 }
 

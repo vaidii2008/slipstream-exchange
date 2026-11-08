@@ -166,6 +166,8 @@ describe("runAgent", () => {
     const [system] = request?.system as Anthropic.TextBlockParam[];
     expect(system?.text).toContain(`You trade ${symbol}`);
     expect(system?.text).toContain("at most 5 turns");
+    // Without this the model ends its turn after quoting, which cancels its own quotes.
+    expect(system?.text).toContain("ends when you reply without calling a tool");
     expect(system?.cache_control).toEqual({ type: "ephemeral" });
     expect(request?.cache_control).toEqual({ type: "ephemeral" });
   });
