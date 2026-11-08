@@ -1835,3 +1835,82 @@ to it, the account channel is the piece to split out.
 
 - No migrations this session. New `.env` lines: `AGENT_EMAIL`, `AGENT_PASSWORD`, and
   optionally `AGENT_MARKET` and `AGENT_API_URL` (see `.env.example`).
+
+## Day 18 — Agent evals
+
+**Commits landed (16)**
+
+- `chore(deps): bump zod to 4.6.7 for GHSA-mrhx-c7xc-m3w5`
+- `chore(deps): bump fast-uri to 3.1.9 and 4.2.3 past its moderate advisories`
+- `feat(mcp): require a client order id on place_order so a retry places one order`
+- `feat(mcp): cancel the agent's resting orders when the server stops`
+- `feat(agent): add an agent loop that connects Claude to the MCP server's tools`
+- `feat(bots): accept a seed so a bot fleet's choices are reproducible`
+- `feat(evals): run each episode on a fresh eval stack with a new agent account`
+- `fix(agent): tell the model that replying without a tool call ends its session`
+- `feat(evals): score episodes on P&L, fills, risk-limit rejections, invalid tool calls and tokens`
+- `refactor(agent): extract a recorded MCP tool call so a second policy can share it`
+- `refactor(risk): value balances at a given price apart from reading the mark`
+- `feat(evals): run the rule-based baseline on the same seeds`
+- `docs: record agent and baseline results in the README`
+- `docs: record the agent evals' decisions and the Session 14 interview note`
+- `docs: keep the Session 14 interview note to five sentences`
+- `docs: record day 18 in PROGRESS.md`
+
+**What now works**
+
+- `npm audit --omit=dev` reports 0 vulnerabilities (zod 4.6.7, fast-uri 3.1.9 and 4.2.3).
+- `place_order` requires `clientOrderId`; a repeat returns the first order with
+  `repeated: true`, a reused id with other fields is refused as `client_order_id_reused`.
+- The MCP server cancels the agent's resting orders when stdin closes or on SIGTERM or SIGINT,
+  and exits 1 if the API has not answered within 3 s. Tested against the spawned server,
+  including an API that hangs.
+- `npm run agent`: Claude (`AGENT_MODEL`, default `claude-haiku-5-5`) drives the MCP tools,
+  stopping on its own, at the turn limit, the deadline, the dollar budget, or before a
+  prompt could pass 75K tokens. Cost is priced from reported usage.
+- `BOT_SEED` (and `AgentRunner`'s `seed`) gives each bot its own repeatable stream.
+- `npm run eval`: every policy on every seed, each episode on a wiped `slipstream-eval` stack,
+  scored on P&L, P&L over holding, fills, risk, invalid and exchange refusals, tokens and cost.
+- The first full run (10 seeds, agent and baseline, 90 s, 15 turns): agent mean P&L 3.01 USD
+  but -0.002 over holding; baseline 1.80 USD and +0.66 over holding, beating holding 10/10.
+  The agent made 280 tool calls with 0 invalid calls and 0 risk refusals. Agent cost 0.0346
+  USD for ten episodes; the run took about 36 minutes.
+- 507 tests in 40 files, up from 466.
+
+**What is stubbed**
+
+- The evals cover one model, one market, one prompt and 90 s episodes, each seed run once per
+  policy. Same-seed episodes still diverge (HTTP latency orders the bots' requests).
+- The harness's own summary table truncates cents; the README figures are rounded from the
+  results JSON.
+- Carried over: the in-flight settlement gap when a market's lock drops, drizzle-kit's
+  dev-only audit findings, the web dependencies' moderate audit findings, Safari unchecked,
+  the MCP server not tried in a real host.
+
+**Decisions and deviations from the plan**
+
+- Three fixes came first, as asked: the two dependency bumps, the client order id, cancel on
+  stop.
+- Added a `fix(agent)` commit: the first smoke episode showed the model ending its session
+  right after quoting, which cancelled its quotes. The prompt now says a reply without a tool
+  call ends the session. Changed once, before the measured run.
+- Added two refactors ahead of the baseline, each with its pressure named: `recordedCall` in
+  `agent.ts` (the baseline's calls are recorded as the agent's are) and `valueAt` in `risk.ts`
+  (the hold comparison needs the mark each equity used).
+- Added the hold reference to the scoring: with 0.1 BTC funded, the market's own move was as
+  large as either policy's trading, and raw P&L ranked the policies the wrong way round.
+- `compose.yaml`'s host ports now come from `SLIPSTREAM_POSTGRES_PORT` and
+  `SLIPSTREAM_REDIS_PORT` (defaults unchanged), so the eval stack runs beside the dev one.
+
+**Repo shape**
+
+- New: `agent.ts` (a new process), `evals.ts` (a new process), `score.ts` (pure scoring,
+  split from `evals.ts`), `baseline.ts` (a second policy), each with a test file.
+- New dependency: `@anthropic-ai/sdk` 1.6.0 (approved).
+- `evals.ts` is about 430 lines: episodes, the stack and the CLI. If the stack grows, the
+  Compose and API helpers are the split.
+
+**Next: stretch list**
+
+- No migrations this session. New `.env` lines: `ANTHROPIC_API_KEY` (already set) and
+  optionally `AGENT_MODEL=claude-haiku-5-5` and `BOT_SEED`.
