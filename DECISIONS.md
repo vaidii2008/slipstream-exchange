@@ -1082,6 +1082,6 @@ starting 0.1 BTC made on the same marks. The trade-off is that the comparison is
 model, one market, one prompt, 90 s) and slow, about 36 minutes for 20 episodes, though cheap
 at 0.0346 USD of Haiku 5.5 for the agent's ten. The numbers show why the design matters: the
 agent's mean P&L was higher (3.01 against 1.80 USD), but over holding it averaged -0.002 USD
-while the baseline earned +0.66 and beat holding in 10 of 10 seeds. Raw P&L would have crowned
-the wrong policy. The agent also made 280 tool calls with no invalid call and no risk refusal,
+while the baseline earned +0.66 and beat holding in 10 of 10 seeds, so raw P&L would have
+crowned the wrong policy. The agent also made 280 tool calls with no invalid call and no risk refusal,
 so the tool contract held even where the strategy did not.
