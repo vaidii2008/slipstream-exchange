@@ -23,11 +23,12 @@ import {
   taskPrompt,
 } from "./agent.ts";
 import { AgentRunner, type Logger } from "./bots.ts";
-import { ApiClient, MARK_WINDOW, units } from "./client.ts";
+import { ApiClient, type Fill, MARK_WINDOW, units } from "./client.ts";
 import { parseEvalConfig } from "./config.ts";
 import { defaultFleet } from "./fleet.ts";
 import { formatAmount } from "./money.ts";
 import { equity } from "./risk.ts";
+import { scoreEpisode, summarize, summaryTable } from "./score.ts";
 
 // What a policy is handed: an account that already exists and is funded, and when to stop.
 export type PolicySession = {
@@ -70,6 +71,10 @@ export type Episode = {
   // Quote minor units: the quote balance plus base valued at the mark (see risk.ts equity).
   startEquity: bigint;
   endEquity: bigint;
+  // Every trade the account made, read at the horizon.
+  fills: Fill[];
+  // The quote asset's scale, to print the equities.
+  quoteScale: number;
   run: PolicyRun;
   durationMs: number;
 };
@@ -159,6 +164,8 @@ export async function runEpisode(options: EpisodeOptions): Promise<Episode> {
       email,
       startEquity,
       endEquity,
+      fills: await account.fills(market),
+      quoteScale: market.quoteScale,
       run,
       durationMs: Date.now() - started,
     };
@@ -369,8 +376,22 @@ async function main(): Promise<void> {
     await removeStack();
   }
 
+  const scores = results.map(scoreEpisode);
+  const summaries = summarize(scores);
+  const [first] = results;
+  if (first !== undefined) {
+    console.error(summaryTable(summaries, first.quoteScale));
+  }
   const json = JSON.stringify(
-    { model: config.AGENT_MODEL, maxTurns, seconds, spentUsd: spent, episodes: results },
+    {
+      model: config.AGENT_MODEL,
+      maxTurns,
+      seconds,
+      spentUsd: spent,
+      summaries,
+      scores,
+      episodes: results,
+    },
     (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
     2,
   );

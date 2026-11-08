@@ -70,6 +70,11 @@ describe("runEpisode", () => {
       // 0.1 BTC near the fleet's 70,000 reference plus 10,000 USD.
       expect(Number(episode.startEquity) / 1e8).toBeGreaterThan(15_000);
       expect(Number(episode.startEquity) / 1e8).toBeLessThan(19_000);
+      // The buy, as the account's fills: taker on the buy side, 0.01 BTC in all.
+      expect(episode.fills.every((fill) => fill.side === "buy" && fill.role === "taker")).toBe(
+        true,
+      );
+      expect(episode.fills.reduce((total, fill) => total + fill.quantity, 0n)).toBe(1000000n);
       // Buying 0.01 BTC across the spread costs a little, not hundreds.
       expect(Math.abs(Number(episode.endEquity - episode.startEquity)) / 1e8).toBeLessThan(200);
       // The policy stopped at once, but the episode waited for the horizon.

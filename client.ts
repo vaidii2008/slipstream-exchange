@@ -43,6 +43,10 @@ export type Book = { bids: BookLevel[]; asks: BookLevel[] };
 
 export type Trade = { price: bigint; quantity: bigint; takerSide: Side; createdAt: string };
 
+// One of this account's trades: which side it was on, and whether its order was resting
+// (maker) or crossed the spread (taker).
+export type Fill = { side: Side; role: "maker" | "taker"; price: bigint; quantity: bigint };
+
 export type OpenOrder = {
   id: string;
   side: Side;
@@ -102,6 +106,16 @@ const tradesReply = z.object({
       quantity: z.string(),
       takerSide: z.enum(["buy", "sell"]),
       createdAt: z.string(),
+    }),
+  ),
+});
+const fillsReply = z.object({
+  fills: z.array(
+    z.object({
+      side: z.enum(["buy", "sell"]),
+      role: z.enum(["maker", "taker"]),
+      price: z.string(),
+      quantity: z.string(),
     }),
   ),
 });
@@ -296,6 +310,18 @@ export class ApiClient {
       price: order.price === null ? null : units(order.price, market.quoteScale),
       quantity: units(order.quantity, market.baseScale),
       filled: units(order.filledQuantity, market.baseScale),
+    }));
+  }
+
+  // This account's latest fills in the market, newest first, up to the API's 500.
+  async fills(market: MarketInfo): Promise<Fill[]> {
+    const path = `/fills?market=${encodeURIComponent(market.symbol)}&limit=500`;
+    const body = fillsReply.parse(await this.#expect("GET", path, 200));
+    return body.fills.map((fill) => ({
+      side: fill.side,
+      role: fill.role,
+      price: units(fill.price, market.quoteScale),
+      quantity: units(fill.quantity, market.baseScale),
     }));
   }
 
