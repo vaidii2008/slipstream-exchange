@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAgentConfig, parseBotConfig, parseConfig } from "./config.ts";
+import { parseAgentConfig, parseAgentLoopConfig, parseBotConfig, parseConfig } from "./config.ts";
 
 const base = {
   DATABASE_URL: "postgres://slipstream:slipstream@127.0.0.1:5433/slipstream",
@@ -166,5 +166,28 @@ describe("parseAgentConfig", () => {
   it("takes any market symbol, leaving the API to say whether it is listed", () => {
     expect(parseAgentConfig({ ...agent, AGENT_MARKET: "ETH-USD" }).AGENT_MARKET).toBe("ETH-USD");
     expect(() => parseAgentConfig({ ...agent, AGENT_MARKET: "" })).toThrow(/AGENT_MARKET/);
+  });
+});
+
+describe("parseAgentLoopConfig", () => {
+  const agent = { AGENT_EMAIL: "agent@example.com", AGENT_PASSWORD: "agent-password" };
+
+  it("adds the key and the model, defaulting to Haiku 5.5", () => {
+    expect(parseAgentLoopConfig({ ...agent, ANTHROPIC_API_KEY: "sk-test" })).toEqual({
+      AGENT_API_URL: "http://localhost:3000",
+      AGENT_EMAIL: "agent@example.com",
+      AGENT_PASSWORD: "agent-password",
+      AGENT_MARKET: "BTC-USD",
+      ANTHROPIC_API_KEY: "sk-test",
+      AGENT_MODEL: "claude-haiku-5-5",
+    });
+  });
+
+  it("requires the key, and the MCP server's variables as before", () => {
+    expect(() => parseAgentLoopConfig(agent)).toThrow(/ANTHROPIC_API_KEY/);
+    expect(() => parseAgentLoopConfig({ ...agent, ANTHROPIC_API_KEY: "" })).toThrow(
+      /is required to call the model/,
+    );
+    expect(() => parseAgentLoopConfig({ ANTHROPIC_API_KEY: "sk-test" })).toThrow(/AGENT_EMAIL/);
   });
 });

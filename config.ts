@@ -87,3 +87,24 @@ export function parseAgentConfig(env: Record<string, string | undefined>): Agent
   }
   return result.data;
 }
+
+// The agent loop starts the MCP server, so it needs the server's variables, plus the model
+// and the key to call it with. The key is read here and passed to the SDK, and never to the
+// MCP server's process.
+const agentLoopEnvSchema = agentEnvSchema
+  .unwrap()
+  .extend({
+    ANTHROPIC_API_KEY: z.string().min(1, { error: "is required to call the model" }),
+    AGENT_MODEL: z.string().min(1).default("claude-haiku-5-5"),
+  })
+  .readonly();
+
+export type AgentLoopConfig = z.infer<typeof agentLoopEnvSchema>;
+
+export function parseAgentLoopConfig(env: Record<string, string | undefined>): AgentLoopConfig {
+  const result = agentLoopEnvSchema.safeParse(env);
+  if (!result.success) {
+    throw new Error(`Invalid agent loop configuration:\n${z.prettifyError(result.error)}`);
+  }
+  return result.data;
+}
