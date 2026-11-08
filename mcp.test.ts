@@ -1,4 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { randomUUID } from "node:crypto";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ApiClient, ApiError } from "./client.ts";
@@ -50,6 +51,11 @@ async function call(client: Client, name: string, args: Record<string, unknown> 
     throw new Error(`${name} returned no text`);
   }
   return { isError: result.isError === true, text: block.text, value: parseJson(block.text) };
+}
+
+// place_order with a fresh client order id, as a model placing a new order would send.
+function place(client: Client, args: Record<string, unknown>) {
+  return call(client, "place_order", { clientOrderId: randomUUID(), ...args });
 }
 
 function parseJson(text: string): unknown {
@@ -278,7 +284,7 @@ describe("trading tools", () => {
   it("rests a limit order, then cancels it once", async () => {
     const { client } = await trader();
 
-    const placed = await call(client, "place_order", bid("60000"));
+    const placed = await place(client, bid("60000"));
     expect(placed).toMatchObject({
       isError: false,
       value: { status: "open", filled: "0.00000000" },
@@ -295,6 +301,40 @@ describe("trading tools", () => {
     expect((await call(client, "get_open_orders")).value).toEqual({ orders: [] });
   });
 
+  it("places one order for a client order id however often it is retried", async () => {
+    const { client } = await trader();
+    const order = { ...bid("60000"), clientOrderId: "retry-1" };
+
+    const first = await call(client, "place_order", order);
+    expect(first).toMatchObject({ isError: false, value: { status: "open", repeated: false } });
+    // The host timed out, the model retries the same call.
+    const again = await call(client, "place_order", order);
+    const { id } = first.value as { id: string };
+    expect(again).toMatchObject({ isError: false, value: { id, status: "open", repeated: true } });
+    expect((await call(client, "get_open_orders")).value).toMatchObject({ orders: [{ id }] });
+    expect(
+      ((await call(client, "get_open_orders")).value as { orders: unknown[] }).orders,
+    ).toHaveLength(1);
+  });
+
+  it("refuses a client order id reused for a different order, in the API's words", async () => {
+    const { client } = await trader();
+    await call(client, "place_order", { ...bid("60000"), clientOrderId: "reused-1" });
+
+    const other = await call(client, "place_order", { ...bid("60001"), clientOrderId: "reused-1" });
+    expect(other).toMatchObject({ isError: true, value: { error: "client_order_id_reused" } });
+    expect(other.text).toContain("differs from this one");
+  });
+
+  it("refuses an order without a client order id", async () => {
+    const { client } = await trader();
+
+    const result = await call(client, "place_order", bid("60000"));
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("clientOrderId");
+    expect((await call(client, "get_open_orders")).value).toEqual({ orders: [] });
+  });
+
   it("fills a market order against the book", async () => {
     const { session, client } = await trader();
     const other = await counterparty();
@@ -305,7 +345,7 @@ describe("trading tools", () => {
       quantity: 500000n,
     });
 
-    const result = await call(client, "place_order", {
+    const result = await place(client, {
       side: "buy",
       type: "market",
       quantity: "0.005",
@@ -319,7 +359,7 @@ describe("trading tools", () => {
   it("refuses a price that is missing, unneeded or malformed, worded as the API words it", async () => {
     const { client } = await trader();
 
-    const missing = await call(client, "place_order", {
+    const missing = await place(client, {
       side: "buy",
       type: "limit",
       quantity: "0.001",
@@ -329,14 +369,14 @@ describe("trading tools", () => {
       error: "invalid_request",
       issues: [{ field: "price", message: "is required for a limit order" }],
     });
-    const unneeded = await call(client, "place_order", {
+    const unneeded = await place(client, {
       side: "buy",
       type: "market",
       quantity: "0.001",
       price: "60000",
     });
     expect(unneeded.value).toMatchObject({ issues: [{ field: "price" }] });
-    const decimals = await call(client, "place_order", bid("60000", "0.000000001"));
+    const decimals = await place(client, bid("60000", "0.000000001"));
     expect(decimals.value).toEqual({
       error: "invalid_request",
       issues: [{ field: "quantity", message: "has more decimals than the asset allows" }],
@@ -347,13 +387,13 @@ describe("trading tools", () => {
   it("passes the API's own refusals through: off the tick, and not enough funds", async () => {
     const { client } = await trader();
 
-    const offTick = await call(client, "place_order", bid("60000.005"));
+    const offTick = await place(client, bid("60000.005"));
     expect(offTick.isError).toBe(true);
     expect(offTick.text).toContain("400");
     expect(offTick.text).toContain('"field":"price"');
 
     // 0.01 BTC at 2,000,000 USD is 20,000 USD; the agent holds 10,000.
-    const tooDear = await call(client, "place_order", bid("2000000", "0.01"));
+    const tooDear = await place(client, bid("2000000", "0.01"));
     expect(tooDear.isError).toBe(true);
     expect(tooDear.value).toMatchObject({ error: "insufficient_funds" });
   });
@@ -361,24 +401,24 @@ describe("trading tools", () => {
   it("refuses, without sending, an order past each risk limit", async () => {
     const { client } = await trader();
 
-    const tooBig = await call(client, "place_order", bid("60000", "0.0101"));
+    const tooBig = await place(client, bid("60000", "0.0101"));
     expect(tooBig).toMatchObject({ isError: true, value: { error: "risk_max_order_quantity" } });
     expect(tooBig.text).toContain("at most 0.01000000 BTC");
 
     // Two 0.01 bids reach the 0.02 position limit; a third would pass it.
-    await call(client, "place_order", bid("60000", "0.01"));
-    await call(client, "place_order", bid("60001", "0.01"));
-    const tooLong = await call(client, "place_order", bid("60002", "0.0001"));
+    await place(client, bid("60000", "0.01"));
+    await place(client, bid("60001", "0.01"));
+    const tooLong = await place(client, bid("60002", "0.0001"));
     expect(tooLong).toMatchObject({ isError: true, value: { error: "risk_max_position" } });
 
     // A sell takes the position back, so the third resting order is allowed and the fourth is not.
-    await call(client, "place_order", {
+    await place(client, {
       side: "sell",
       type: "limit",
       price: "90000",
       quantity: "0.001",
     });
-    const tooMany = await call(client, "place_order", {
+    const tooMany = await place(client, {
       side: "sell",
       type: "limit",
       price: "90001",
@@ -444,13 +484,13 @@ describe("kill switch", () => {
       seller.place(session.market, { type: "limit", side: "sell", price, quantity: 1000000n });
 
     await sell(70_000_00000000n);
-    const bought = await call(client, "place_order", {
+    const bought = await place(client, {
       side: "buy",
       type: "market",
       quantity: "0.01",
     });
     expect(bought.value).toMatchObject({ status: "filled" });
-    const resting = await call(client, "place_order", {
+    const resting = await place(client, {
       side: "buy",
       type: "limit",
       price: "5000",
@@ -466,7 +506,7 @@ describe("kill switch", () => {
   it("trips on the next order, cancels what is resting and refuses every order after", async () => {
     const { session, client } = await crashed();
 
-    const next = await call(client, "place_order", {
+    const next = await place(client, {
       side: "buy",
       type: "limit",
       price: "5000",
@@ -478,7 +518,7 @@ describe("kill switch", () => {
     expect(await session.api.openOrders(session.market)).toEqual([]);
 
     // Sells would lower the risk, but a tripped switch refuses those too.
-    const sell = await call(client, "place_order", {
+    const sell = await place(client, {
       side: "sell",
       type: "market",
       quantity: "0.01",
@@ -541,14 +581,14 @@ describe("kill switch", () => {
     const sell = (price: bigint) =>
       seller.place(session.market, { type: "limit", side: "sell", price, quantity: 1000000n });
     await sell(70_000_00000000n);
-    await call(client, "place_order", { side: "buy", type: "market", quantity: "0.01" });
+    await place(client, { side: "buy", type: "market", quantity: "0.01" });
     // 0.01 BTC marked down to 64,000 is 60 USD lost, inside the 100 USD limit.
     await sell(64_000_00000000n);
     await buyer.place(session.market, { type: "market", side: "buy", quantity: 10000n });
 
     await session.kill.check();
     expect(session.kill.tripped).toBe(false);
-    const next = await call(client, "place_order", {
+    const next = await place(client, {
       side: "buy",
       type: "limit",
       price: "5000",

@@ -3,6 +3,7 @@
 // each tool; this checks the parts only a real process has: the stdio framing, configuration
 // from the environment, nothing but protocol on stdout, and the default limits.
 
+import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   getDefaultEnvironment,
@@ -103,7 +104,12 @@ describe("a scripted MCP session over stdio", () => {
       return { isError: result.isError === true, value };
     };
     const buy = (quantity: string) =>
-      call("place_order", { side: "buy", type: "market", quantity });
+      call("place_order", {
+        clientOrderId: randomUUID(),
+        side: "buy",
+        type: "market",
+        quantity,
+      });
 
     // What the model sees first.
     const { tools } = await session.listTools();
@@ -131,6 +137,7 @@ describe("a scripted MCP session over stdio", () => {
 
     // Rest a bid, find it, cancel it.
     const bid = await call("place_order", {
+      clientOrderId: randomUUID(),
       side: "buy",
       type: "limit",
       price: "60000",
@@ -147,6 +154,7 @@ describe("a scripted MCP session over stdio", () => {
       value: { error: "risk_max_order_quantity" },
     });
     const offTick = await call("place_order", {
+      clientOrderId: randomUUID(),
       side: "buy",
       type: "limit",
       price: "60000.001",
@@ -168,6 +176,7 @@ describe("a scripted MCP session over stdio", () => {
     });
     // A sell lowers the position, so it may rest.
     const ask = await call("place_order", {
+      clientOrderId: randomUUID(),
       side: "sell",
       type: "limit",
       price: "90000",
@@ -187,6 +196,7 @@ describe("a scripted MCP session over stdio", () => {
     await buyer.place(market, { type: "market", side: "buy", quantity: 10000n });
 
     const halted = await call("place_order", {
+      clientOrderId: randomUUID(),
       side: "sell",
       type: "limit",
       price: "90000",

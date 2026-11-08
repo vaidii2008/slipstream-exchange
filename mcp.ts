@@ -354,6 +354,19 @@ export function buildMcpServer(session: AgentSession): McpServer {
           .describe(
             `In ${market.quoteAsset}, as a decimal string. Required for limit, absent for market.`,
           ),
+        // Required, not optional: a host may time out a call the exchange still carried out,
+        // and a model that retries without the same id would place the order twice.
+        clientOrderId: z
+          .string()
+          .min(1)
+          .max(64)
+          .describe(
+            "Your own id for this order: 1 to 64 letters, digits or . _ : -. Use a new one for every " +
+              "new order. If a call fails without saying why (a timeout, a dropped connection), retry " +
+              "with the same id and the same fields: the exchange places it at most once and answers " +
+              "with the first order. If such a retry is refused by a risk limit, the first attempt may " +
+              "still have been placed; check get_open_orders.",
+          ),
       },
       annotations: {
         readOnlyHint: false,
@@ -377,9 +390,10 @@ export function buildMcpServer(session: AgentSession): McpServer {
       if (!parsedQuantity.ok) {
         return failure(parsedQuantity.error);
       }
+      const { clientOrderId } = input;
       let order: OrderRequest;
       if (input.price === undefined) {
-        order = { type: "market", side: input.side, quantity: parsedQuantity.units };
+        order = { type: "market", side: input.side, quantity: parsedQuantity.units, clientOrderId };
       } else {
         const parsedPrice = amount("price", input.price, market.quoteScale);
         if (!parsedPrice.ok) {
@@ -390,6 +404,7 @@ export function buildMcpServer(session: AgentSession): McpServer {
           side: input.side,
           price: parsedPrice.units,
           quantity: parsedQuantity.units,
+          clientOrderId,
         };
       }
 
@@ -397,7 +412,13 @@ export function buildMcpServer(session: AgentSession): McpServer {
       // ApiError carrying the API's body; the SDK turns that into an error result.
       const result = await kill.track(guard.place(market, order));
       if (result.ok) {
-        const placed = { id: result.id, status: result.status, filled: quantity(result.filled) };
+        const placed = {
+          id: result.id,
+          status: result.status,
+          filled: quantity(result.filled),
+          // True when clientOrderId had already placed this order and nothing new was sent.
+          repeated: result.repeated,
+        };
         // A fill from this very order can be what pushes equity past the limit.
         await kill.check();
         return json(kill.tripped ? { ...placed, halted: haltMessage() } : placed);

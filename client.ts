@@ -21,12 +21,17 @@ export type MarketInfo = {
 
 export type Balance = { available: bigint; reserved: bigint };
 
-export type OrderRequest =
+// clientOrderId is the API's idempotency key: a second order with the same one places
+// nothing and gets the first order back, so a client that retries after a timeout cannot
+// place twice. The bots send none; a bot does not retry a tick.
+export type OrderRequest = (
   | { type: "limit"; side: Side; price: bigint; quantity: bigint }
-  | { type: "market"; side: Side; quantity: bigint };
+  | { type: "market"; side: Side; quantity: bigint }
+) & { clientOrderId?: string };
 
 export type PlaceResult =
-  | { ok: true; id: string; status: string; filled: bigint }
+  // repeated: the client order id already belonged to this order, so nothing new was placed.
+  | { ok: true; id: string; status: string; filled: bigint; repeated: boolean }
   // The API's own error code (insufficient_funds, rate_limited, market_busy, ...), so a
   // strategy can tell a refusal it should expect from a bug. Status 0 means the risk guard
   // refused it and nothing was sent. message is the API's explanation, when it sent one.
@@ -240,14 +245,17 @@ export class ApiClient {
       type: order.type,
       quantity: formatAmount(order.quantity, market.baseScale),
       ...(order.type === "limit" ? { price: formatAmount(order.price, market.quoteScale) } : {}),
+      ...(order.clientOrderId === undefined ? {} : { clientOrderId: order.clientOrderId }),
     });
-    if (reply.status === 201) {
+    // 201 placed it; 200 is a repeat of a client order id, answered with the first order.
+    if (reply.status === 201 || reply.status === 200) {
       const placed = placedReply.parse(reply.body);
       return {
         ok: true,
         id: placed.id,
         status: placed.status,
         filled: units(placed.filledQuantity, market.baseScale),
+        repeated: reply.status === 200,
       };
     }
     // 400 means the bot built a bad order, which is a bug, not a market condition.
