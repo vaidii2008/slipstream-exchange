@@ -98,6 +98,31 @@ like this, with absolute paths:
 stdout is the protocol channel. Run it as `node mcp.ts` or `npm run --silent mcp`; plain
 `npm run mcp` prints npm's banner to stdout, which a host reads as a malformed message.
 
+`place_order` takes a required `clientOrderId`, the API's idempotency key, so a call retried
+after a timeout places one order. When the host closes stdin, or the server gets SIGTERM or
+SIGINT, it cancels the agent's resting orders and exits, giving up after 3 s.
+
+### Running an agent and measuring it
+
+`agent.ts` is an agent loop without a host: it starts `mcp.ts` as a child, gives its tools to
+Claude (`AGENT_MODEL`, default `claude-haiku-5-5`, with `ANTHROPIC_API_KEY`) and runs the
+calls the model makes until it stops, runs out of turns or time, or spends its budget. Cost is
+priced from the token usage the API reports on each request.
+
+```bash
+npm run --silent agent -- --turns 10 --budget 0.05   # one session on AGENT_API_URL
+npm run --silent eval -- --episodes 10 --turns 15 --seconds 90 --out results.json
+```
+
+`npm run eval` needs Docker and only `ANTHROPIC_API_KEY`. For each seed and each policy it
+wipes and restarts a Postgres and Redis under the Compose project `slipstream-eval` (ports 5434
+and 6381, never the dev stack's volumes), migrates, starts the API on port 3100 and the BTC-USD
+bot fleet with that seed, waits for 20 trades, and funds a new account with 0.1 BTC and
+10,000 USD. The policy then trades for 90 s through the MCP server and the account is valued
+at the end, whenever the policy stopped. Two policies run on the same seeds: the agent, and a
+rule-based baseline that requotes 0.01 BTC one tick inside the best bid and ask every 3 s
+through the same tools. A run stops starting agent episodes after 1 USD.
+
 ## Architecture
 
 ```mermaid
@@ -181,6 +206,34 @@ is mostly Postgres round trips: a resting order sends 16 statements over its lif
 order 43. The 4 µs match is a rounding error inside it. The trade-to-subscriber delay
 compares k6's container clock with the host's, which disagree by at least 12 ms.
 
+### Agent evals
+
+Ten seeds, each run once per policy: 20 episodes of 90 s on BTC-USD, `claude-haiku-5-5`, at
+most 15 turns, 8 November 2026, same machine. P&L is in USD from 0.1 BTC and 10,000 USD
+(about 17,000 USD of equity), rounded to the cent. **Over holding** subtracts what keeping
+the starting 0.1 BTC and never trading made over the same 90 s, valued at the same marks.
+
+| Policy   | Mean P&L | Range         | Mean over holding | Beat holding | Fills per episode | Risk / invalid / exchange refusals |       Cost |
+| -------- | -------: | ------------- | ----------------: | -----------: | ----------------: | ---------------------------------- | ---------: |
+| Agent    |     3.01 | −4.56 to 8.41 |            −0.002 |         6/10 |               5.7 | 0 / 0 / 0 in 280 tool calls        | 0.0346 USD |
+| Baseline |     1.80 | −1.58 to 4.00 |             +0.66 |        10/10 |              88.8 | 0 / 0 / 0                          |          0 |
+
+- **The agent's higher P&L is the market's, not its trading.** Its P&L over holding ranged from
+  −0.34 to +0.25 USD and averaged −0.002. In its episodes BTC happened to rise more: holding
+  alone made 3.01 USD on average there and 1.14 in the baseline's. The baseline earned the
+  spread in every seed, 0.07 to 1.00 USD over holding, from about 89 maker fills an episode.
+- **One seed is not one market.** The bots' choices repeat with the seed, but HTTP latency
+  decides which order reaches the book first, so the same seed's two episodes diverge. On
+  seed 1 holding made 5.75 USD in the agent's episode and 3.90 in the baseline's. That is why
+  every score here is over holding and over ten seeds, and why ten seeds still only say the
+  baseline is ahead on this setup, not by how much in general.
+- **The agent made no invalid calls.** 280 tool calls, 42 orders, no schema errors, no off-grid
+  prices, no risk refusals. It placed few orders and mostly read: 75 `get_open_orders` and 66
+  `get_order_book` calls. It ended its own session before its turns ran out in 6 of 10 episodes,
+  after 7 to 12 turns, although the prompt says ending early cancels its quotes.
+- **Tokens.** 111 requests, 825,173 prompt tokens, of which 737,173 were cache reads, and
+  32,405 output tokens: 0.0035 USD an episode at Haiku 5.5's rates.
+
 ## Three things the measurements found
 
 **The ledger deadlock.** A reserve and a release on the same user and asset could deadlock. Each
@@ -231,9 +284,10 @@ from 7.0–7.5 ms to 0.07–0.21 ms, a single Postgres query timed in `psql` wit
   already in flight when the lock drops still commits. The trades table's unique (market,
   sequence) makes a double settlement fail and halt rather than pay twice.
 - **The MCP server's limits last one process.** The position and loss limits count from where
-  the server started, and a tripped kill switch resets on restart. Orders carry no client
-  order id, so a `place_order` retried after a timeout can place twice. Stopping the server
-  leaves the agent's resting orders in the book.
+  the server started, and a tripped kill switch resets on restart.
+- **The evals are small.** One model, one market, one prompt, ten seeds of 90 s, each run once.
+  The prompt was changed once before the measured run, after a single smoke episode showed the
+  model ending its session straight after quoting.
 - **A market's ceiling is its round trips.** One command at a time means one market tops out
   at a few hundred commands a second here. Settling several queued commands per transaction is
   the lever, and it is not built.
@@ -257,6 +311,9 @@ reasons are in the commit history: each `refactor:` commit names its pressure.
 | `risk.ts`                         | Pre-trade limits, the loss limit and cancel-all.             |
 | `bots.ts`, `strategies.ts`        | Bot runtime, market maker and noise trader.                  |
 | `mcp.ts`                          | The MCP server that lets a language model trade.             |
+| `agent.ts`                        | The agent loop: Claude, the MCP tools, the token budget.     |
+| `evals.ts`, `score.ts`            | Eval episodes on a fresh stack, and their scores.            |
+| `baseline.ts`                     | The rule-based policy the agent is measured against.         |
 | `money.ts`                        | The only conversion between decimal strings and minor units. |
 | `web/`                            | The trading terminal.                                        |
 | `load/`                           | k6 scripts and the bench database tool.                      |
