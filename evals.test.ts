@@ -67,6 +67,9 @@ describe("runEpisode", () => {
       });
 
       expect(episode).toMatchObject({ seed: 3, policy: "buyer", email: handed?.email });
+      // The funding valued at the mark the episode recorded, to the minor unit.
+      expect(episode.startBase).toBe(10000000n);
+      expect(episode.startEquity).toBe(10_000_00000000n + episode.startMark / 10n);
       // 0.1 BTC near the fleet's 70,000 reference plus 10,000 USD.
       expect(Number(episode.startEquity) / 1e8).toBeGreaterThan(15_000);
       expect(Number(episode.startEquity) / 1e8).toBeLessThan(19_000);

@@ -70,6 +70,9 @@ export type EpisodeScore = {
   policy: string;
   // Quote minor units: end equity minus start equity.
   pnl: bigint;
+  // What holding the starting base and never trading would have made over the same marks.
+  // pnl minus this is what the policy's trading added or lost.
+  holdPnl: bigint;
   fills: number;
   makerFills: number;
   // Base minor units traded, both sides.
@@ -92,6 +95,9 @@ export function scoreEpisode(episode: Episode): EpisodeScore {
     seed: episode.seed,
     policy: episode.policy,
     pnl: episode.endEquity - episode.startEquity,
+    holdPnl:
+      (episode.startBase * (episode.endMark - episode.startMark)) /
+      10n ** BigInt(episode.baseScale),
     fills: episode.fills.length,
     makerFills: episode.fills.filter((fill) => fill.role === "maker").length,
     volume: episode.fills.reduce((total, fill) => total + fill.quantity, 0n),
@@ -126,6 +132,9 @@ export type Summary = {
   episodes: number;
   // P&L across episodes, quote minor units. mean rounds toward zero.
   pnl: { mean: bigint; median: bigint; min: bigint; max: bigint; positive: number };
+  // Mean of pnl minus holdPnl: what trading added over holding, and in how many episodes it
+  // beat holding.
+  overHold: { mean: bigint; better: number };
   // Per episode, averaged.
   fills: number;
   makerFills: number;
@@ -137,6 +146,8 @@ export type Summary = {
   tokens: TokenTotals;
   costUsd: number;
 };
+
+const sum = (values: bigint[]) => values.reduce((total, value) => total + value, 0n);
 
 // One summary per policy, in the order the policies first appear.
 export function summarize(scores: EpisodeScore[]): Summary[] {
@@ -159,11 +170,15 @@ export function summarize(scores: EpisodeScore[]): Summary[] {
       policy,
       episodes: n,
       pnl: {
-        mean: pnls.reduce((total, pnl) => total + pnl, 0n) / BigInt(n),
+        mean: sum(pnls) / BigInt(n),
         median: median(pnls),
         min: pnls.reduce((low, pnl) => (pnl < low ? pnl : low)),
         max: pnls.reduce((high, pnl) => (pnl > high ? pnl : high)),
         positive: pnls.filter((pnl) => pnl > 0n).length,
+      },
+      overHold: {
+        mean: sum(mine.map((score) => score.pnl - score.holdPnl)) / BigInt(n),
+        better: mine.filter((score) => score.pnl > score.holdPnl).length,
       },
       fills: mean((score) => score.fills),
       makerFills: mean((score) => score.makerFills),
@@ -192,6 +207,8 @@ export function summaryTable(summaries: Summary[], quoteScale: number): string {
       usd(s.pnl.median),
       `${usd(s.pnl.min)} to ${usd(s.pnl.max)}`,
       `${s.pnl.positive}/${s.episodes}`,
+      usd(s.overHold.mean),
+      `${s.overHold.better}/${s.episodes}`,
       one(s.fills),
       one(s.makerFills),
       one(s.riskRejections),
@@ -203,8 +220,8 @@ export function summaryTable(summaries: Summary[], quoteScale: number): string {
     ].join(" | "),
   );
   return [
-    "| Policy | Episodes | Mean P&L | Median P&L | Range | Profitable | Fills | Maker fills | Risk refusals | Invalid calls | Exchange refusals | Prompt tokens | Output tokens | Cost (USD) |",
-    "| --- | --: | --: | --: | --- | --: | --: | --: | --: | --: | --: | --: | --: | --: |",
+    "| Policy | Episodes | Mean P&L | Median P&L | Range | Profitable | Mean vs holding | Beat holding | Fills | Maker fills | Risk refusals | Invalid calls | Exchange refusals | Prompt tokens | Output tokens | Cost (USD) |",
+    "| --- | --: | --: | --: | --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |",
     ...rows.map((row) => `| ${row} |`),
   ].join("\n");
 }

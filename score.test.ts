@@ -64,6 +64,11 @@ function episode(policy: string, pnl: bigint, calls: ToolCall[] = []): Episode {
     email: "x@evals.slipstream.local",
     startEquity: 17_000_00000000n,
     endEquity: 17_000_00000000n + pnl,
+    // 0.1 BTC while the mark rises by 100 USD: holding would have made 10 USD.
+    startMark: 70_000_00000000n,
+    endMark: 70_100_00000000n,
+    startBase: 10000000n,
+    baseScale: 8,
     fills: [
       { side: "buy", role: "taker", price: 70_000_00000000n, quantity: 1000000n },
       { side: "sell", role: "maker", price: 70_010_00000000n, quantity: 500000n },
@@ -87,6 +92,7 @@ describe("scoreEpisode", () => {
       seed: 1,
       policy: "agent",
       pnl: -12_50000000n,
+      holdPnl: 10_00000000n,
       fills: 2,
       makerFills: 1,
       volume: 1500000n,
@@ -124,6 +130,8 @@ describe("summarize", () => {
         max: 10_00000000n,
         positive: 2,
       },
+      // 10, -4 and 3 against the 10 holding made: 0, -14 and -7. Matching it is not beating it.
+      overHold: { mean: -7_00000000n, better: 0 },
       fills: 2,
       makerFills: 1,
       tokens: { requests: 6, input: 30, output: 60, cacheWrite: 90, cacheRead: 120 },
@@ -138,7 +146,7 @@ describe("summarize", () => {
     const [header, , row] = table.split("\n");
     expect(header).toContain("| Policy | Episodes | Mean P&L |");
     expect(row).toBe(
-      "| agent | 1 | -12.34 | -12.34 | -12.34 to -12.34 | 0/1 | 2.0 | 1.0 | 0.0 | 0.0 | 0.0 | 80 | 20 | 0.0020 |",
+      "| agent | 1 | -12.34 | -12.34 | -12.34 to -12.34 | 0/1 | -22.34 | 0/1 | 2.0 | 1.0 | 0.0 | 0.0 | 0.0 | 80 | 20 | 0.0020 |",
     );
   });
 });

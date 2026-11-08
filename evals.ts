@@ -22,12 +22,13 @@ import {
   type ToolCall,
   taskPrompt,
 } from "./agent.ts";
+import { baselinePolicy } from "./baseline.ts";
 import { AgentRunner, type Logger } from "./bots.ts";
-import { ApiClient, type Fill, MARK_WINDOW, units } from "./client.ts";
+import { ApiClient, type Fill, MARK_WINDOW, type MarketInfo, units } from "./client.ts";
 import { parseEvalConfig } from "./config.ts";
 import { defaultFleet } from "./fleet.ts";
 import { formatAmount } from "./money.ts";
-import { equity } from "./risk.ts";
+import { valueAt } from "./risk.ts";
 import { scoreEpisode, summarize, summaryTable } from "./score.ts";
 
 // What a policy is handed: an account that already exists and is funded, and when to stop.
@@ -71,6 +72,12 @@ export type Episode = {
   // Quote minor units: the quote balance plus base valued at the mark (see risk.ts equity).
   startEquity: bigint;
   endEquity: bigint;
+  // The marks those two equities used, and the base the account started with, so a score can
+  // say what holding that base and doing nothing would have made over the same stretch.
+  startMark: bigint;
+  endMark: bigint;
+  startBase: bigint;
+  baseScale: number;
   // Every trade the account made, read at the horizon.
   fills: Fill[];
   // The quote asset's scale, to print the equities.
@@ -97,6 +104,18 @@ async function waitForTrades(api: ApiClient, symbol: string, count: number): Pro
     }
     await sleep(250);
   }
+}
+
+// Equity and the mark it was valued at, from one read of each.
+async function valuation(
+  account: ApiClient,
+  market: MarketInfo,
+): Promise<{ equity: bigint; mark: bigint }> {
+  const [balances, mark] = await Promise.all([account.balances(), account.markPrice(market)]);
+  if (mark === undefined) {
+    throw new Error("no trades to value the account at");
+  }
+  return { equity: valueAt(balances, mark, market), mark };
 }
 
 export async function runEpisode(options: EpisodeOptions): Promise<Episode> {
@@ -139,10 +158,8 @@ export async function runEpisode(options: EpisodeOptions): Promise<Episode> {
       market.quoteScale,
     );
 
-    const startEquity = await equity(account, market);
-    if (startEquity === undefined) {
-      throw new Error("no trades to value the account at");
-    }
+    const start = await valuation(account, market);
+    const startEquity = start.equity;
     const deadline = Date.now() + options.horizonMs;
     log(
       `episode seed ${seed}, ${policy.name}: start equity ${formatAmount(startEquity, market.quoteScale)}`,
@@ -151,10 +168,8 @@ export async function runEpisode(options: EpisodeOptions): Promise<Episode> {
     // Every policy is marked at the same horizon, so one that stops early still carries its
     // position through the same stretch of market as one that trades to the end.
     await sleep(Math.max(0, deadline - Date.now()));
-    const endEquity = await equity(account, market);
-    if (endEquity === undefined) {
-      throw new Error("no trades to value the account at");
-    }
+    const end = await valuation(account, market);
+    const endEquity = end.equity;
     log(
       `episode seed ${seed}, ${policy.name}: end equity ${formatAmount(endEquity, market.quoteScale)}`,
     );
@@ -164,6 +179,10 @@ export async function runEpisode(options: EpisodeOptions): Promise<Episode> {
       email,
       startEquity,
       endEquity,
+      startMark: start.mark,
+      endMark: end.mark,
+      startBase: units(options.funding.base, market.baseScale),
+      baseScale: market.baseScale,
       fills: await account.fills(market),
       quoteScale: market.quoteScale,
       run,
@@ -306,8 +325,11 @@ async function startApi(): Promise<RunningApi> {
   };
 }
 
-// The whole run stops starting episodes once it has spent this much on the model.
+// The whole run stops starting agent episodes once it has spent this much on the model.
 const RUN_BUDGET_USD = 1;
+
+// How often the baseline requotes: about as often as the agent takes a turn.
+const BASELINE_STEP_MS = 3000;
 
 // `npm run eval -- --episodes 2 --turns 8 --seconds 60`
 async function main(): Promise<void> {
@@ -322,6 +344,7 @@ async function main(): Promise<void> {
       turns: { type: "string", default: "8" },
       seconds: { type: "string", default: "60" },
       "episode-budget": { type: "string", default: "0.1" },
+      policies: { type: "string", default: "agent,baseline" },
       out: { type: "string" },
     },
   });
@@ -336,40 +359,54 @@ async function main(): Promise<void> {
   if (!Number.isInteger(firstSeed) || firstSeed < 0) {
     throw new Error("--first-seed must be a whole number");
   }
+  const policies = values.policies.split(",");
+  if (policies.length === 0 || !policies.every((name) => name === "agent" || name === "baseline")) {
+    throw new Error("--policies is a comma-separated list of agent and baseline");
+  }
 
   const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
   const create: CreateMessage = (params) => anthropic.messages.create(params);
   const results: Episode[] = [];
   let spent = 0;
   try {
+    // Every policy on every seed, each on a stack of its own, so the baseline meets the same
+    // seeded fleet the agent did, from the same empty book.
     for (let seed = firstSeed; seed < firstSeed + episodes; seed += 1) {
-      if (spent >= RUN_BUDGET_USD) {
-        console.error(`eval: stopping, $${spent.toFixed(4)} spent of the run's $${RUN_BUDGET_USD}`);
-        break;
-      }
-      await freshStack();
-      const api = await startApi();
-      try {
-        const episode = await runEpisode({
-          apiUrl: api.url,
-          symbol: "BTC-USD",
-          seed,
-          policy: agentPolicy({
-            create,
-            model: config.AGENT_MODEL,
-            maxTurns,
-            budgetUsd: Math.min(episodeBudget, RUN_BUDGET_USD - spent),
+      for (const name of policies) {
+        if (name === "agent" && spent >= RUN_BUDGET_USD) {
+          console.error(
+            `eval: skipping the agent, $${spent.toFixed(4)} spent of $${RUN_BUDGET_USD}`,
+          );
+          continue;
+        }
+        const policy =
+          name === "agent"
+            ? agentPolicy({
+                create,
+                model: config.AGENT_MODEL,
+                maxTurns,
+                budgetUsd: Math.min(episodeBudget, RUN_BUDGET_USD - spent),
+                log: (line) => console.error(line),
+              })
+            : baselinePolicy({ stepMs: BASELINE_STEP_MS, quantity: "0.01" });
+        await freshStack();
+        const api = await startApi();
+        try {
+          const episode = await runEpisode({
+            apiUrl: api.url,
+            symbol: "BTC-USD",
+            seed,
+            policy,
+            horizonMs: seconds * 1000,
+            warmupTrades: MARK_WINDOW,
+            funding: { base: "0.1", quote: "10000" },
             log: (line) => console.error(line),
-          }),
-          horizonMs: seconds * 1000,
-          warmupTrades: MARK_WINDOW,
-          funding: { base: "0.1", quote: "10000" },
-          log: (line) => console.error(line),
-        });
-        spent += episode.run.costUsd;
-        results.push(episode);
-      } finally {
-        await api.stop();
+          });
+          spent += episode.run.costUsd;
+          results.push(episode);
+        } finally {
+          await api.stop();
+        }
       }
     }
   } finally {
