@@ -97,13 +97,23 @@ export class KillSwitch {
 
   // Safe to call more than once or concurrently: every caller waits for the same cancels.
   async trip(reason: string): Promise<void> {
+    await this.#halt(reason, `kill switch tripped (${reason})`);
+  }
+
+  // The server is going away: the same halt as a trip, so nothing the agent placed is left
+  // resting in the book holding its funds with no one watching the loss limit.
+  async stop(why: string): Promise<void> {
+    await this.#halt(`the server is stopping (${why})`, `stopping (${why})`);
+  }
+
+  async #halt(reason: string, log: string): Promise<void> {
     if (this.#tripping === undefined) {
       this.reason = reason;
       this.#guard.killed = true;
       this.#tripping = (async () => {
         await Promise.allSettled([...this.#inFlight]);
         const cancelled = await cancelAll(this.#api, this.#market);
-        console.error(`slipstream mcp: kill switch tripped (${reason}); cancelled ${cancelled}`);
+        console.error(`slipstream mcp: ${log}; cancelled ${cancelled}`);
       })();
     }
     await this.#tripping;
@@ -474,6 +484,38 @@ function fieldError(field: string, message: string) {
 // How often the loss limit is checked between tool calls. Each check is two GET requests.
 const LOSS_CHECK_MS = 5000;
 
+// How long the cancels on stop may take. The MCP spec's stdio shutdown, which the SDK's client
+// follows, closes stdin, waits 2 s, sends SIGTERM, waits 2 s more, then sends SIGKILL; 3 s
+// finishes inside that, and an API that does not answer cannot hold the process open.
+export const STOP_DEADLINE_MS = 3000;
+
+// Stops on whichever comes first: the host closing stdin (its normal way to end a session),
+// SIGTERM or SIGINT. Later ones are ignored, so the SIGTERM that follows a slow stdin close
+// does not cut the cancels short.
+function stopOnExit(kill: KillSwitch): void {
+  let stopping = false;
+  const stop = (why: string) => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    setTimeout(() => {
+      console.error(`slipstream mcp: open orders not cancelled within ${STOP_DEADLINE_MS} ms`);
+      process.exit(1);
+    }, STOP_DEADLINE_MS);
+    kill.stop(why).then(
+      () => process.exit(0),
+      (error: unknown) => {
+        console.error(`slipstream mcp: cancelling open orders failed: ${String(error)}`);
+        process.exit(1);
+      },
+    );
+  };
+  process.stdin.once("end", () => stop("stdin closed"));
+  process.once("SIGTERM", () => stop("SIGTERM"));
+  process.once("SIGINT", () => stop("SIGINT"));
+}
+
 async function serve(): Promise<void> {
   const config = parseAgentConfig(process.env);
   const session = await signInAgent(
@@ -483,6 +525,7 @@ async function serve(): Promise<void> {
     config.AGENT_MARKET,
   );
   session.kill.watch(LOSS_CHECK_MS);
+  stopOnExit(session.kill);
   await buildMcpServer(session).connect(new StdioServerTransport());
   console.error(
     `slipstream mcp: signed in as ${config.AGENT_EMAIL}, trading ${config.AGENT_MARKET}`,

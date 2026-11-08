@@ -3,7 +3,9 @@
 // each tool; this checks the parts only a real process has: the stdio framing, configuration
 // from the environment, nothing but protocol on stdout, and the default limits.
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   getDefaultEnvironment,
@@ -11,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ApiClient, type MarketInfo } from "./client.ts";
+import { STOP_DEADLINE_MS } from "./mcp.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail, testMarket } = useTestServer();
@@ -211,5 +214,142 @@ describe("a scripted MCP session over stdio", () => {
     // would have failed to parse a message above.
     expect(stderr).toContain(`signed in as ${email}`);
     expect(stderr).toContain("kill switch tripped");
+  });
+});
+
+// The server as a bare child process, for the tests that end it. Resolves once it has signed
+// in and is serving, which it reports on stderr.
+async function spawnServer(apiUrl: string, email: string) {
+  const child = spawn(process.execPath, ["mcp.ts"], {
+    cwd: import.meta.dirname,
+    env: {
+      ...getDefaultEnvironment(),
+      AGENT_API_URL: apiUrl,
+      AGENT_EMAIL: email,
+      AGENT_PASSWORD: PASSWORD,
+      AGENT_MARKET: symbol,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  const exited = new Promise<number | null>((resolve) => {
+    child.once("exit", (code) => resolve(code));
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.includes("signed in as")) {
+        resolve();
+      }
+    });
+    void exited.then((code) => reject(new Error(`server exited ${code}: ${stderr}`)));
+  });
+  return { child, exited, stderr: () => stderr };
+}
+
+// A funded agent with two bids resting, below the ask the first test leaves at 40,000, placed through its own account before the server
+// starts, as orders left from earlier in a session would be.
+async function agentWithBids() {
+  const email = uniqueEmail("mcp-session");
+  const agent = new ApiClient(baseUrl, email, PASSWORD);
+  await agent.signIn();
+  await agent.deposit("USD", 10_000_00000000n, 8);
+  const market = await agent.market(symbol);
+  for (const price of [20_000_00000000n, 20_001_00000000n]) {
+    await agent.place(market, { type: "limit", side: "buy", price, quantity: 10000n });
+  }
+  expect(await agent.openOrders(market)).toHaveLength(2);
+  return { email, agent, market };
+}
+
+// Forwards to the test server until told to hang, then never answers: an API that has gone
+// away without closing its connections.
+async function hangingProxy(target: string) {
+  let hanging = false;
+  const proxy = createServer((request, response) => {
+    if (hanging) {
+      return;
+    }
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const headers: Record<string, string> = {};
+      for (const name of ["content-type", "authorization"]) {
+        const value = request.headers[name];
+        if (typeof value === "string") {
+          headers[name] = value;
+        }
+      }
+      const body = Buffer.concat(chunks);
+      fetch(`${target}${request.url ?? "/"}`, {
+        method: request.method ?? "GET",
+        headers,
+        body: body.length === 0 ? undefined : body,
+      })
+        .then(async (reply) => {
+          response.writeHead(reply.status, { "content-type": "application/json" });
+          response.end(Buffer.from(await reply.arrayBuffer()));
+        })
+        .catch((error: unknown) => {
+          response.writeHead(502).end(String(error));
+        });
+    });
+  });
+  await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const address = proxy.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("proxy has no port");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    hang: () => {
+      hanging = true;
+    },
+    close: () => {
+      proxy.closeAllConnections();
+      proxy.close();
+    },
+  };
+}
+
+describe("stopping the server", () => {
+  it("cancels the agent's resting orders when the host closes stdin", async () => {
+    const { email, agent, market } = await agentWithBids();
+    const server = await spawnServer(baseUrl, email);
+
+    server.child.stdin.end();
+    expect(await server.exited).toBe(0);
+    expect(await agent.openOrders(market)).toEqual([]);
+    expect(server.stderr()).toContain("stopping (stdin closed); cancelled 2");
+  });
+
+  it.each(["SIGTERM", "SIGINT"] as const)("cancels them on %s", async (signal) => {
+    const { email, agent, market } = await agentWithBids();
+    const server = await spawnServer(baseUrl, email);
+
+    server.child.kill(signal);
+    expect(await server.exited).toBe(0);
+    expect(await agent.openOrders(market)).toEqual([]);
+    expect(server.stderr()).toContain(`stopping (${signal}); cancelled 2`);
+  });
+
+  it("gives up and exits non-zero when the API does not answer in time", async () => {
+    const { email } = await agentWithBids();
+    const proxy = await hangingProxy(baseUrl);
+    try {
+      const server = await spawnServer(proxy.url, email);
+      proxy.hang();
+      const started = Date.now();
+
+      server.child.stdin.end();
+      expect(await server.exited).toBe(1);
+      const took = Date.now() - started;
+      expect(took).toBeGreaterThanOrEqual(STOP_DEADLINE_MS - 100);
+      // Inside the 4 s a host following the spec waits before SIGKILL.
+      expect(took).toBeLessThan(4000);
+      expect(server.stderr()).toContain(`not cancelled within ${STOP_DEADLINE_MS} ms`);
+    } finally {
+      proxy.close();
+    }
   });
 });
