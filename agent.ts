@@ -146,6 +146,31 @@ function resultText(content: unknown): string {
     .join("\n");
 }
 
+// Calls one tool and records the call as a scorer sees it. Never throws: a protocol error (an
+// unknown tool, arguments that break the schema) is the caller's mistake to see, not a reason
+// to end the run, so it comes back as an error result like any other.
+export async function recordedCall(
+  mcp: Client,
+  turn: number,
+  name: string,
+  input: unknown,
+): Promise<{ call: ToolCall; text: string }> {
+  let text: string;
+  let isError: boolean;
+  try {
+    const result = await mcp.callTool({
+      name,
+      arguments: (input ?? {}) as Record<string, unknown>,
+    });
+    text = resultText(result.content);
+    isError = result.isError === true;
+  } catch (error) {
+    text = error instanceof Error ? error.message : String(error);
+    isError = true;
+  }
+  return { call: { turn, name, input, isError, ...(isError ? { error: text } : {}) }, text };
+}
+
 export async function runAgent(options: AgentOptions): Promise<AgentRun> {
   const { mcp, model, maxTurns, budgetUsd, deadline } = options;
   const log = options.log ?? (() => {});
@@ -239,30 +264,15 @@ export async function runAgent(options: AgentOptions): Promise<AgentRun> {
     // other through the risk checks.
     const results: Anthropic.ToolResultBlockParam[] = [];
     for (const use of uses) {
-      let text: string;
-      let isError: boolean;
-      try {
-        const result = await mcp.callTool({
-          name: use.name,
-          arguments: (use.input ?? {}) as Record<string, unknown>,
-        });
-        text = resultText(result.content);
-        isError = result.isError === true;
-      } catch (error) {
-        // A protocol error (an unknown tool on some servers) is the model's mistake to see, not
-        // a reason to end the run.
-        text = error instanceof Error ? error.message : String(error);
-        isError = true;
-      }
-      log(`  ${use.name} ${JSON.stringify(use.input)} -> ${isError ? "error: " : ""}${text}`);
-      toolCalls.push({
-        turn: turns,
-        name: use.name,
-        input: use.input,
-        isError,
-        ...(isError ? { error: text } : {}),
+      const { call, text } = await recordedCall(mcp, turns, use.name, use.input);
+      log(`  ${use.name} ${JSON.stringify(use.input)} -> ${call.isError ? "error: " : ""}${text}`);
+      toolCalls.push(call);
+      results.push({
+        type: "tool_result",
+        tool_use_id: use.id,
+        content: text,
+        is_error: call.isError,
       });
-      results.push({ type: "tool_result", tool_use_id: use.id, content: text, is_error: isError });
     }
     // Every result in one user message: splitting them teaches the model to stop calling tools
     // in parallel.
