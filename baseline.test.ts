@@ -4,7 +4,7 @@ import { ApiClient } from "./client.ts";
 import { type PolicySession, runEpisode } from "./evals.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, testMarket } = useTestServer();
+const { app, testMarket, uniqueEmail } = useTestServer();
 let baseUrl: string;
 
 beforeAll(async () => {
@@ -39,6 +39,30 @@ describe("quotes", () => {
 describe("baselinePolicy", () => {
   it("requotes both sides each step until the deadline and leaves nothing resting", async () => {
     const symbol = (await testMarket("BTC-USD")).symbol;
+    // A bid and an ask 100 USD either side of the fleet's 70,000, past the maker's outermost
+    // quote and any noise limit, and deeper than the noise flow can take in an episode. The
+    // policy only quotes when both sides have a best price, and the maker requotes by
+    // cancelling every quote before placing new ones: without these, a step that reads the book
+    // in that gap finds a side empty and quotes nothing, more often the slower the machine.
+    const backstop = new ApiClient(baseUrl, uniqueEmail("baseline-test"), "baseline-test-password");
+    await backstop.signIn();
+    const btcUsd = await backstop.market(symbol);
+    const whole = (amount: number) => BigInt(amount) * 100_000_000n;
+    await backstop.deposit("USD", whole(69_900), 8);
+    await backstop.deposit("BTC", whole(1), 8);
+    for (const [side, price] of [
+      ["buy", whole(69_900)],
+      ["sell", whole(70_100)],
+    ] as const) {
+      const placed = await backstop.place(btcUsd, {
+        type: "limit",
+        side,
+        price,
+        quantity: whole(1),
+      });
+      expect(placed).toMatchObject({ ok: true, status: "open" });
+    }
+
     const baseline = baselinePolicy({ stepMs: 1000, quantity: "0.01" });
     let handed: PolicySession | undefined;
 
