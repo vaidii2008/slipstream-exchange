@@ -8,3 +8,4 @@ resources:
   - redis.yaml
   - api.yaml
   - web.yaml
+  - bots.yaml

@@ -1,0 +1,40 @@
+# The bot fleet (fleet.ts): a client of the API like any trader, reaching it inside the cluster.
+# Recreate, because two fleets at once would sign the same accounts in twice and double the
+# quotes for the length of a rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bots
+  namespace: slipstream
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bots
+  template:
+    metadata:
+      labels:
+        app: bots
+    spec:
+      containers:
+        - name: bots
+          image: slipstream-api
+          imagePullPolicy: Never
+          command: ["node", "fleet.ts"]
+          env:
+            - name: BOT_API_URL
+              value: http://api:3000
+            # Every bot account is registered with it on first start and signs in with it after.
+            - name: BOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slipstream
+                  key: BOT_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
