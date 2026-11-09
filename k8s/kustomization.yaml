@@ -1,0 +1,6 @@
+# `kubectl apply -k k8s` applies everything below as one unit. The Secret is not listed:
+# secrets.sh creates it, so its values never exist in a file.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml

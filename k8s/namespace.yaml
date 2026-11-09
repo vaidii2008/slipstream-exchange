@@ -1,0 +1,6 @@
+# Everything Slipstream runs on the cluster lives here, apart from Traefik's own settings,
+# which k3s keeps in kube-system.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slipstream
