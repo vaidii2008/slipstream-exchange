@@ -195,7 +195,9 @@ describe("noiseTrader", () => {
     expect((await api.balances()).get("ETH")?.available).not.toBe(2n * 100_000_000n);
     expect(mostOpen).toBeLessThanOrEqual(3);
     expect(await api.openOrders(ethUsd)).toEqual([]);
-  });
+    // Thirty real ticks of about eight API calls each: the run time follows the machine's
+    // load, and under a full gate it came within reach of the 5 s default.
+  }, 15_000);
 });
 
 const maker: MakerOptions = {
