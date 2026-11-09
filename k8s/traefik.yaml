@@ -1,0 +1,39 @@
+# Settings for the Traefik that k3s installs itself: k3s merges these values into its own
+# Helm chart, which is why this lives in kube-system.
+#
+# - Plain HTTP redirects to HTTPS. Let's Encrypt's HTTP challenge still gets through, because
+#   Traefik answers it on port 80 itself, ahead of any redirect.
+# - Certificates are kept on a volume. Without one they would be requested again every time
+#   Traefik restarts, and Let's Encrypt limits how often a name can be issued.
+# - Two resolvers with separate stores: staging, whose certificates browsers do not trust but
+#   whose limits are generous, to prove the setup; then production.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+    persistence:
+      enabled: true
+      storageClass: local-path
+    certificatesResolvers:
+      letsencrypt-staging:
+        acme:
+          caServer: https://acme-staging-v02.api.letsencrypt.org/directory
+          storage: /data/acme-staging.json
+          httpChallenge:
+            entryPoint: web
+      letsencrypt:
+        acme:
+          storage: /data/acme.json
+          httpChallenge:
+            entryPoint: web

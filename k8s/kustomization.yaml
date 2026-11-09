@@ -9,3 +9,5 @@ resources:
   - api.yaml
   - web.yaml
   - bots.yaml
+  - traefik.yaml
+  - ingress.yaml

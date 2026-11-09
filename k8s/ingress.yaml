@@ -1,0 +1,31 @@
+# The two public names, both over HTTPS. They are subdomains of one registrable name
+# (duckdns.org is a public suffix), so the browser counts them as one site and sends the API's
+# SameSite=Strict refresh cookie on the terminal's requests.
+#
+# WebSocket upgrades on /ws need nothing here: Traefik forwards the Upgrade header and then
+# copies bytes both ways. The API pings every 15 s, inside Traefik's 60 s read timeout.
+#
+# /metrics has no route, so Traefik answers 404 for it: it counts orders per market and is
+# meant for a scraper inside the cluster, not the internet.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: slipstream
+  namespace: slipstream
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`slipstream-exchange.duckdns.org`)
+      kind: Rule
+      services:
+        - name: web
+          port: 3001
+    - match: Host(`api.slipstream-exchange.duckdns.org`) && !Path(`/metrics`)
+      kind: Rule
+      services:
+        - name: api
+          port: 3000
+  # One certificate per route's Host, requested by Traefik from the rule itself.
+  tls:
+    certResolver: letsencrypt-staging
