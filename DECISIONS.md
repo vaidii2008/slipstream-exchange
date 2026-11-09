@@ -1085,3 +1085,68 @@ agent's mean P&L was higher (3.01 against 1.80 USD), but over holding it average
 while the baseline earned +0.66 and beat holding in 10 of 10 seeds, so raw P&L would have
 crowned the wrong policy. The agent also made 280 tool calls with no invalid call and no risk refusal,
 so the tool contract held even where the strategy did not.
+
+## Deploying to k3s
+
+### The API is a one-replica StatefulSet, not a Deployment
+
+- **Decision:** the API runs as a StatefulSet with one replica, its migrations in an init
+  container.
+- **Alternative:** a Deployment, the usual home for a stateless HTTP server.
+- **Why:** each market has one writer, enforced by a Postgres advisory lock the process holds
+  while the market is open. A Deployment's rolling update starts the new pod first, and while
+  the old pod still held the locks the new one would halt every market as "open in another
+  process". A StatefulSet deletes the old pod before creating the new one: after a rollout
+  restart both markets opened with `halted: false`. After a force-kill under bot load, the new
+  pod replayed 32,677 commands in 944 ms, opened both markets, and the ledger, orders and log
+  checked clean.
+- **Where:** `k8s/api.yaml`; the lock in `marketlock.ts`.
+
+### Images travel over SSH into k3s, with no registry
+
+- **Decision:** `k8s/deploy.sh` builds both images for linux/amd64, pipes `docker save | gzip`
+  over `gcloud compute ssh` into `k3s ctr images import`, tags them with the commit, and the
+  pods never pull (`imagePullPolicy: Never`).
+- **Alternative:** Artifact Registry, or GHCR from CI.
+- **Why:** one node needs no image distribution. A registry is another API to enable, another
+  resource, and pull credentials on the cluster. The commit tag makes every deploy name its
+  sources, so the script refuses to build from uncommitted image sources. The cost is a
+  manual, Mac-only deploy: the first run took 2 min 41 s, building amd64 under
+  emulation.
+- **Where:** `k8s/deploy.sh`.
+
+### Two hosts on one site, not one host with an /api prefix
+
+- **Decision:** the terminal is `slipstream-exchange.duckdns.org` and the API
+  `api.slipstream-exchange.duckdns.org`, two routes in one IngressRoute.
+- **Alternative:** one host, the API under `/api` with the prefix stripped by Traefik.
+- **Why:** the refresh cookie is `SameSite=Strict; Path=/session`. Behind a stripped prefix the
+  browser would see `/api/session` and never send it. duckdns.org is on the Public Suffix
+  List, so both names belong to the one site `slipstream-exchange.duckdns.org`, and the cookie
+  travels with no API change. A headless browser reloaded the terminal and got 200 from the
+  API's `/session/refresh`.
+- **Where:** `k8s/ingress.yaml`; the cookie options in `sessions.ts`.
+
+### Traefik takes challenge traffic before it is ready, and only one Traefik runs
+
+- **Decision:** Traefik's Service publishes its pod before the readiness probe passes, and
+  Traefik updates by Recreate. Let's Encrypt staging proved the setup, then was removed.
+- **Alternative:** the chart's defaults: a rolling update, and traffic only to ready pods.
+- **Why:** Traefik starts its HTTP challenge as soon as it boots (10:46:28) and was ready 7 s
+  later (10:46:35). Until then the Service sent Let's Encrypt's callback nowhere: the request
+  timed out on every restart, and during a rolling update the old pod answered it 404 instead.
+  With the change, both production certificates were issued at boot, and a second restart
+  reused them with no request. Staging had to go because Traefik requests no certificate for a
+  name it already holds one for, from any resolver.
+- **Where:** `k8s/traefik.yaml`.
+
+### Secrets are generated into the cluster and never written down
+
+- **Decision:** `k8s/secrets.sh` makes the Postgres password, JWT secret and bot password with
+  `openssl rand` and passes them to `kubectl create secret` through a process substitution.
+  k3s runs with `--secrets-encryption`, and the script never replaces an existing Secret.
+- **Alternative:** a gitignored env file, or encrypted secrets in the repo (SOPS).
+- **Why:** nothing on the Mac or in git can leak them, and nothing needs to: no person ever
+  types these values. Replacing them would lock the API out of Postgres, which keeps its first
+  password, and the bots out of accounts registered with the old one.
+- **Where:** `k8s/secrets.sh`.
