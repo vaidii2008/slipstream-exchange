@@ -10,7 +10,7 @@ import { ApiClient } from "./client.ts";
 import { agentPolicy, type Policy, runEpisode } from "./evals.ts";
 import { useTestServer } from "./testing.ts";
 
-const { app, testMarket } = useTestServer();
+const { app, testMarket, uniqueEmail } = useTestServer();
 let baseUrl: string;
 
 beforeAll(async () => {
@@ -33,6 +33,22 @@ describe("runEpisode", () => {
     "funds a new account once the fleet trades, runs the policy and marks it at the horizon",
     async () => {
       const symbol = (await testMarket("BTC-USD")).symbol;
+      // An ask 100 USD above the fleet's 70,000, past the maker's outermost quote and any noise
+      // limit. The maker requotes by cancelling every quote before placing new ones, so a market
+      // buy that lands in that gap finds no ask and is cancelled, more often the slower the
+      // machine. With this resting, the buy always fills.
+      const backstop = new ApiClient(baseUrl, uniqueEmail("evals-test"), "evals-test-password");
+      await backstop.signIn();
+      const btcUsd = await backstop.market(symbol);
+      await backstop.deposit("BTC", 100_000_000n, 8);
+      await expect(
+        backstop.place(btcUsd, {
+          type: "limit",
+          side: "sell",
+          price: 70_100n * 100_000_000n,
+          quantity: 100_000_000n,
+        }),
+      ).resolves.toMatchObject({ ok: true, status: "open" });
       let handed: { email: string; password: string; deadline: number } | undefined;
       // Buys 0.01 BTC at the market and stops.
       const buyer: Policy = {
