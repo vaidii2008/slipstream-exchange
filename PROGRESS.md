@@ -1914,3 +1914,85 @@ to it, the account channel is the piece to split out.
 
 - No migrations this session. New `.env` lines: `ANTHROPIC_API_KEY` (already set) and
   optionally `AGENT_MODEL=claude-haiku-5-5` and `BOT_SEED`.
+
+## Day 19 — Deployed to k3s on one Compute Engine VM
+
+**Commits landed (12)**
+
+- `build(k8s): create the cluster's namespace and secrets from fresh random values`
+- `build(k8s): run Postgres as a StatefulSet on a local-path volume`
+- `build(k8s): run Redis as a Deployment without persistence`
+- `build(k8s): build amd64 images and import them into k3s over SSH`
+- `build(k8s): run the API as a one-replica StatefulSet that migrates before it starts`
+- `build(k8s): run the terminal as a Deployment`
+- `build(k8s): run the bot fleet against the API inside the cluster`
+- `build(k8s): serve both hosts over HTTPS with Let's Encrypt staging, keeping /metrics private`
+- `build(k8s): switch to production Let's Encrypt and let Traefik answer challenges at startup`
+- `docs: add a deploy runbook for k3s on one VM to the README`
+- `docs: record the k3s deploy's decisions in DECISIONS.md`
+- `docs: record day 19 in PROGRESS.md`
+
+**What now works**
+
+- Before any deploy work, the dev database checked clean after Day 18's second API: 0 pending
+  orders, every asset netting to 0 over 2.5M entries, 0 unbalanced transactions, 0 cached
+  balances off their entries, 0 duplicate (market, sequence), and both logs (509,357 and
+  498,954 commands) replaying with no gap into books equal to the open orders.
+- Live at https://slipstream-exchange.duckdns.org (terminal) and
+  https://api.slipstream-exchange.duckdns.org (API): k3s v1.37.2 on an e2-medium in
+  europe-west1-b, Traefik 3.7.15, production Let's Encrypt certificates valid to 7 Feb 2027,
+  HTTP redirecting to HTTPS. The bot fleet trades in the cluster, about 50,000 commands an
+  hour per market.
+- `node .claude/web-check.js` against the public terminal: 0 console errors, 0 overlay issues.
+  A copy that also reloads got 200 from the API's `/session/refresh`: the `SameSite=Strict`
+  cookie crosses the two hosts.
+- A `wss://` connection held 5 minutes through Traefik with no close: 4,204 book updates and
+  478 trades.
+- `/metrics`, `/metrics/`, `/metrics?x=1`, `/METRICS` and `/%6detrics` all answer 404 from
+  outside.
+- A rollout restart of the API opens both markets unhalted. After a force-kill under bot load,
+  the new pod replayed 32,677 commands in 944 ms, and the cluster's database checked clean the
+  same way as the dev one.
+- Node at 47% of 3.9 GB memory (API 143 MiB), 4.2 of 30 GB disk. First deploy 2 min 41 s.
+- 507 tests in 40 files, unchanged.
+
+**What is stubbed**
+
+- Boot replays the whole log, and the API's memory limit is 1 GiB. At the fleet's rate, a
+  restart after several hours of trading would replay past it (1.5–1.6 GB at 1M commands,
+  Day 15's measurement; not yet hit here). Needs a decision: snapshots, a slower deployed
+  fleet, a higher limit, or periodic resets.
+- No backups of the cluster's Postgres; its volume is a directory on the VM's disk.
+- Deploys run from the Mac only, through an SSH tunnel; CI does not deploy.
+- No Prometheus on the cluster; `/metrics` is reachable only inside it.
+- Carried over: the in-flight settlement gap when a market's lock drops, drizzle-kit's
+  dev-only audit findings, the web dependencies' moderate audit findings, Safari unchecked,
+  the MCP server not tried in a real host.
+
+**Decisions and deviations from the plan**
+
+- The Secret came first and the deploy script before the API, so each workload was applied
+  to the cluster as its commit landed. Postgres/Redis and terminal/bots were split, as asked.
+- Staging's certificate failures were first put down to a bundled two-name certificate (in
+  `1b6480c`'s message: "cause not found"). The cause was found in the next commit: Traefik
+  requests certificates about 7 s before its pod is ready, and its Service routed nothing to
+  an unready pod. One certificate per host stays, but it was not the fix.
+- `6c888fc` was committed while the gate was red (a 5 s timeout in `strategies.test.ts`): my
+  command chain did not stop on the failure. The same tree passed the gate twice right after;
+  every later commit ran only behind a green gate.
+- The gate's timing tests (`strategies.test.ts`, `baseline.test.ts`, the recovery kill test)
+  failed under load while the compose bot fleet traded against the dev database (its Postgres
+  at 134% CPU). The compose `bots` container was stopped for the session.
+
+**Repo shape**
+
+- New: `k8s/`. Pressure: kubectl applies a directory of manifests as one kustomization, and
+  ten YAML files and two scripts are not TypeScript.
+- Cloud resources (approved): static IP `slipstream-ip` (35.205.134.142), firewall rule
+  `slipstream-web` (tcp:80, tcp:443 to tag `slipstream`), VM `slipstream`, and an SSH key in
+  the project's metadata. They cost money while they exist.
+
+**Next: stretch list**
+
+- Decide the boot-replay memory question before the cluster restarts with a long log.
+- No migrations, no new `.env` lines.
