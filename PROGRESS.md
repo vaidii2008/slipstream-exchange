@@ -1996,3 +1996,75 @@ to it, the account channel is the piece to split out.
 
 - Decide the boot-replay memory question before the cluster restarts with a long log.
 - No migrations, no new `.env` lines.
+
+## Day 20 — Flaky tests, paged replay and book snapshots
+
+**Commits landed (9)**
+
+- `fix(test): hold only accounts no reservation needs in the kill test`
+- `fix(test): keep both sides of the baseline test's book quoted`
+- `fix(engine): replay the event log in batches so boot memory follows the book, not the log`
+- `feat(engine): snapshot each market's state every 10,000 events`
+- `feat(engine): restore each market from its latest snapshot plus the events after it`
+- `chore(engine): keep only the last three snapshots per market`
+- `docs: record paged replay, snapshots and the replay memory estimate in DECISIONS.md`
+- `docs: describe boot from snapshots in the README and drop the full-replay limitation`
+- `docs: record day 20 in PROGRESS.md`
+
+**What now works**
+
+- The recovery kill test no longer mistakes a sell's reservation for a blocked settlement:
+  10 of 10 runs passed with the compose bots trading. The baseline test rests a backstop bid
+  and ask, so no step reads a one-sided book while the fleet's maker requotes: 8 of 8.
+- Boot reads each market's log in pages of 5,000 and keeps only the commands past the settled
+  frontier. On the cluster, 218,890 logged commands rebuilt in 3.75 s at a 192 MiB peak, the
+  same peak as 82,095 commands under the full read (1.72 s).
+- Every 10,000 events a market writes its whole engine state to `book_snapshots` from inside
+  its queue, the insert outside it; the newest three are kept. A boot restores the newest that
+  reads and replays the log after it, falls back past unreadable ones, and replays the whole log
+  when none reads. A fast-check property checks restore plus the rest of the log against a full
+  replay at random cut points.
+- Deployed `f108bfd`. Both markets wrote their first snapshot at sequence 120,000 (about 1 KB
+  each). Deleting `api-0` then rebuilt both from it, replaying 1,872 and 208 commands, in
+  761 ms at a 190 MiB peak, 18 s from delete to ready; both reopened unhalted, no error lines,
+  `/health` 200.
+- 517 tests in 41 files.
+
+**What is stubbed**
+
+- The time-to-limit estimate (8 to 10 hours of trading from a fresh log, about 780,000
+  commands) rests on one cluster point and Day 15's local growth rate; the old code's growth was
+  never measured on the cluster.
+- Pruning is tested but not yet seen on the cluster: it needs a fourth snapshot per market.
+- The first boot of `f108bfd`, with no snapshot yet, took 10.0 s for 224,079 commands while the
+  rollout was importing images; not a clean measurement.
+- The noise-trader test still times out under load, and `exchange.test.ts` and
+  `trading.test.ts` can too. A candidate fix for the noise-trader test is written but not
+  applied. The dev database's open-orders lookup has no index for open orders (643,681 rows,
+  40 open), which is what loads Postgres when the compose bots trade.
+- Carried over from Day 19: no backups of the cluster's Postgres, deploys only from the Mac,
+  no Prometheus on the cluster.
+
+**Decisions and deviations from the plan**
+
+- Snapshots were cut on 6 November; they came back because a restart with a long log would
+  have passed the API's 1 GiB limit.
+- `book_snapshots` follows the plan's columns; its `book` holds the full engine state (sequence
+  and every resting order in queue order), not just price levels.
+- `f108bfd`'s message says about 10 snapshots a market a day; at the measured rate it is about
+  5 an hour, about 125 a day. DECISIONS.md has the right figure.
+- The two `fix(test)` commits end with a co-author trailer; later commits do not.
+- `c2c92a7` was deployed from a temporary worktree, so uncommitted work in the checkout did not
+  reach the image.
+
+**Repo shape**
+
+- New: `snapshots.ts` and `snapshots.test.ts`. Pressure: `events.ts` is the command log's
+  format and was near 190 lines, and the snapshot format changes for its own reasons.
+- New migration: `0014_create_book_snapshots`.
+
+**Next**
+
+- Decide on an index for open orders, a data-model change.
+- Decide whether to apply the noise-trader test fix.
+- No new `.env` lines.
