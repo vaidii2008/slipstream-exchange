@@ -2,7 +2,7 @@
 // can start from the latest one and replay only the log after it instead of the whole log.
 // The log stays the record; a snapshot is a cache of it that a boot may skip.
 
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Engine, EngineState } from "./engine.ts";
 import { minorUnits } from "./events.ts";
@@ -12,6 +12,10 @@ import { bookSnapshots } from "./schema.ts";
 // At the deployed fleet's 50,000 or so events an hour per market, one every 12 minutes, and a
 // boot replays at most this many events past the latest one.
 export const SNAPSHOT_EVERY = 10_000;
+
+// Snapshots kept per market. The newest is the one a boot uses; the two before it are there in
+// case it does not read, and anything older would only ever save replaying 20,000 events.
+export const SNAPSHOTS_KEPT = 3;
 
 // Bumped when the shape changes, so a reader can tell a snapshot it cannot read from a
 // corrupt one.
@@ -100,4 +104,20 @@ export async function readSnapshot(
     throw new Error(`snapshot ${market} ${sequence} is gone`);
   }
   return row.book;
+}
+
+// Deletes the market's snapshots older than its `keep` newest. Safe to run alongside another
+// call or a write: it never deletes a row newer than the newest `keep` it saw.
+export async function pruneSnapshots(
+  db: Database,
+  market: string,
+  keep = SNAPSHOTS_KEPT,
+): Promise<void> {
+  const oldestKept = (await snapshotSequences(db, market))[keep - 1];
+  if (oldestKept === undefined) {
+    return;
+  }
+  await db
+    .delete(bookSnapshots)
+    .where(and(eq(bookSnapshots.market, market), lt(bookSnapshots.sequence, oldestKept)));
 }

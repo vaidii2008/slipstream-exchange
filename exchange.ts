@@ -27,6 +27,7 @@ import { type Recovered, recover, type ReplayedCommand, settledFrontier } from "
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 import {
   decodeSnapshot,
+  pruneSnapshots,
   readSnapshot,
   SNAPSHOT_EVERY,
   serializeEngine,
@@ -104,8 +105,9 @@ export class MarketBusyError extends Error {
 
 export type HaltListener = (market: string, error: unknown) => void;
 
-// Called once each snapshot write has finished, with its error if it failed. A failed write
-// costs nothing but a longer replay until the next snapshot succeeds.
+// Called once each snapshot's write, and the pruning of older ones after it, has finished,
+// with its error if either failed. A failed write costs nothing but a longer replay until the
+// next snapshot succeeds; a failed prune leaves old rows for the next one to delete.
 export type SnapshotListener = (market: string, sequence: number, error?: unknown) => void;
 
 // Called when a market opening could not use a snapshot and tried the one before it.
@@ -518,8 +520,9 @@ export class Exchange {
 
   // Called in the market's queue, after a command has settled: the state is serialized here,
   // so it is exact at its sequence and everything in it is settled. The write runs outside
-  // the queue, so the next command never waits on Postgres for it. A write that fails is
-  // reported and not retried; the next interval takes a fresh snapshot.
+  // the queue, so the next command never waits on Postgres for it, and so does deleting all
+  // but the newest few. A write that fails is reported and not retried; the next interval
+  // takes a fresh snapshot.
   #snapshot(running: RunningMarket, symbol: string): void {
     const { sequence } = running.engine;
     const book = serializeEngine(running.engine);
@@ -529,10 +532,12 @@ export class Exchange {
         listener(symbol, sequence, error);
       }
     };
-    const write = writeSnapshot(this.#db, symbol, sequence, book).then(
-      () => notify(),
-      (error: unknown) => notify(error),
-    );
+    const write = writeSnapshot(this.#db, symbol, sequence, book)
+      .then(() => pruneSnapshots(this.#db, symbol))
+      .then(
+        () => notify(),
+        (error: unknown) => notify(error),
+      );
     this.#snapshotWrites.add(write);
     void write.finally(() => this.#snapshotWrites.delete(write));
   }

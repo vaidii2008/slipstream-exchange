@@ -157,7 +157,7 @@ export function buildServer(
       app.log.info({ market, sequence }, "book snapshot written");
     } else {
       // Not fatal: the market trades on, and its next boot replays further back.
-      app.log.error({ err: error, market, sequence }, "book snapshot write failed");
+      app.log.error({ err: error, market, sequence }, "book snapshot write or prune failed");
     }
   });
   exchange.onSnapshotSkipped((market, sequence, error) => {

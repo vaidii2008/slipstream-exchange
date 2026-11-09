@@ -365,3 +365,23 @@ describe("a snapshot plus the rest of the log", { timeout: 30_000 }, () => {
     );
   });
 });
+
+describe("pruning", () => {
+  it("keeps only the newest three snapshots of a market", async () => {
+    const market = await testMarket("BTC-USD");
+    const other = await testMarket("BTC-USD");
+    const seller = await funded({ BTC: "10" });
+    const exchange = new Exchange(db, { snapshotEvery: 1 });
+    // A snapshot after every resting ask: 1 to 6 in one market, 1 to 2 in the other.
+    for (let i = 0; i < 6; i++) {
+      await exchange.placeOrder(market, limit(seller, "sell", String(60_000 + 10 * i), "0.1"));
+    }
+    for (let i = 0; i < 2; i++) {
+      await exchange.placeOrder(other, limit(seller, "sell", String(60_000 + 10 * i), "0.1"));
+    }
+    await exchange.close();
+
+    expect((await snapshotsOf(market.symbol)).map((row) => row.sequence)).toEqual([4, 5, 6]);
+    expect((await snapshotsOf(other.symbol)).map((row) => row.sequence)).toEqual([1, 2]);
+  });
+});
