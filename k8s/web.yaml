@@ -1,0 +1,53 @@
+# The trading terminal, Next.js's standalone server. Stateless, so a plain Deployment: a new
+# pod may start beside the old one. Its bundle has the API's public address written in at
+# build time (deploy.sh), so this manifest sets nothing about the API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: slipstream
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 3001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: slipstream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: slipstream-web
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 3001
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
