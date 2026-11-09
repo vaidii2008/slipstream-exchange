@@ -1,0 +1,82 @@
+# Postgres 16, the same image as compose.yaml. A StatefulSet, so its volume claim belongs to
+# the pod's name and outlives the pod: a restarted or rescheduled Postgres gets its data back.
+# The volume is k3s's local-path, a directory on the VM's disk, which is enough on one node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: slipstream
+spec:
+  # Headless: the name resolves straight to the one pod, which a StatefulSet requires.
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: slipstream
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: slipstream
+            - name: POSTGRES_DB
+              value: slipstream
+            # Read only on the first start, when the data directory is empty. Changing the
+            # Secret later does not change the password; see secrets.sh.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slipstream
+                  key: POSTGRES_PASSWORD
+            # A directory inside the mount, so initdb finds it empty even if the volume's root
+            # holds anything else.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "slipstream", "-d", "slipstream"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "slipstream", "-d", "slipstream"]
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi
