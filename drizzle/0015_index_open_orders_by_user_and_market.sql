@@ -1,0 +1,1 @@
+CREATE INDEX "orders_open_user_id_market_idx" ON "orders" USING btree ("user_id","market") WHERE "orders"."status" in ('pending', 'open');

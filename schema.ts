@@ -180,6 +180,13 @@ export const orders = pgTable(
   },
   (table) => [
     unique("orders_user_client_order_id").on(table.userId, table.clientOrderId),
+    // A user's open orders, which every bot reads every tick. Only the open ones: they are a
+    // few dozen rows against a history that grows without end, so the index stays that small
+    // and a lookup costs the same however long the market has traded. Keyed as the listing
+    // filters, by user and then market, so a listing without a market uses its first column.
+    index("orders_open_user_id_market_idx")
+      .on(table.userId, table.market)
+      .where(sql`${table.status} in ('pending', 'open')`),
     check(
       "orders_price_matches_type",
       sql`(${table.type} = 'limit') = (${table.price} is not null)`,
