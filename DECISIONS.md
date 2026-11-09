@@ -699,6 +699,68 @@ the last command it reported replays to exactly the book it printed, the restart
 one interrupted command and cancels the unlogged orders, and the ledger sums to zero with
 every reservation matching an open order.
 
+### Boot reads the log in pages and keeps only what recovery needs
+
+- **Decision:** a market opens by reading its log in keyset pages of 5,000 commands
+  (`sequence > last`, from the primary key), replaying each page and letting it go. The
+  settled frontier is read first, and only the commands after it are kept for recovery.
+- **Alternative:** read the whole log, replay it, and hand every command's events to recovery,
+  as before; or page with `OFFSET`, which scans every row before the page.
+- **Why:** recovery only ever settles commands past the frontier, one or none after a crash, so
+  holding the whole log and all its events was the 1.5 GB at a million commands. Paged, the
+  cluster's boot peaked at 192 MiB with 218,890 commands logged, the same as with 82,095 under
+  the old code: memory follows the book, and only time follows the log.
+- **Where:** `readLogPages` in `events.ts`; `#replay` in `exchange.ts`; `settledFrontier` and
+  `recover` in `recovery.ts`.
+
+### Each market snapshots its whole engine state every 10,000 events
+
+- **Decision:** when a market's sequence reaches the next multiple of 10,000, the exchange
+  serializes the engine's full state inside the market's queue, right after that command's
+  settlement commits, and writes it to `book_snapshots` outside the queue. The state is the
+  sequence and every resting order with its remaining quantity, oldest first within each
+  price. A boot restores the newest snapshot that reads, then replays only the log after it;
+  one that fails to read, decode or restore is logged and the one before it tried, and with
+  none the whole log replays. Each successful write deletes all but the newest three.
+- **Alternative:** store only the price levels (the public depth); or write inside the queue.
+- **Why:** levels lose who rests where and in what order, so a restored book would match a
+  different order first: the time priority is the position within the level, and the fast-check
+  property (random commands, a random cut, restore plus the rest against a full replay) fails at
+  once if restore reverses a level. Serializing in the queue makes the snapshot exact at its
+  sequence and covers only settled commands, so recovery still finds every unsettled one after
+  it; writing outside keeps matching from waiting on Postgres. A snapshot is a cache of the log,
+  so a failed write is only reported, and the next interval takes a fresh one.
+- **Measured on the cluster:** the first snapshots were at sequence 120,000, about 1 KB each,
+  since the bots keep few orders resting. Deleting the API pod then rebuilt both markets from
+  them, replaying 1,872 and 208 commands, in 761 ms at a 190 MiB peak. The same boot reading
+  the whole log (218,890 commands, paged) had taken 3.75 s. At the fleet's rate a market writes
+  about five snapshots an hour, about 125 a day, so without pruning the table grows by that many
+  copies of each book.
+- **Where:** `snapshots.ts`; `#snapshot` and `#restore` in `exchange.ts`; `Engine.restore` in
+  `engine.ts`; tests in `snapshots.test.ts`.
+
+### How long the full-log replay had before the 1 GiB limit
+
+- **Rate, measured:** the cluster's log started at 10:37 UTC on 9 November. Each market logged
+  about 50,000 commands an hour in the first hour (40,966 in 49 minutes) and 37,500 an hour over
+  the first three (30,500 in the last of them, which included this session's deploys and pod
+  restarts). There are about 1.04 events per command (BTC-USD: 118,357 events, 112,919
+  commands).
+- **Memory, measured:** under the old code, a boot with 82,095 commands logged across both
+  markets peaked at 192 MiB (the container's `memory.peak`) and rebuilt the books in 1.72 s.
+- **Growth per 100k commands, not measured on the cluster:** the second cluster point came after
+  paging landed, so it shows no growth at all. Day 15 measured the old code locally at 418–449 MB
+  for 118,271 commands and 1.5–1.6 GB for 1,011,453: about 1.25 MB per 1,000 commands, so about
+  119 MiB per 100,000.
+- **Estimate:** 192 MiB plus 119 MiB per 100,000 commands past 82,095 reaches 1 GiB at about
+  780,000 commands across both markets. At 75,000 to 100,000 an hour combined, that is 8 to 10
+  hours after the log started: a restart after about 18:30 to 21:00 UTC that day would have been
+  killed for memory, and every restart replays the same log, so the API would have crash-looped
+  until the limit or the log changed. It rests on one cluster point and a slope measured on a
+  Mac, so read it as hours, not minutes.
+- **Where:** the container's `memory.peak` and the API's `books rebuilt` log line, read after
+  each `kubectl delete pod api-0`.
+
 ## Measurement
 
 ### Metrics carry market and outcome labels, never ids
