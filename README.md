@@ -232,8 +232,9 @@ An order's path:
    candles and private order and balance updates to subscribed sockets.
 
 On boot, each market takes a Postgres advisory lock, so only one process writes it. It then
-rebuilds its book by replaying the event log and finishes any settlement a crash interrupted.
-It opens only if the rebuilt book matches the orders Postgres says are open.
+restores its book from its latest snapshot, which the engine writes every 10,000 events, replays
+the event log after it a page at a time, and finishes any settlement a crash interrupted. It
+opens only if the rebuilt book matches the orders Postgres says are open.
 
 Money is never a float. Prices and quantities are `bigint` minor units in the engine and
 `NUMERIC(36,18)` in Postgres. An amount with more decimals than its asset allows is rejected,
@@ -259,6 +260,7 @@ in Docker Desktop (10 CPUs, 7.75 GB); k6 1.2.3 in Docker. 7 November 2026.
 | End to end  | The match inside a placement (200/s steady)                            | p50 4.1 µs                                                  |
 | End to end  | Trade to subscriber, 200 sockets, 100 orders/s                         | p50 18 ms, p95 44 ms, p99 69 ms; no gap in 1,791,445 deltas |
 | End to end  | Boot: replay the log until `/health` answers, 118,271 / 1,011,453 cmds | 0.76–1.12 s / 3.3–4.1 s                                     |
+| Cluster     | Boot from a snapshot, 2,080 commands logged after it, both markets     | books rebuilt in 761 ms, 190 MiB peak                       |
 
 The engine is four orders of magnitude faster than the exchange around it. A market runs one
 command at a time, so its ceiling is one over the time a command takes, about 3.8 ms. That time
@@ -333,10 +335,6 @@ from 7.0–7.5 ms to 0.07–0.21 ms, a single Postgres query timed in `psql` wit
   about 25,000 messages a second, event-loop lag p99 reached 89 ms, and throughput fell to
   177/s. Redis pub/sub already allows moving the gateway to its own process; it hasn't been
   done.
-- **Boot replays the whole log.** There are no snapshots, so every boot reads and replays each
-  market from its first command: about 3.5 s of downtime per million commands on this machine,
-  growing with the log. The whole log is in memory during replay, 1.5–1.6 GB peak at 1M
-  commands.
 - **`/metrics` is unauthenticated.** It exposes counts and latencies per market, never user or
   order ids, but anyone who can reach the API can read it. The k3s deployment gives it no
   public route; a separate, private listener would not depend on the proxy for that.
