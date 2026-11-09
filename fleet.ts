@@ -2,7 +2,8 @@
 // keep the book two-sided and trades printing. `npm run bots` registers and funds every agent
 // on first run, signs them back in on later runs, and stops them cleanly on Ctrl-C.
 
-import { type AgentLimits, AgentRunner, type AgentSpec, jsonLog } from "./bots.ts";
+import { setTimeout as sleep } from "node:timers/promises";
+import { type AgentLimits, AgentRunner, type AgentSpec, jsonLog, type Logger } from "./bots.ts";
 import { parseBotConfig } from "./config.ts";
 import { parseAmount } from "./money.ts";
 import { marketMaker, noiseTrader } from "./strategies.ts";
@@ -137,6 +138,57 @@ export function defaultFleet(
   });
 }
 
+export type WaitOptions = {
+  // How long to keep trying before giving up, counted from the first attempt.
+  timeoutMs: number;
+  // The wait after the first failure; each later wait doubles, up to maxDelayMs.
+  firstDelayMs: number;
+  maxDelayMs: number;
+  log: Logger;
+};
+
+const WAIT_FOR_API: WaitOptions = {
+  timeoutMs: 60_000,
+  firstDelayMs: 250,
+  maxDelayMs: 5_000,
+  log: jsonLog,
+};
+
+// Resolves once the API's /health answers 200. The API listens only after it has rebuilt
+// every book, so a 200 means it takes orders. A rollout restarts the API and the fleet
+// together; without this wait the fleet's first sign-in fails while the API replays, the
+// process exits and the pod restarts. Doubling delays keep a long replay from being hammered.
+export async function waitForApi(
+  baseUrl: string,
+  options: Partial<WaitOptions> = {},
+): Promise<void> {
+  const { timeoutMs, firstDelayMs, maxDelayMs, log } = { ...WAIT_FOR_API, ...options };
+  const deadline = Date.now() + timeoutMs;
+  const health = new URL("/health", baseUrl);
+  let delay = firstDelayMs;
+  for (let attempt = 1; ; attempt += 1) {
+    let outcome: string;
+    try {
+      const reply = await fetch(health, { signal: AbortSignal.timeout(2_000) });
+      if (reply.ok) {
+        return;
+      }
+      await reply.body?.cancel();
+      outcome = `status ${reply.status}`;
+    } catch (error) {
+      outcome = String(error);
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      throw new Error(`API at ${baseUrl} not healthy after ${timeoutMs} ms: ${outcome}`);
+    }
+    const wait = Math.min(delay, left);
+    log("api_waiting", { attempt, outcome, retryInMs: wait });
+    await sleep(wait);
+    delay = Math.min(delay * 2, maxDelayMs);
+  }
+}
+
 async function runFleet(): Promise<void> {
   const config = parseBotConfig(process.env);
   const runner = new AgentRunner({
@@ -158,6 +210,7 @@ async function runFleet(): Promise<void> {
     });
   }
 
+  await waitForApi(config.BOT_API_URL);
   try {
     for (const spec of defaultFleet()) {
       await runner.start(spec);

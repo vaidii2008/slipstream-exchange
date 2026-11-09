@@ -1,7 +1,8 @@
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentRunner, type Logger } from "./bots.ts";
 import { ApiClient } from "./client.ts";
-import { defaultFleet, NOISE_TRADERS_PER_MARKET } from "./fleet.ts";
+import { defaultFleet, NOISE_TRADERS_PER_MARKET, waitForApi } from "./fleet.ts";
 import { useTestServer } from "./testing.ts";
 
 const { app, uniqueEmail, testMarket } = useTestServer();
@@ -108,4 +109,54 @@ describe("defaultFleet", () => {
     }
     expect(fleetRunner.agents.length).toBe(2 * (1 + NOISE_TRADERS_PER_MARKET));
   }, 45_000);
+});
+
+describe("waitForApi", () => {
+  // A stand-in API whose /health answers with each given status in turn, then the last one.
+  async function healthServer(...statuses: number[]): Promise<[Server, string]> {
+    const server = createServer((_request, response) => {
+      const status = statuses.length > 1 ? statuses.shift() : statuses[0];
+      response.writeHead(status ?? 500).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("server has no port");
+    }
+    return [server, `http://127.0.0.1:${address.port}`];
+  }
+
+  it("returns at once when the API is healthy", async () => {
+    const waits: unknown[] = [];
+    await waitForApi(baseUrl, { log: (_event, fields) => waits.push(fields) });
+    expect(waits).toEqual([]);
+  });
+
+  it("retries with doubling delays until /health answers 200", async () => {
+    const [server, url] = await healthServer(503, 503, 503, 200);
+    const waits: Record<string, unknown>[] = [];
+    try {
+      await waitForApi(url, {
+        firstDelayMs: 10,
+        maxDelayMs: 25,
+        log: (_event, fields = {}) => waits.push(fields),
+      });
+    } finally {
+      server.close();
+    }
+    expect(waits).toEqual([
+      { attempt: 1, outcome: "status 503", retryInMs: 10 },
+      { attempt: 2, outcome: "status 503", retryInMs: 20 },
+      { attempt: 3, outcome: "status 503", retryInMs: 25 },
+    ]);
+  });
+
+  it("gives up with the last failure once the timeout has passed", async () => {
+    // A port that was just free: nothing listens on it, so every attempt is refused.
+    const [server, url] = await healthServer(200);
+    await new Promise((resolve) => server.close(resolve));
+    await expect(
+      waitForApi(url, { timeoutMs: 200, firstDelayMs: 20, maxDelayMs: 50, log: () => {} }),
+    ).rejects.toThrow(`API at ${url} not healthy after 200 ms: TypeError: fetch failed`);
+  });
 });
