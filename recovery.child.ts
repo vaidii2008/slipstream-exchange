@@ -4,18 +4,25 @@
 // it, one JSON line per command, so the test knows exactly what the process had in memory
 // when it died.
 //
-// Usage: node recovery.child.ts <market> <user ids as a JSON array>, with DATABASE_URL set.
+// Each user only buys or only sells, so the test can hold accounts that every trade's
+// settlement needs and no order's reservation does (see the test).
+//
+// Usage: node recovery.child.ts <market> <buyer ids as JSON> <seller ids as JSON>, with
+// DATABASE_URL set.
 
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { Exchange } from "./exchange.ts";
 import { loadMarket, OrderError } from "./orders.ts";
 
-const [symbol, users] = process.argv.slice(2);
-if (symbol === undefined || users === undefined) {
-  throw new Error("usage: node recovery.child.ts <market> <user ids as JSON>");
+const [symbol, buyers, sellers] = process.argv.slice(2);
+if (symbol === undefined || buyers === undefined || sellers === undefined) {
+  throw new Error(
+    "usage: node recovery.child.ts <market> <buyer ids as JSON> <seller ids as JSON>",
+  );
 }
-const userIds = JSON.parse(users) as string[];
+const buyerIds = JSON.parse(buyers) as string[];
+const sellerIds = JSON.parse(sellers) as string[];
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const db = drizzle({ client: pool });
 const market = await loadMarket(db, symbol);
@@ -39,11 +46,10 @@ await exchange.open([market]);
 const pick = (n: number) => Math.floor(Math.random() * n);
 
 // Prices within ten ticks of 60,000, so orders cross often; up to 50 steps of quantity.
-async function trade(userId: string): Promise<never> {
+async function trade(userId: string, side: "buy" | "sell"): Promise<never> {
   const resting: string[] = [];
   for (;;) {
     const roll = Math.random();
-    const side = Math.random() < 0.5 ? "buy" : "sell";
     const quantity = BigInt(1 + pick(50)) * market!.quantityStep;
     try {
       if (roll < 0.15 && resting.length > 0) {
@@ -74,4 +80,7 @@ async function trade(userId: string): Promise<never> {
   }
 }
 
-await Promise.all(userIds.map((userId) => trade(userId)));
+await Promise.all([
+  ...buyerIds.map((userId) => trade(userId, "buy")),
+  ...sellerIds.map((userId) => trade(userId, "sell")),
+]);

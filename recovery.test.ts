@@ -327,10 +327,12 @@ describe("a process killed mid-load", () => {
         }
         userIds.push(userId);
       }
+      const buyerIds = userIds.slice(0, 3);
+      const sellerIds = userIds.slice(3);
 
       const child = spawn(
         process.execPath,
-        ["recovery.child.ts", market.symbol, JSON.stringify(userIds)],
+        ["recovery.child.ts", market.symbol, JSON.stringify(buyerIds), JSON.stringify(sellerIds)],
         {
           env: { ...process.env, DATABASE_URL: testDatabaseUrl() },
           stdio: ["ignore", "pipe", "pipe"],
@@ -365,19 +367,22 @@ describe("a process killed mid-load", () => {
           return books.length >= 300;
         });
 
-        // Hold every user's BTC available account. A settlement locks every account it touches,
-        // and every trade credits the buyer's BTC available, so the next command that trades
-        // (or cancels a sell) is logged and applied, then its settlement waits here. A buy
-        // reserves USD, which is not held, so buys are reserved and recorded behind it and
-        // wait in the queue without being logged. Locked in id order, like every settlement:
-        // in any other order this lock and a running settlement can each hold a row the other
-        // is waiting for, and Postgres kills one of them as a deadlock.
+        // Hold the buyers' BTC available accounts. A settlement locks every account it
+        // touches, and every trade credits the buyer's BTC available, so the next command that
+        // trades is logged and applied, then its settlement waits here. No reservation needs
+        // these rows: a buy reserves USD and a sell reserves its seller's BTC. So whatever waits
+        // on this lock is a settlement, and the orders reserved after it are recorded and wait
+        // in the queue without being logged. Were the sellers' BTC held too, a sell's
+        // reservation could be the first to wait, and the queue would run on past the check
+        // below. Locked in id order, like every settlement: in any other order this lock and a
+        // running settlement can each hold a row the other is waiting for, and Postgres kills
+        // one of them as a deadlock.
         await lock.query("begin");
         await lock.query(
           `select id from ledger_accounts
            where user_id = any($1) and asset = 'BTC' and bucket = 'available'
            order by id for update`,
-          [userIds],
+          [buyerIds],
         );
         const holder = await lock.query<{ xid: string }>("select txid_current()::text as xid");
         await until("a settlement to wait on the held accounts", async () => {
