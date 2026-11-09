@@ -29,15 +29,20 @@ export type Recovered = {
   cancelled: number;
 };
 
-// `replayed` holds each logged command's events, in log order, as replay returned them.
+// A logged command with the events replay produced for it.
+export type ReplayedCommand = LoggedCommand & { events: EngineEvent[] };
+
+// `pastFrontier` holds every logged command numbered after `frontier`, in log order, with
+// its replayed events. Commands at or before the frontier have settled, so the caller can let
+// them go as it replays and hold only these, which after a crash is one command or none.
 export async function recover(
   db: Database,
   market: Market,
   engine: Engine,
-  log: LoggedCommand[],
-  replayed: EngineEvent[][],
+  frontier: number,
+  pastFrontier: ReplayedCommand[],
 ): Promise<Recovered> {
-  const settled = await settleInterrupted(db, market, log, replayed);
+  const settled = await settleInterrupted(db, market, frontier, pastFrontier);
   const cancelled = await cancelUnlogged(db, market);
   await checkBook(db, market, engine);
   return { settled, cancelled };
@@ -48,25 +53,24 @@ export async function recover(
 // market's orders is the last settled event, and every command numbered after it is unsettled,
 // except a rejected cancel, which writes nothing and needs nothing. At most the last command
 // that writes is unsettled after a crash; after a halt, the command whose settlement failed,
-// which may fail again and halt the market again.
-async function settleInterrupted(
-  db: Database,
-  market: Market,
-  log: LoggedCommand[],
-  replayed: EngineEvent[][],
-): Promise<number> {
+// which may fail again and halt the market again. Read before the replay: nothing settles in
+// the market while it opens, so it is the same number afterwards.
+export async function settledFrontier(db: Database, market: Market): Promise<number> {
   const [row] = await db
     .select({ frontier: max(orders.engineSequence) })
     .from(orders)
     .where(eq(orders.market, market.symbol));
-  const frontier = row?.frontier ?? 0;
+  return row?.frontier ?? 0;
+}
 
+async function settleInterrupted(
+  db: Database,
+  market: Market,
+  frontier: number,
+  pastFrontier: ReplayedCommand[],
+): Promise<number> {
   let settled = 0;
-  for (const [index, { sequence, command, loggedAt }] of log.entries()) {
-    const events = replayed[index];
-    if (events === undefined) {
-      throw new Error(`replay returned no events for command ${sequence}`);
-    }
+  for (const { sequence, command, loggedAt, events } of pastFrontier) {
     // A rejected cancel writes nothing, so it can sit past the frontier settled or not.
     const writes = events.some((event) => event.type !== "cancel_rejected");
     if (sequence > frontier && writes) {

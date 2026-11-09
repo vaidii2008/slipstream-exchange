@@ -87,7 +87,9 @@ describe("recovery when a market opens", () => {
     // The buy crosses the ask: a trade at 2 and the rest resting at 3, none of it settled.
     const bid = await loggedButNotSettled(market, 2, limit(buyer, "buy", "60500", "0.3"));
 
-    const after = new Exchange(db);
+    // Read a command at a time, so the unsettled command arrives in a page of its own after
+    // the settled one has been let go.
+    const after = new Exchange(db, { logPageSize: 1 });
     await expect(after.open([market])).resolves.toEqual([
       { market: market.symbol, sequence: 3, halted: false, replayed: 2, settled: 1, cancelled: 0 },
     ]);

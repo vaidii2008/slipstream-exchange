@@ -2,7 +2,7 @@
 // The exchange appends each command before applying it; recovery reads a market's commands
 // back in order and replays them into a fresh engine.
 
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq, gt } from "drizzle-orm";
 import { z } from "zod";
 import type { Engine, EngineEvent, NewOrder } from "./engine.ts";
 import type { Database } from "./ledger.ts";
@@ -107,23 +107,68 @@ export async function appendCommand(
   });
 }
 
-// Every command logged for the market, oldest first.
-export async function readLog(db: Database, market: string): Promise<LoggedCommand[]> {
-  const rows = await db
-    .select({
-      sequence: engineEvents.sequence,
-      commandType: engineEvents.commandType,
-      payload: engineEvents.payload,
-      createdAt: engineEvents.createdAt,
-    })
-    .from(engineEvents)
-    .where(eq(engineEvents.market, market))
-    .orderBy(asc(engineEvents.sequence));
-  return rows.map((row) => ({
+const logColumns = {
+  sequence: engineEvents.sequence,
+  commandType: engineEvents.commandType,
+  payload: engineEvents.payload,
+  createdAt: engineEvents.createdAt,
+};
+
+function logged(row: {
+  sequence: number;
+  commandType: "submit" | "cancel";
+  payload: unknown;
+  createdAt: Date;
+}): LoggedCommand {
+  return {
     sequence: row.sequence,
     command: decode(row.commandType, row.payload),
     loggedAt: row.createdAt,
-  }));
+  };
+}
+
+// Every command logged for the market, oldest first.
+export async function readLog(db: Database, market: string): Promise<LoggedCommand[]> {
+  const rows = await db
+    .select(logColumns)
+    .from(engineEvents)
+    .where(eq(engineEvents.market, market))
+    .orderBy(asc(engineEvents.sequence));
+  return rows.map(logged);
+}
+
+// Commands per page when a market's log is read at boot. A page decoded into commands is a
+// few MB, and at this size a million-command log is 200 round trips.
+export const LOG_PAGE_SIZE = 5_000;
+
+// The market's commands numbered after `after`, oldest first, one page at a time, so a
+// caller that is done with a page before asking for the next holds one page of the log in
+// memory, not all of it. Each page starts after the last sequence of the one before (keyset
+// paging) and is served from the primary key, so a page deep in the log costs what the
+// first one does; OFFSET would scan every row before it.
+export async function* readLogPages(
+  db: Database,
+  market: string,
+  { after = 0, pageSize = LOG_PAGE_SIZE }: { after?: number; pageSize?: number } = {},
+): AsyncGenerator<LoggedCommand[]> {
+  let last = after;
+  for (;;) {
+    const rows = await db
+      .select(logColumns)
+      .from(engineEvents)
+      .where(and(eq(engineEvents.market, market), gt(engineEvents.sequence, last)))
+      .orderBy(asc(engineEvents.sequence))
+      .limit(pageSize);
+    const final = rows.at(-1);
+    if (final === undefined) {
+      return;
+    }
+    yield rows.map(logged);
+    if (rows.length < pageSize) {
+      return;
+    }
+    last = final.sequence;
+  }
 }
 
 // Applies a market's logged commands, oldest first, to an engine that has seen none of them,

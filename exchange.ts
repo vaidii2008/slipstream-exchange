@@ -8,7 +8,8 @@ import {
   appendCommand,
   applyCommand,
   type Command,
-  readLog,
+  LOG_PAGE_SIZE,
+  readLogPages,
   replay,
   takerLimitOf,
 } from "./events.ts";
@@ -22,7 +23,7 @@ import {
   recordOrder,
 } from "./orders.ts";
 import { acquireMarketLock, type MarketLock } from "./marketlock.ts";
-import { type Recovered, recover } from "./recovery.ts";
+import { type Recovered, recover, type ReplayedCommand, settledFrontier } from "./recovery.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
@@ -134,6 +135,9 @@ export type ExchangeOptions = {
   // server always passes it. Without it markets open unlocked, which tests rely on to run
   // several exchanges side by side, each on markets of its own.
   lockDatabaseUrl?: string;
+  // Commands read from the event log at a time when a market opens. Tests make it small to
+  // put page boundaries inside a short log.
+  logPageSize?: number;
 };
 
 export const DEFAULT_MAX_PENDING_COMMANDS = 10_000;
@@ -169,15 +173,21 @@ export class Exchange {
   readonly #updateListeners = new Set<UpdateListener>();
   readonly #maxPending: number;
   readonly #lockDatabaseUrl: string | undefined;
+  readonly #logPageSize: number;
   #closed = false;
 
   constructor(
     db: Database,
-    { maxPendingCommands = DEFAULT_MAX_PENDING_COMMANDS, lockDatabaseUrl }: ExchangeOptions = {},
+    {
+      maxPendingCommands = DEFAULT_MAX_PENDING_COMMANDS,
+      lockDatabaseUrl,
+      logPageSize = LOG_PAGE_SIZE,
+    }: ExchangeOptions = {},
   ) {
     this.#db = db;
     this.#maxPending = maxPendingCommands;
     this.#lockDatabaseUrl = lockDatabaseUrl;
+    this.#logPageSize = logPageSize;
   }
 
   // Called once per halt with the error that caused it. The server logs it at fatal.
@@ -312,10 +322,26 @@ export class Exchange {
       if (this.#lockDatabaseUrl !== undefined) {
         await this.#lock(running, market.symbol, this.#lockDatabaseUrl);
       }
-      const log = await readLog(this.#db, market.symbol);
-      const replayed = replay(running.engine, log);
-      running.replayed = log.length;
-      running.recovered = await recover(this.#db, market, running.engine, log, replayed);
+      // A page at a time, keeping only what recovery needs, so the memory a boot takes
+      // follows the book rather than the length of the log.
+      const frontier = await settledFrontier(this.#db, market);
+      const pastFrontier: ReplayedCommand[] = [];
+      for await (const page of readLogPages(this.#db, market.symbol, {
+        pageSize: this.#logPageSize,
+      })) {
+        const events = replay(running.engine, page);
+        for (const [index, entry] of page.entries()) {
+          const replayed = events[index];
+          if (replayed === undefined) {
+            throw new Error(`replay returned no events for command ${entry.sequence}`);
+          }
+          if (entry.sequence > frontier) {
+            pastFrontier.push({ ...entry, events: replayed });
+          }
+        }
+        running.replayed += page.length;
+      }
+      running.recovered = await recover(this.#db, market, running.engine, frontier, pastFrontier);
     } catch (error) {
       this.#halt(running, market.symbol, error);
     }

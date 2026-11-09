@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { decode, readLog } from "./events.ts";
+import { decode, readLog, readLogPages } from "./events.ts";
 import { Exchange, MarketHaltedError } from "./exchange.ts";
 import { balancesOf, deposit } from "./ledger.ts";
 import { parseAmount } from "./money.ts";
@@ -176,6 +176,14 @@ describe("rebuilding books from the log", () => {
     ]);
 
     expect(after.depth(market.symbol, 50)).toEqual(book);
+    // Read in pages that split the log twice, and in pages that end exactly where it does.
+    for (const logPageSize of [3, 4]) {
+      const paged = new Exchange(db, { logPageSize });
+      await expect(paged.open([market])).resolves.toMatchObject([
+        { sequence: book.sequence, halted: false, replayed: 8 },
+      ]);
+      expect(paged.depth(market.symbol, 50)).toEqual(book);
+    }
     // The rebuilt queue still has behind's 0.05 first at 60,000, so a buy of 0.05 fills it
     // there, at the sequence after the last logged one.
     const taker = await after.placeOrder(market, limit(buyer, "buy", "60100", "0.05"));
@@ -223,6 +231,48 @@ describe("rebuilding books from the log", () => {
     await expect(
       exchange.placeOrder(fine, limit(seller, "sell", "3000", "0.1")),
     ).resolves.toMatchObject({ status: "open" });
+  });
+});
+
+describe("reading the log in pages", () => {
+  it("halts at a gap that falls between two pages", async () => {
+    const market = await testMarket("BTC-USD");
+    for (const sequence of [1, 2, 4]) {
+      await db.insert(engineEvents).values({
+        market: market.symbol,
+        sequence,
+        commandType: "cancel",
+        payload: { orderId: `missing-${sequence}` },
+      });
+    }
+    const exchange = new Exchange(db, { logPageSize: 2 });
+    const halts: unknown[] = [];
+    exchange.onHalt((_symbol, error) => halts.push(error));
+
+    // The first page replayed; the second starts at the gap.
+    await expect(exchange.open([market])).resolves.toEqual([
+      { market: market.symbol, sequence: 2, halted: true, replayed: 2, settled: 0, cancelled: 0 },
+    ]);
+    expect(halts).toEqual([
+      expect.objectContaining({ message: "event log has command 4 where 3 was next" }),
+    ]);
+  });
+
+  it("gives every command after a sequence once, in order, a page at a time", async () => {
+    const market = await testMarket("BTC-USD");
+    for (let sequence = 1; sequence <= 7; sequence++) {
+      await db.insert(engineEvents).values({
+        market: market.symbol,
+        sequence,
+        commandType: "cancel",
+        payload: { orderId: `o-${sequence}` },
+      });
+    }
+    const pages: number[][] = [];
+    for await (const page of readLogPages(db, market.symbol, { after: 2, pageSize: 2 })) {
+      pages.push(page.map((entry) => entry.sequence));
+    }
+    expect(pages).toEqual([[3, 4], [5, 6], [7]]);
   });
 });
 
