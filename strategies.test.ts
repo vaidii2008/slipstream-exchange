@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type AgentLimits, AgentRunner, type Logger, seededRandom } from "./bots.ts";
 import { ApiClient, type MarketInfo } from "./client.ts";
@@ -325,4 +326,69 @@ describe("marketMaker", () => {
       quantity: maker.quoteQuantity,
     });
   });
+
+  it("keeps its asks resting through every requote, so market buys always fill", async () => {
+    const runner = new AgentRunner({ baseUrl, password: PASSWORD, log: quiet });
+    runners.push(runner);
+    const email = uniqueEmail("strategies-test");
+    const strategy = marketMaker(maker);
+    const agent = await runner.start({
+      name: "maker",
+      email,
+      market: btc,
+      funding: { USD: "10000", BTC: "1" },
+      intervalMs: 600_000,
+      limits: loose,
+      strategy,
+    });
+    const api = new PricedClient(baseUrl, email, PASSWORD);
+    await api.signIn();
+    const refused: unknown[] = [];
+    const context = {
+      ...agent.context,
+      api,
+      log: (event: string, fields?: Record<string, unknown>) => refused.push({ event, ...fields }),
+    };
+    const market = context.market;
+    await strategy.tick(context);
+
+    // The price jumps 300 ticks each tick, past the maker's whole ladder, so every requote
+    // replaces every quote and its new bids cross its stale asks. Meanwhile a taker sends one
+    // small market buy after another. Under cancel-then-place, buys that landed between the
+    // cancels and the places found no ask and came back cancelled for no liquidity.
+    const taker = new ApiClient(baseUrl, uniqueEmail("strategies-test"), PASSWORD);
+    await taker.signIn();
+    await taker.deposit("USD", usd(10_000), 8);
+    let requoting = true;
+    const requotes = (async () => {
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          api.price += (i % 2 === 0 ? 300n : -300n) * tick;
+          await strategy.tick(context);
+          // Each tick places four orders; paced under the API's 20 orders a second per user.
+          await sleep(250);
+        }
+      } finally {
+        requoting = false;
+      }
+    })();
+    const buys: unknown[] = [];
+    while (requoting) {
+      buys.push(await taker.place(market, { type: "market", side: "buy", quantity: 10_000n }));
+      await sleep(60);
+    }
+    await requotes;
+
+    expect(refused).toEqual([]);
+    expect(buys.length).toBeGreaterThan(10);
+    for (const bought of buys) {
+      expect(bought).toMatchObject({ ok: true, status: "filled", filled: 10_000n });
+    }
+    // Every stale quote went once its replacement was in: one ladder each side, no more.
+    const sides = (await api.openOrders(market)).map((o) => o.side).sort();
+    expect(sides).toEqual([
+      ...Array<string>(maker.levels).fill("buy"),
+      ...Array<string>(maker.levels).fill("sell"),
+    ]);
+  }, 15_000);
 });

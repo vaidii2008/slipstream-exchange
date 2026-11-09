@@ -3,7 +3,8 @@
 // market over the API, decides and sends.
 
 import type { Strategy } from "./bots.ts";
-import type { MarketInfo, OrderRequest, Side } from "./client.ts";
+import type { MarketInfo, OpenOrder, OrderRequest, Side } from "./client.ts";
+import { notional } from "./money.ts";
 
 // A whole number in [0, n).
 function below(random: () => number, n: number): number {
@@ -120,6 +121,15 @@ export function makerQuotes(
   return quotes;
 }
 
+// What resting a quote reserves: base for an ask, its notional in quote for a bid.
+function reservedFor(market: MarketInfo, side: Side, price: bigint, quantity: bigint): bigint {
+  return side === "sell" ? quantity : notional(price, quantity, market.baseScale);
+}
+
+// Refusals that cancelling one more stale quote can cure: it frees funds, a resting slot and
+// position room on its side.
+const CURABLE = new Set(["insufficient_funds", "risk_max_open_orders", "risk_max_position"]);
+
 export function marketMaker(options: MakerOptions): Strategy {
   return {
     async tick({ name, api, market, log }) {
@@ -133,22 +143,91 @@ export function marketMaker(options: MakerOptions): Strategy {
       const wanted = makerQuotes(market, last ?? options.referencePrice, inventory, options);
 
       // Only the difference is sent, so a quote already resting at the right price and size
-      // keeps its place in the queue. Stale quotes go first: a new bid placed before an old
-      // ask was cancelled could cross it, and self-trade prevention would cancel the bid.
+      // keeps its place in the queue.
       const key = (side: Side, price: bigint | null, quantity: bigint) =>
         `${side}:${price}:${quantity}`;
       const missing = new Map(wanted.map((q) => [key(q.side, q.price, q.quantity), q]));
+      let stale: OpenOrder[] = [];
       for (const order of open) {
-        const resting = key(order.side, order.price, order.quantity - order.filled);
-        if (!missing.delete(resting)) {
-          await api.cancel(order.id);
+        if (!missing.delete(key(order.side, order.price, order.quantity - order.filled))) {
+          stale.push(order);
         }
       }
-      for (const quote of missing.values()) {
-        const result = await api.place(market, { type: "limit", ...quote });
-        if (!result.ok) {
+
+      // New quotes go in before stale ones come out, so a taker arriving mid-requote finds the
+      // side quoted, old or new. Each new quote is paid for from what is available; the stale
+      // ones stay reserved until cancelled. When the available balance does not cover a quote,
+      // the stale quote furthest out on its side is cancelled first to free its funds, so the
+      // maker never sends an order it cannot pay for and gives up its outermost quote, not its
+      // whole side, to pay for it.
+      const available = {
+        buy: balances.get(market.quoteAsset)?.available ?? 0n,
+        sell: held?.available ?? 0n,
+      };
+      const drop = async (order: OpenOrder) => {
+        stale = stale.filter((o) => o !== order);
+        // False when it filled first: then its reservation was spent, not freed.
+        if ((await api.cancel(order.id)) && order.price !== null) {
+          const remaining = order.quantity - order.filled;
+          available[order.side] += reservedFor(market, order.side, order.price, remaining);
+        }
+      };
+      // The stale quote on a side furthest from the price: the one a taker is least likely to
+      // want, so the first to go. The maker only rests limits, so every price is set.
+      const outward = (o: OpenOrder) => (o.side === "buy" ? -1n : 1n) * (o.price ?? 0n);
+      const furthest = (side: Side) =>
+        stale
+          .filter((o) => o.side === side)
+          .reduce<OpenOrder | undefined>(
+            (out, o) => (out === undefined || outward(o) > outward(out) ? o : out),
+            undefined,
+          );
+      // A new bid at or above a stale ask, or a new ask at or below a stale bid, would trade
+      // with the maker's own order, and self-trade prevention would cancel the new one.
+      const crossed = (quote: Quote) =>
+        stale.filter(
+          (o) =>
+            o.side !== quote.side &&
+            o.price !== null &&
+            (quote.side === "buy" ? quote.price >= o.price : quote.price <= o.price),
+        );
+
+      // Quotes that cross nothing go first. A price move makes only one side's new quotes
+      // cross: moving up, new bids reach the stale asks, and the new asks above are resting
+      // before those stale asks are cancelled to make way.
+      const queue = [...missing.values()].sort(
+        (a, b) => Number(crossed(a).length > 0) - Number(crossed(b).length > 0),
+      );
+      for (const quote of queue) {
+        for (const order of crossed(quote)) {
+          await drop(order);
+        }
+        const cost = reservedFor(market, quote.side, quote.price, quote.quantity);
+        for (let order = furthest(quote.side); available[quote.side] < cost && order;) {
+          await drop(order);
+          order = furthest(quote.side);
+        }
+        if (available[quote.side] < cost) {
+          log("order_refused", { agent: name, error: "insufficient_funds", side: quote.side });
+          continue;
+        }
+        let result = await api.place(market, { type: "limit", ...quote });
+        // Both sets resting count against the risk guard's open-order and position limits, and
+        // a fill since the balances were read can leave less available. One stale quote out of
+        // the way, on this side if there is one, is enough to try again.
+        const spare = furthest(quote.side) ?? stale[0];
+        if (!result.ok && CURABLE.has(result.error) && spare !== undefined) {
+          await drop(spare);
+          result = await api.place(market, { type: "limit", ...quote });
+        }
+        if (result.ok) {
+          available[quote.side] -= cost;
+        } else {
           log("order_refused", { agent: name, error: result.error, side: quote.side });
         }
+      }
+      for (const order of stale) {
+        await api.cancel(order.id);
       }
     },
   };
