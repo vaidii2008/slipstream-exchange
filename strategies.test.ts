@@ -149,6 +149,17 @@ describe("noiseTrader", () => {
       await provider.place(ethUsd, { type: "limit", side, price, quantity: 10n * 100_000_000n });
     }
 
+    // Resting orders are counted inside the agent, straight after each tick: a tick ends with
+    // its place, so that is when the count peaks, and the test waits for 30 ticks rather than
+    // for a clock. Polling from outside missed peaks between reads, and its stream of requests
+    // slowed the agent it was measuring.
+    const noisy = noiseTrader({ ...noise, referencePrice: usd(3_000), limitShare: 0.3 });
+    let mostOpen = 0;
+    let tried = 0;
+    let thirtieth = () => {};
+    const thirtyTicks = new Promise<void>((resolve) => {
+      thirtieth = resolve;
+    });
     const email = uniqueEmail("strategies-test");
     const agent = await runner().start({
       name: "noise",
@@ -157,17 +168,26 @@ describe("noiseTrader", () => {
       funding: { USD: "10000", ETH: "2" },
       intervalMs: 10,
       limits: loose,
-      strategy: noiseTrader({ ...noise, referencePrice: usd(3_000), limitShare: 0.3 }),
+      strategy: {
+        async tick(context) {
+          try {
+            await noisy.tick(context);
+            const open = await context.api.openOrders(context.market);
+            mostOpen = Math.max(mostOpen, open.length);
+          } finally {
+            // Failed ticks count too, so a failing agent ends the wait and the assertions say why.
+            tried += 1;
+            if (tried === 30) {
+              thirtieth();
+            }
+          }
+        },
+      },
     });
+    await thirtyTicks;
+    await agent.stop();
     const api = new ApiClient(baseUrl, email, PASSWORD);
     await api.signIn();
-
-    let mostOpen = 0;
-    const deadline = Date.now() + 5000;
-    while (agent.ticks < 30 && Date.now() < deadline) {
-      mostOpen = Math.max(mostOpen, (await api.openOrders(ethUsd)).length);
-    }
-    await agent.stop();
 
     expect(agent.ticks).toBeGreaterThanOrEqual(30);
     expect(agent.failedTicks).toBe(0);
