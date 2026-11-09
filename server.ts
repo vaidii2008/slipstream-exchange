@@ -160,6 +160,12 @@ export function buildServer(
       app.log.error({ err: error, market, sequence }, "book snapshot write failed");
     }
   });
+  exchange.onSnapshotSkipped((market, sequence, error) => {
+    app.log.error(
+      { err: error, market, sequence },
+      "book snapshot unreadable, trying the one before",
+    );
+  });
 
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });

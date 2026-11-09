@@ -168,6 +168,7 @@ describe("rebuilding books from the log", () => {
         market: market.symbol,
         sequence: book.sequence,
         halted: false,
+        restoredFrom: 0,
         // Seven placements and the cancel.
         replayed: 8,
         settled: 0,
@@ -180,7 +181,7 @@ describe("rebuilding books from the log", () => {
     for (const logPageSize of [3, 4]) {
       const paged = new Exchange(db, { logPageSize });
       await expect(paged.open([market])).resolves.toMatchObject([
-        { sequence: book.sequence, halted: false, replayed: 8 },
+        { sequence: book.sequence, halted: false, restoredFrom: 0, replayed: 8 },
       ]);
       expect(paged.depth(market.symbol, 50)).toEqual(book);
     }
@@ -218,8 +219,24 @@ describe("rebuilding books from the log", () => {
 
     await expect(exchange.open([broken, fine])).resolves.toEqual([
       // The gap stops the replay, so nothing counts as replayed.
-      { market: broken.symbol, sequence: 1, halted: true, replayed: 0, settled: 0, cancelled: 0 },
-      { market: fine.symbol, sequence: 0, halted: false, replayed: 0, settled: 0, cancelled: 0 },
+      {
+        market: broken.symbol,
+        sequence: 1,
+        halted: true,
+        restoredFrom: 0,
+        replayed: 0,
+        settled: 0,
+        cancelled: 0,
+      },
+      {
+        market: fine.symbol,
+        sequence: 0,
+        halted: false,
+        restoredFrom: 0,
+        replayed: 0,
+        settled: 0,
+        cancelled: 0,
+      },
     ]);
     expect(halts).toEqual([
       expect.objectContaining({ message: "event log has command 3 where 2 was next" }),
@@ -251,7 +268,15 @@ describe("reading the log in pages", () => {
 
     // The first page replayed; the second starts at the gap.
     await expect(exchange.open([market])).resolves.toEqual([
-      { market: market.symbol, sequence: 2, halted: true, replayed: 2, settled: 0, cancelled: 0 },
+      {
+        market: market.symbol,
+        sequence: 2,
+        halted: true,
+        restoredFrom: 0,
+        replayed: 2,
+        settled: 0,
+        cancelled: 0,
+      },
     ]);
     expect(halts).toEqual([
       expect.objectContaining({ message: "event log has command 4 where 3 was next" }),

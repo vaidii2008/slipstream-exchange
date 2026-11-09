@@ -25,7 +25,14 @@ import {
 import { acquireMarketLock, type MarketLock } from "./marketlock.ts";
 import { type Recovered, recover, type ReplayedCommand, settledFrontier } from "./recovery.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
-import { SNAPSHOT_EVERY, serializeEngine, writeSnapshot } from "./snapshots.ts";
+import {
+  decodeSnapshot,
+  readSnapshot,
+  SNAPSHOT_EVERY,
+  serializeEngine,
+  snapshotSequences,
+  writeSnapshot,
+} from "./snapshots.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
 // engine command and the settlement that follows have exactly one writer: the next command
@@ -101,6 +108,9 @@ export type HaltListener = (market: string, error: unknown) => void;
 // costs nothing but a longer replay until the next snapshot succeeds.
 export type SnapshotListener = (market: string, sequence: number, error?: unknown) => void;
 
+// Called when a market opening could not use a snapshot and tried the one before it.
+export type SnapshotSkippedListener = (market: string, sequence: number, error: unknown) => void;
+
 // How long one command took, in seconds, split where the time goes: waiting behind the
 // commands queued ahead of it, then its own turn in the queue (the log append, the match and
 // the settlement), of which the match in memory is a part.
@@ -156,7 +166,9 @@ type RunningMarket = {
   pending: number;
   // What recovery finished when the market opened; zero for a market that failed to open.
   recovered: Recovered;
-  // Commands replayed from the log when it opened; zero for a market whose log did not read.
+  // The snapshot it opened from, 0 for none; then the commands replayed from the log after
+  // it. Zero for a market whose log did not read.
+  restoredFrom: number;
   replayed: number;
   // The market's advisory lock, while this process holds it.
   lock?: MarketLock;
@@ -168,6 +180,7 @@ export type OpenedMarket = {
   market: string;
   sequence: number;
   halted: boolean;
+  restoredFrom: number;
   replayed: number;
 } & Recovered;
 
@@ -185,6 +198,7 @@ export class Exchange {
   readonly #logPageSize: number;
   readonly #snapshotEvery: number;
   readonly #snapshotListeners: SnapshotListener[] = [];
+  readonly #snapshotSkippedListeners: SnapshotSkippedListener[] = [];
   // Snapshot writes still in flight, which close() waits for.
   readonly #snapshotWrites = new Set<Promise<void>>();
   #closed = false;
@@ -212,6 +226,10 @@ export class Exchange {
 
   onSnapshot(listener: SnapshotListener): void {
     this.#snapshotListeners.push(listener);
+  }
+
+  onSnapshotSkipped(listener: SnapshotSkippedListener): void {
+    this.#snapshotSkippedListeners.push(listener);
   }
 
   // Returns the function that stops the listener.
@@ -304,6 +322,7 @@ export class Exchange {
           market: market.symbol,
           sequence: running.engine.sequence,
           halted: running.halted,
+          restoredFrom: running.restoredFrom,
           replayed: running.replayed,
           ...running.recovered,
         };
@@ -335,6 +354,7 @@ export class Exchange {
       halted: false,
       pending: 0,
       recovered: { settled: 0, cancelled: 0 },
+      restoredFrom: 0,
       replayed: 0,
       nextSnapshotAt: 0,
     };
@@ -342,11 +362,15 @@ export class Exchange {
       if (this.#lockDatabaseUrl !== undefined) {
         await this.#lock(running, market.symbol, this.#lockDatabaseUrl);
       }
-      // A page at a time, keeping only what recovery needs, so the memory a boot takes
-      // follows the book rather than the length of the log.
+      // From the latest snapshot that reads, then the log after it a page at a time, keeping
+      // only what recovery needs, so a boot's memory follows the book and its time follows the
+      // commands since the snapshot. The replay's gap check starts at the snapshot's sequence,
+      // so a log missing the commands right after it halts the market.
       const frontier = await settledFrontier(this.#db, market);
+      running.restoredFrom = await this.#restore(running, market.symbol);
       const pastFrontier: ReplayedCommand[] = [];
       for await (const page of readLogPages(this.#db, market.symbol, {
+        after: running.restoredFrom,
         pageSize: this.#logPageSize,
       })) {
         const events = replay(running.engine, page);
@@ -368,6 +392,26 @@ export class Exchange {
     }
     this.#markets.set(market.symbol, running);
     return running;
+  }
+
+  // Puts the market's engine in the state of its newest snapshot that reads and returns that
+  // snapshot's sequence, or leaves the engine empty and returns 0 when none does. Everything
+  // up to a snapshot's sequence had settled when it was taken, so recovery only ever needs
+  // commands after it. A snapshot that fails to read, decode or restore is reported and the
+  // one before it tried: snapshots are a cache, and an older one costs only a longer replay.
+  async #restore(running: RunningMarket, symbol: string): Promise<number> {
+    for (const sequence of await snapshotSequences(this.#db, symbol)) {
+      try {
+        const book = await readSnapshot(this.#db, symbol, sequence);
+        running.engine = Engine.restore(symbol, decodeSnapshot(book, sequence));
+        return sequence;
+      } catch (error) {
+        for (const listener of this.#snapshotSkippedListeners) {
+          listener(symbol, sequence, error);
+        }
+      }
+    }
+    return 0;
   }
 
   // Sets `running.lock` once the lock is held (marketlock.ts). A lock lost later halts the

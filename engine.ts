@@ -26,6 +26,15 @@ export type MarketOrder = {
 
 export type NewOrder = LimitOrder | MarketOrder;
 
+// Everything a replay rebuilds: the last event number and every resting order. Within a
+// level, orders are oldest first, which is their time priority.
+export type EngineState = {
+  sequence: number;
+  bids: StateLevel[];
+  asks: StateLevel[];
+};
+type StateLevel = { price: bigint; orders: { id: string; userId: string; remaining: bigint }[] };
+
 // What happened, without the stamp every event gets on the way out.
 export type EventBody =
   | {
@@ -104,6 +113,34 @@ export class Engine {
 
   constructor(market: string) {
     this.#market = market;
+  }
+
+  // An engine in the state another was in, as if it had replayed the same commands: the same
+  // book, the same queue at every price, and numbering on from the same sequence. Throws on a
+  // state no engine could have been in, so a caller can treat it as unreadable.
+  static restore(market: string, state: EngineState): Engine {
+    if (!Number.isSafeInteger(state.sequence) || state.sequence < 0) {
+      throw new RangeError(`cannot restore ${market} at sequence ${state.sequence}`);
+    }
+    const engine = new Engine(market);
+    for (const [side, levels] of [
+      ["buy", state.bids],
+      ["sell", state.asks],
+    ] as const) {
+      for (const level of levels) {
+        for (const order of level.orders) {
+          // Appends at the back of its level, so restoring oldest first keeps the queue.
+          engine.#book.rest({ ...order, side, price: level.price });
+        }
+      }
+    }
+    const bid = engine.bestPrice("buy");
+    const ask = engine.bestPrice("sell");
+    if (bid !== undefined && ask !== undefined && bid >= ask) {
+      throw new Error(`cannot restore ${market}: best bid ${bid} crosses best ask ${ask}`);
+    }
+    engine.#sequence = state.sequence;
+    return engine;
   }
 
   // Number of the last event emitted, 0 before the first.

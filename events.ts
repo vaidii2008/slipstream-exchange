@@ -36,7 +36,7 @@ export function takerLimitOf(command: Command): bigint | null {
 
 // JSON has no bigint, so amounts are stored as decimal strings of minor units: exact, and
 // readable in psql. A string that is not a whole number fails to decode rather than round.
-const minorUnits = z
+export const minorUnits = z
   .string()
   .regex(/^\d+$/)
   .transform((value) => BigInt(value));

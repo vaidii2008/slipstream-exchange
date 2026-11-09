@@ -2,8 +2,10 @@
 // can start from the latest one and replay only the log after it instead of the whole log.
 // The log stays the record; a snapshot is a cache of it that a boot may skip.
 
-import { sql } from "drizzle-orm";
-import type { Engine } from "./engine.ts";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { z } from "zod";
+import type { Engine, EngineState } from "./engine.ts";
+import { minorUnits } from "./events.ts";
 import type { Database } from "./ledger.ts";
 import { bookSnapshots } from "./schema.ts";
 
@@ -49,4 +51,53 @@ export async function writeSnapshot(
   book: string,
 ): Promise<void> {
   await db.insert(bookSnapshots).values({ market, sequence, book: sql`${book}::jsonb` });
+}
+
+const level = z.strictObject({
+  price: minorUnits,
+  orders: z.array(
+    z.strictObject({ id: z.string().min(1), userId: z.string().min(1), remaining: minorUnits }),
+  ),
+});
+const snapshotFormat = z.strictObject({
+  version: z.literal(FORMAT_VERSION),
+  sequence: z.number().int().nonnegative(),
+  bids: z.array(level),
+  asks: z.array(level),
+});
+
+// A stored snapshot read back as engine state. Throws on anything serializeEngine would not
+// have written, and on a row whose state is for a different sequence than the row says.
+export function decodeSnapshot(book: unknown, sequence: number): EngineState {
+  const state = snapshotFormat.parse(book);
+  if (state.sequence !== sequence) {
+    throw new Error(`snapshot row ${sequence} holds the state at ${state.sequence}`);
+  }
+  return { sequence: state.sequence, bids: state.bids, asks: state.asks };
+}
+
+// The sequences of a market's snapshots, newest first. Only the numbers, so trying them in
+// turn reads one state at a time.
+export async function snapshotSequences(db: Database, market: string): Promise<number[]> {
+  const rows = await db
+    .select({ sequence: bookSnapshots.sequence })
+    .from(bookSnapshots)
+    .where(eq(bookSnapshots.market, market))
+    .orderBy(desc(bookSnapshots.sequence));
+  return rows.map((row) => row.sequence);
+}
+
+export async function readSnapshot(
+  db: Database,
+  market: string,
+  sequence: number,
+): Promise<unknown> {
+  const [row] = await db
+    .select({ book: bookSnapshots.book })
+    .from(bookSnapshots)
+    .where(and(eq(bookSnapshots.market, market), eq(bookSnapshots.sequence, sequence)));
+  if (row === undefined) {
+    throw new Error(`snapshot ${market} ${sequence} is gone`);
+  }
+  return row.book;
 }
