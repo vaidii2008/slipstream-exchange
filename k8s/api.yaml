@@ -1,0 +1,102 @@
+# The API: one process per market across the whole system, which the per-market advisory lock
+# enforces (marketlock.ts). A StatefulSet because its rolling update deletes the old pod before
+# it creates the new one. A Deployment starts the new pod first; while the old one still held
+# the locks, the new one would halt every market as "open in another process".
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: slipstream
+spec:
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 3000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: api
+  namespace: slipstream
+spec:
+  serviceName: api
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      # Shutdown lets in-flight requests and queued commands settle before releasing the locks.
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Applies any migrations the database has not had. Until Postgres is ready it exits 1
+        # and the kubelet retries it with backoff.
+        - name: migrate
+          image: slipstream-api
+          imagePullPolicy: Never
+          command: ["node", "migrate.ts"]
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slipstream
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: postgres://slipstream:$(POSTGRES_PASSWORD)@postgres:5432/slipstream
+      containers:
+        - name: api
+          # deploy.sh pins the tag to the commit, and imports the image: nothing is pulled.
+          image: slipstream-api
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slipstream
+                  key: POSTGRES_PASSWORD
+            # $(POSTGRES_PASSWORD) expands because it is defined above; the password is hex,
+            # so it needs no escaping inside the URL.
+            - name: DATABASE_URL
+              value: postgres://slipstream:$(POSTGRES_PASSWORD)@postgres:5432/slipstream
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: JWT_ACCESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: slipstream
+                  key: JWT_ACCESS_SECRET
+            # The terminal's address as the browser sees it, or CORS refuses its requests.
+            - name: WEB_ORIGIN
+              value: https://slipstream-exchange.duckdns.org
+          ports:
+            - name: http
+              containerPort: 3000
+          # The server listens only after every market's log has replayed, and replay grows
+          # with the log, so startup gets up to five minutes before liveness applies.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          # /health checks Postgres and Redis: while either is down, take no traffic...
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          # ...but do not restart for it. A restart replays every log and cannot fix Redis.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
