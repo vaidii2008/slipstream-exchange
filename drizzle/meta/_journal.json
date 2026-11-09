@@ -99,6 +99,13 @@
       "when": 1794034796641,
       "tag": "0013_index_entries_by_account_and_id",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1794223815506,
+      "tag": "0014_create_book_snapshots",
+      "breakpoints": true
     }
   ]
 }

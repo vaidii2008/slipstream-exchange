@@ -108,6 +108,7 @@ export async function createTestMarket(
 async function deleteTestMarkets(pool: Pool, symbols: string[]): Promise<void> {
   await pool.query("delete from trades where market = any($1)", [symbols]);
   await pool.query("delete from engine_events where market = any($1)", [symbols]);
+  await pool.query("delete from book_snapshots where market = any($1)", [symbols]);
   await pool.query("delete from orders where market = any($1)", [symbols]);
   await pool.query("delete from markets where symbol = any($1)", [symbols]);
 }

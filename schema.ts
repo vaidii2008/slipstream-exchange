@@ -252,3 +252,23 @@ export const engineEvents = pgTable(
   // One writer per market: a second process appending to the same market collides here.
   (table) => [primaryKey({ columns: [table.market, table.sequence] })],
 );
+
+// A market's whole engine state as of one event number: every resting order, oldest first
+// within its price, and the sequence. Opening the market from one and replaying only the
+// commands logged after it gives the book a full replay gives, without reading the whole log.
+// Taken inside the market's queue after a command has settled, so everything up to `sequence`
+// is settled too. Rows are a cache of the log, which stays the record.
+export const bookSnapshots = pgTable(
+  "book_snapshots",
+  {
+    market: text("market")
+      .notNull()
+      .references(() => markets.symbol),
+    // The last event number the state includes.
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    // Amounts as decimal strings of minor units, like the log (see snapshots.ts).
+    book: jsonb("book").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.market, table.sequence] })],
+);

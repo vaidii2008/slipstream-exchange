@@ -25,6 +25,7 @@ import {
 import { acquireMarketLock, type MarketLock } from "./marketlock.ts";
 import { type Recovered, recover, type ReplayedCommand, settledFrontier } from "./recovery.ts";
 import { type SettledOrder, settle, type Trade } from "./settlement.ts";
+import { SNAPSHOT_EVERY, serializeEngine, writeSnapshot } from "./snapshots.ts";
 
 // Runs async tasks one at a time, in the order they were added. Each market gets one, so its
 // engine command and the settlement that follows have exactly one writer: the next command
@@ -96,6 +97,10 @@ export class MarketBusyError extends Error {
 
 export type HaltListener = (market: string, error: unknown) => void;
 
+// Called once each snapshot write has finished, with its error if it failed. A failed write
+// costs nothing but a longer replay until the next snapshot succeeds.
+export type SnapshotListener = (market: string, sequence: number, error?: unknown) => void;
+
 // How long one command took, in seconds, split where the time goes: waiting behind the
 // commands queued ahead of it, then its own turn in the queue (the log append, the match and
 // the settlement), of which the match in memory is a part.
@@ -138,6 +143,8 @@ export type ExchangeOptions = {
   // Commands read from the event log at a time when a market opens. Tests make it small to
   // put page boundaries inside a short log.
   logPageSize?: number;
+  // Events between snapshots of a market's state. Tests make it small.
+  snapshotEvery?: number;
 };
 
 export const DEFAULT_MAX_PENDING_COMMANDS = 10_000;
@@ -153,6 +160,8 @@ type RunningMarket = {
   replayed: number;
   // The market's advisory lock, while this process holds it.
   lock?: MarketLock;
+  // The event number at or past which the next snapshot is taken.
+  nextSnapshotAt: number;
 };
 
 export type OpenedMarket = {
@@ -174,6 +183,10 @@ export class Exchange {
   readonly #maxPending: number;
   readonly #lockDatabaseUrl: string | undefined;
   readonly #logPageSize: number;
+  readonly #snapshotEvery: number;
+  readonly #snapshotListeners: SnapshotListener[] = [];
+  // Snapshot writes still in flight, which close() waits for.
+  readonly #snapshotWrites = new Set<Promise<void>>();
   #closed = false;
 
   constructor(
@@ -182,17 +195,23 @@ export class Exchange {
       maxPendingCommands = DEFAULT_MAX_PENDING_COMMANDS,
       lockDatabaseUrl,
       logPageSize = LOG_PAGE_SIZE,
+      snapshotEvery = SNAPSHOT_EVERY,
     }: ExchangeOptions = {},
   ) {
     this.#db = db;
     this.#maxPending = maxPendingCommands;
     this.#lockDatabaseUrl = lockDatabaseUrl;
     this.#logPageSize = logPageSize;
+    this.#snapshotEvery = snapshotEvery;
   }
 
   // Called once per halt with the error that caused it. The server logs it at fatal.
   onHalt(listener: HaltListener): void {
     this.#haltListeners.push(listener);
+  }
+
+  onSnapshot(listener: SnapshotListener): void {
+    this.#snapshotListeners.push(listener);
   }
 
   // Returns the function that stops the listener.
@@ -317,6 +336,7 @@ export class Exchange {
       pending: 0,
       recovered: { settled: 0, cancelled: 0 },
       replayed: 0,
+      nextSnapshotAt: 0,
     };
     try {
       if (this.#lockDatabaseUrl !== undefined) {
@@ -342,6 +362,7 @@ export class Exchange {
         running.replayed += page.length;
       }
       running.recovered = await recover(this.#db, market, running.engine, frontier, pastFrontier);
+      running.nextSnapshotAt = this.#snapshotAfter(running.engine.sequence);
     } catch (error) {
       this.#halt(running, market.symbol, error);
     }
@@ -370,6 +391,8 @@ export class Exchange {
     this.#closed = true;
     // #replay catches every failure, so these never reject.
     const markets = await Promise.all(this.#opening.values());
+    // Snapshot writes report their own failures, so these never reject either.
+    await Promise.all(this.#snapshotWrites);
     await Promise.all(
       markets.map(async (running) => {
         const lock = running.lock;
@@ -437,8 +460,37 @@ export class Exchange {
         commandSeconds: (performance.now() - startedAt) / 1000,
       };
       this.#announce(running.engine, market, events, settled, settledAt, timing);
+      if (running.engine.sequence >= running.nextSnapshotAt) {
+        this.#snapshot(running, market.symbol);
+      }
       return events;
     });
+  }
+
+  // The first multiple of the snapshot interval after `sequence`.
+  #snapshotAfter(sequence: number): number {
+    return (Math.floor(sequence / this.#snapshotEvery) + 1) * this.#snapshotEvery;
+  }
+
+  // Called in the market's queue, after a command has settled: the state is serialized here,
+  // so it is exact at its sequence and everything in it is settled. The write runs outside
+  // the queue, so the next command never waits on Postgres for it. A write that fails is
+  // reported and not retried; the next interval takes a fresh snapshot.
+  #snapshot(running: RunningMarket, symbol: string): void {
+    const { sequence } = running.engine;
+    const book = serializeEngine(running.engine);
+    running.nextSnapshotAt = this.#snapshotAfter(sequence);
+    const notify = (error?: unknown) => {
+      for (const listener of this.#snapshotListeners) {
+        listener(symbol, sequence, error);
+      }
+    };
+    const write = writeSnapshot(this.#db, symbol, sequence, book).then(
+      () => notify(),
+      (error: unknown) => notify(error),
+    );
+    this.#snapshotWrites.add(write);
+    void write.finally(() => this.#snapshotWrites.delete(write));
   }
 
   #halt(running: RunningMarket, symbol: string, error: unknown): MarketHaltedError {

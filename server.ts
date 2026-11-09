@@ -152,6 +152,14 @@ export function buildServer(
     // process holds or this one lost.
     app.log.fatal({ err: error, market }, "market halted");
   });
+  exchange.onSnapshot((market, sequence, error) => {
+    if (error === undefined) {
+      app.log.info({ market, sequence }, "book snapshot written");
+    } else {
+      // Not fatal: the market trades on, and its next boot replays further back.
+      app.log.error({ err: error, market, sequence }, "book snapshot write failed");
+    }
+  });
 
   registerAuthRoutes(app, { db, tokens });
   registerSessionRoutes(app, { db, tokens });
