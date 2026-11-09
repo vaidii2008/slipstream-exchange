@@ -28,4 +28,4 @@ spec:
           port: 3000
   # One certificate per route's Host, requested by Traefik from the rule itself.
   tls:
-    certResolver: letsencrypt-staging
+    certResolver: letsencrypt

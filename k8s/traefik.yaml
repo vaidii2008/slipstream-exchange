@@ -5,8 +5,14 @@
 #   Traefik answers it on port 80 itself, ahead of any redirect.
 # - Certificates are kept on a volume. Without one they would be requested again every time
 #   Traefik restarts, and Let's Encrypt limits how often a name can be issued.
-# - Two resolvers with separate stores: staging, whose certificates browsers do not trust but
-#   whose limits are generous, to prove the setup; then production.
+# - Traefik requests certificates the moment it starts, about 7 s before its readiness probe
+#   passes, and a Service sends nothing to an unready pod: Let's Encrypt's call back to port
+#   80 timed out, every time Traefik restarted. So its Service publishes the pod unready.
+# - Recreate, not a rolling update, so that unready pod is never beside an old one that would
+#   answer the challenge 404 (staging's first attempt failed so). One pod, always.
+# - Production Let's Encrypt. Staging proved this setup first (commit history), then had to
+#   go: Traefik requests no certificate for a name it already holds one for, from any
+#   resolver, so staging's stored certificates kept production from asking.
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:
@@ -22,16 +28,16 @@ spec:
               to: websecure
               scheme: https
               permanent: true
+    service:
+      spec:
+        publishNotReadyAddresses: true
+    updateStrategy:
+      type: Recreate
+      rollingUpdate: null
     persistence:
       enabled: true
       storageClass: local-path
     certificatesResolvers:
-      letsencrypt-staging:
-        acme:
-          caServer: https://acme-staging-v02.api.letsencrypt.org/directory
-          storage: /data/acme-staging.json
-          httpChallenge:
-            entryPoint: web
       letsencrypt:
         acme:
           storage: /data/acme.json
